@@ -1,8 +1,26 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use serde::Deserialize;
+
+/// Failure modes for loading `Config` from a TOML file.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("reading config file {path} (copy config.example.toml to get started)")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parsing config file {path}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+}
+
+type Result<T> = std::result::Result<T, ConfigError>;
 
 /// Process configuration, loaded from a TOML file (see `config.example.toml`
 /// for the schema and `[Config::load]` for how the path is resolved).
@@ -61,13 +79,14 @@ impl Config {
     /// Reads and parses a TOML config file from `path`.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let raw = std::fs::read_to_string(path).with_context(|| {
-            format!(
-                "reading config file {} (copy config.example.toml to get started)",
-                path.display()
-            )
+        let raw = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
         })?;
-        toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
+        toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }
 
@@ -134,5 +153,6 @@ mod tests {
         let err = Config::load("/nonexistent/path/config.toml").unwrap_err();
 
         assert!(err.to_string().contains("reading config file"));
+        assert!(matches!(err, ConfigError::Read { .. }));
     }
 }

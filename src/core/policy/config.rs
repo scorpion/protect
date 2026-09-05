@@ -1,11 +1,29 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::Policy;
 use super::threshold::{ThresholdConfig, ThresholdPolicy};
+
+/// Failure modes for loading the ordered `[[policy]]` list from a TOML file.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyConfigError {
+    #[error("reading policy file {path} (copy policies/ldap.example.toml to get started)")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parsing policy file {path}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+}
+
+type Result<T> = std::result::Result<T, PolicyConfigError>;
 
 /// One `[[policy]]` table. Tagged by `type` so a policy file can declare an
 /// ordered list of heterogeneous policies; adding a new `Policy` impl means
@@ -33,19 +51,20 @@ struct PolicyFile {
 /// Reads and parses an ordered list of policies from a TOML file (see
 /// `policies/ldap.example.toml` for the schema).
 pub fn load(path: &Path) -> Result<Vec<Arc<dyn Policy>>> {
-    let raw = std::fs::read_to_string(path).with_context(|| {
-        format!(
-            "reading policy file {} (copy policies/ldap.example.toml to get started)",
-            path.display()
-        )
+    let raw = std::fs::read_to_string(path).map_err(|source| PolicyConfigError::Read {
+        path: path.to_path_buf(),
+        source,
     })?;
-    parse(&raw).with_context(|| format!("parsing policy file {}", path.display()))
+    parse(&raw).map_err(|source| PolicyConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Order is preserved from the file: `evaluate_all` stops at the first
 /// block, and stateful policies (like threshold history) only advance their
 /// state on `Allow`, so where a policy sits in the list matters.
-fn parse(raw: &str) -> Result<Vec<Arc<dyn Policy>>> {
+fn parse(raw: &str) -> std::result::Result<Vec<Arc<dyn Policy>>, toml::de::Error> {
     let file: PolicyFile = toml::from_str(raw)?;
     Ok(file.policies.into_iter().map(PolicyEntry::build).collect())
 }

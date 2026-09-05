@@ -1,11 +1,13 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use rasn_ldap::{ChangeOperation, LdapMessage, LdapResult, ModifyResponse, ProtocolOp, ResultCode};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
 
 use crate::core::action::{Action, OperationKind};
+use crate::core::connector::{Connector, DuplexStream};
 use crate::core::net::MaybeTlsStream;
 use crate::core::tls::UpstreamTls;
 
@@ -97,12 +99,34 @@ impl LdapConnector {
     }
 }
 
+#[async_trait]
+impl Connector for LdapConnector {
+    async fn connect_upstream(&self) -> Result<Box<dyn DuplexStream>> {
+        Ok(Box::new(self.connect_upstream().await?))
+    }
+
+    async fn read_frame(
+        &self,
+        stream: &mut (dyn AsyncRead + Send + Unpin),
+    ) -> Result<Option<Vec<u8>>> {
+        read_frame(stream).await
+    }
+
+    fn decode(&self, frame: &[u8]) -> Result<Option<Action>> {
+        self.decode(frame)
+    }
+
+    fn build_rejection(&self, frame: &[u8], reason: &str) -> Result<Vec<u8>> {
+        self.build_rejection(frame, reason)
+    }
+}
+
 /// Read exactly one BER-encoded LDAP message frame (tag + definite-length +
 /// content) from `stream`. Returns `None` on a clean EOF before any bytes of
 /// a new frame are read. LDAP requires definite-length BER encoding (RFC 4511
 /// section 5.1), so long-form lengths are the only case beyond the single
 /// length byte.
-pub async fn read_frame<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option<Vec<u8>>> {
+pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(stream: &mut R) -> Result<Option<Vec<u8>>> {
     let mut tag = [0u8; 1];
     match stream.read_exact(&mut tag).await {
         Ok(_) => {}
@@ -274,6 +298,31 @@ mod tests {
             }
             other => panic!("expected ModifyResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn works_through_the_connector_trait_object() {
+        let connector: Box<dyn Connector> = Box::new(connector());
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
+        let mut cursor = std::io::Cursor::new(frame.clone());
+
+        let read = connector.read_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(read, frame);
+
+        let action = connector
+            .decode(&read)
+            .unwrap()
+            .expect("expected an action");
+        assert_eq!(action.operation, OperationKind::AccountLock);
+
+        let rejection = connector.build_rejection(&read, "too many locks").unwrap();
+        let message = decode_message(&rejection);
+        assert_eq!(message.message_id, 1);
     }
 
     #[tokio::test]

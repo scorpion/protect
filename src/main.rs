@@ -8,5 +8,6 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
 
-    ai_protect::run(&config_path).await
+    ai_protect::run(&config_path).await?;
+    Ok(())
 }

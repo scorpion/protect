@@ -78,14 +78,21 @@ protocol is this" from "should this be allowed."
                                           └──────────────┘
 ```
 
-- **Connector** ([src/connector/ldap.rs](src/connector/ldap.rs)) owns
-  everything protocol-specific: BER framing (`read_frame`), message decoding
-  (`rasn`/`rasn-ldap`), recognizing which attributes represent an
+- **Connector** is a trait ([`Connector`](src/core/connector.rs):
+  `connect_upstream`/`read_frame`/`decode`/`build_rejection`) that
+  [src/proxy.rs](src/proxy.rs) is written against as `Arc<dyn Connector>` —
+  it has no compile-time knowledge of LDAP or any other specific backend.
+  [`LdapConnector`](src/connector/ldap.rs) is the only implementation today,
+  and owns everything protocol-specific: BER framing (`read_frame`), message
+  decoding (`rasn`/`rasn-ldap`), recognizing which attributes represent an
   account-lock across different directory schemas (`LOCK_ATTRIBUTES` covers
   AD's `userAccountControl`, OpenLDAP's `pwdAccountLockedTime`, 389 DS's
   `nsAccountLock`, and `shadowExpire`), and building a well-formed rejection
-  response (`build_rejection`) in that same protocol. Nothing outside this
-  module needs to know LDAP exists.
+  response (`build_rejection`) in that same protocol. Nothing outside the
+  `connector/ldap` module needs to know LDAP exists. `connect_upstream`
+  returns a boxed `DuplexStream` (any `AsyncRead + AsyncWrite + Send +
+  Unpin`) so the proxy loop's `tokio::io::split`/relay code is written once
+  regardless of which connector or transport is underneath.
 - **Action** is the seam. It says *what* is being attempted
   (`OperationKind`), *what* it targets (`target`), and *how big* it is
   (`blast_radius`) — nothing about how it was expressed on the wire. Today
@@ -219,21 +226,33 @@ an existing type is a config-only change (another `[[policy]]` table).
 ## Extension points
 
 - **New backend protocol** (e.g. a different directory API, or a non-LDAP
-  admin surface): add a module under `src/connector/` that reads its own
-  framing and produces `Action`s for the operations worth policing. Wire it
-  up in `ai_protect::run` alongside (or instead of) `LdapConnector`. The
-  proxy loop and policy engine need no changes as long as the connector
-  exposes `decode`/rejection-building analogous to `LdapConnector`'s.
-- **New policy rule**: implement `Policy` and add it to the `Vec<Arc<dyn
-  Policy>>` built in `ai_protect::run`. Because `evaluate_all` stops at the
-  first block, place cheap/fast-failing policies earlier if ordering matters
-  for performance; place stateful policies with care since only `Allow`s
-  should typically advance their state (see `ThresholdPolicy`).
+  admin surface): add a module under `src/connector/` with a type that
+  `impl Connector` (see [src/core/connector.rs](src/core/connector.rs)) —
+  its own framing (`read_frame`), decoding (`decode`), and rejection-building
+  (`build_rejection`), producing `Action`s for the operations worth policing.
+  Hand an `Arc::new(YourConnector::new(...))` to `ProxyBuilder::connector`
+  (or wire it into `ai_protect::run_with_config` alongside/instead of
+  `LdapConnector`). `src/proxy.rs` and the policy engine need no changes —
+  this is no longer just a convention to follow, it's enforced by
+  `proxy::run`'s signature taking `Arc<dyn Connector>`.
+- **New policy rule**: implement `Policy` and add it via
+  `ProxyBuilder::policy`/`policies` (or `[[policy]]` entries in a policy
+  file, which is a config-only change once the `Policy` impl and its
+  `PolicyEntry` variant exist — see [Configuration](#configuration)).
+  Because `evaluate_all` stops at the first block, place cheap/fast-failing
+  policies earlier if ordering matters for performance; place stateful
+  policies with care since only `Allow`s should typically advance their
+  state (see `ThresholdPolicy`).
+- **Embedding ai-protect in another process**: use
+  [`ProxyBuilder`](src/builder.rs) directly instead of `ai_protect::run` —
+  see the library-usage section of [AGENTS.md](AGENTS.md#using-ai-protect-as-a-library).
+  No TOML file is required; a `Connector` and `Policy` list constructed
+  in-memory are enough.
 - **Multiple upstreams / multiple listeners**: not modeled yet.
-  `proxy::run` takes one `listen_addr` and one connector bound to one
-  `upstream_addr`; supporting several would mean either multiple `run` tasks
-  in `ai_protect::run` or extending `Config` to a list and adding a dispatch
-  layer.
+  `proxy::run`/`ProxyBuilder` take one `listen_addr` and one connector bound
+  to one upstream; supporting several would mean either multiple
+  `ProxyBuilder::serve` tasks or extending `Config` to a list and adding a
+  dispatch layer.
 
 ## Known gaps (by design, at this stage)
 

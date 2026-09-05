@@ -24,8 +24,18 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
 
 - [src/main.rs](src/main.rs) — thin binary entry point: reads the config
   path CLI arg and hands off to `ai_protect::run`.
-- [src/lib.rs](src/lib.rs) — wires up config, connector, and policies, then
-  hands off to the proxy loop. Start here to see how pieces fit together.
+- [src/lib.rs](src/lib.rs) — the library's three public entry points
+  (`run`, `run_with_config`, `builder::ProxyBuilder`) covering different
+  amounts of "load this from a file" — see its module doc comment and
+  [Using ai-protect as a library](#using-ai-protect-as-a-library) below.
+  Start here to see how pieces fit together.
+- [src/builder.rs](src/builder.rs) — `ProxyBuilder`, the fully-programmatic
+  entry point for embedding ai-protect: set a connector and policies you
+  already have in memory, no config file required.
+- [src/error.rs](src/error.rs) — `Error`, the aggregate error type returned
+  by the public entry points above. Each variant wraps a module-local error
+  type (`ConfigError`, `PolicyConfigError`, `TlsError`, `ProxyError`) that
+  lives next to the code producing it.
 - [src/config.rs](src/config.rs) — process configuration, loaded from a TOML
   file (`config.toml` by default, or a path given as the first CLI arg; see
   `config.example.toml` for the schema). Policy definitions are deliberately
@@ -36,16 +46,24 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   client, dials upstream, and relays frames in both directions concurrently
   via `tokio::select!`. Client→upstream frames are decoded and evaluated
   against policy before being forwarded or rejected; upstream→client frames
-  pass through untouched.
+  pass through untouched. Generic over `Arc<dyn Connector>` — this module
+  has no compile-time dependency on LDAP or any other specific backend.
 - [src/core/action.rs](src/core/action.rs) — defines `Action` /
   `OperationKind`, the normalized representation a connector produces so the
   policy engine never has to understand a wire protocol.
+- [src/core/connector.rs](src/core/connector.rs) — the `Connector` trait
+  (`connect_upstream`/`read_frame`/`decode`/`build_rejection`) that
+  `src/proxy.rs` is written against, plus `DuplexStream`, the boxable
+  `AsyncRead + AsyncWrite` object every connector's upstream connection is
+  returned as. This is what makes "a new backend is a new connector, not a
+  proxy.rs change" literally true rather than aspirational.
 - [src/connector/ldap.rs](src/connector/ldap.rs) — the only connector today.
   Reads BER-framed LDAP messages off the wire (`read_frame`), decodes
   `ModifyRequest`s via `rasn`/`rasn-ldap`, and flags ones touching a known
   account-lock attribute (`LOCK_ATTRIBUTES`, covering AD/OpenLDAP/389 DS
   schemas) as an `Action`. Also builds the `UnwillingToPerform` rejection
-  response sent back to a blocked client.
+  response sent back to a blocked client. Exposes this as both inherent
+  methods (used directly by its own tests) and an `impl Connector`.
 - [src/core/policy.rs](src/core/policy.rs) — the `Policy` trait
   (`evaluate(&Action, &PolicyContext) -> Decision`) and `evaluate_all`, which
   runs every configured policy and stops at the first `Block`.
@@ -70,13 +88,16 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
 
 - **Connector → Action → Policy → Decision** is the core pipeline. A new
   backend (e.g. a different directory protocol, or a non-LDAP admin API)
-  means a new module under `src/connector/` that produces `Action`s; it
-  should not require touching `src/core/policy/`. A new rule means a new
-  `Policy` impl; it should not require touching `src/connector/`.
+  means a new `impl Connector` (see `src/core/connector.rs`) that produces
+  `Action`s; it should not require touching `src/proxy.rs` or
+  `src/core/policy/` — `proxy.rs` only ever sees `Arc<dyn Connector>`. A new
+  rule means a new `Policy` impl; it should not require touching any
+  connector.
 - Policies are pure decision logic — `evaluate_all` stops at the first
-  block, so ordering in the `Vec<Arc<dyn Policy>>` built in `main.rs` matters
-  if policies have side effects (like `ThresholdPolicy`'s history tracking,
-  which only advances state on an `Allow`).
+  block, so ordering in the `Vec<Arc<dyn Policy>>` passed to
+  `ProxyBuilder`/`proxy::run` matters if policies have side effects (like
+  `ThresholdPolicy`'s history tracking, which only advances state on an
+  `Allow`).
 - The proxy relays raw bytes; it only decodes frames it might act on
   (currently just LDAP `ModifyRequest`s touching lock attributes). Anything
   else — binds, searches, unrelated modifies — is forwarded without being
@@ -90,6 +111,29 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
 - `Identity` is peer-address-based only; there's no LDAP bind/auth
   correlation yet. Don't assume it maps to a stable principal across
   reconnects.
+
+## Using ai-protect as a library
+
+`ai-protect` is a normal Rust library crate as well as a binary — `main.rs`
+is a thin wrapper around it, not a separate thing. Three public entry points
+in `src/lib.rs` cover different amounts of "load this from a file":
+
+- `run(config_path)` — fully file-driven, what the binary calls.
+- `run_with_config(&Config)` — skip the config file (`Config`'s fields are
+  all `pub`) but still load policies from the file `config.policy.file`
+  points at.
+- `builder::ProxyBuilder` — fully programmatic: give it an `Arc<dyn
+  Connector>` and a `Vec<Arc<dyn Policy>>` you built yourself (e.g.
+  `LdapConnector::new(...)` and `ThresholdPolicy::new(...)`), no file I/O
+  anywhere.
+
+All three return `ai_protect::Error` (`src/error.rs`), a `thiserror` enum
+aggregating the module-local error types (`ConfigError`, `PolicyConfigError`,
+`TlsError`, `ProxyError`) so a caller can match on what went wrong instead of
+only reading a message string. Runtime, per-connection errors deliberately
+stay `anyhow::Result` — see the `Connector` trait and `proxy::handle_connection` —
+since those are caught and logged per-connection rather than returned to any
+caller; typing them wouldn't change any caller's behavior.
 
 ## Building and running
 
@@ -114,11 +158,13 @@ Both `config.toml` and everything under `policies/` (except the tracked
 `*.example.toml` templates) are gitignored, since real deployment values may
 be sensitive — see `.gitignore`.
 
-There is no test suite yet (`cargo test` runs zero tests). If you add
-behavior, prefer adding `#[test]`/`#[tokio::test]` coverage alongside it —
-`ThresholdPolicy` and `LdapConnector::decode`/`build_rejection` are
-straightforward to unit test without a real LDAP server since they operate
-on plain byte frames / in-memory state.
+Run the test suite with `cargo test`. If you add behavior, prefer adding
+`#[test]`/`#[tokio::test]` coverage alongside it — `ThresholdPolicy` and
+`LdapConnector::decode`/`build_rejection` are straightforward to unit test
+without a real LDAP server since they operate on plain byte frames /
+in-memory state, and `proxy::serve`/`builder::ProxyBuilder` can be driven
+end-to-end over real (loopback) TCP/TLS connections, as their existing
+tests do.
 
 Run `cargo fmt` and `cargo clippy` before considering a change done; neither
 is currently wired into CI (there is no CI config in this repo yet), so
@@ -126,12 +172,17 @@ they're on the honor system.
 
 ## Conventions
 
-- Rust 2024 edition, `anyhow::Result` for fallible functions outside of
-  tightly-scoped protocol decoding, `.context(...)` on I/O and decode calls
-  to keep error messages traceable to what was being attempted.
+- Rust 2024 edition. The public setup/config surface (config/policy file
+  loading, TLS setup, binding, `ProxyBuilder`) returns typed `thiserror`
+  errors — see [Using ai-protect as a library](#using-ai-protect-as-a-library).
+  Everything else (protocol decoding, the `Connector` trait, per-connection
+  runtime code) keeps using `anyhow::Result`, with `.context(...)` on I/O and
+  decode calls to keep error messages traceable to what was being attempted.
 - `tracing` for logging, not `println!`/`eprintln!`.
 - Doc comments on non-obvious structs/functions explain *why*, not what
   (see `read_frame`, `LOCK_ATTRIBUTES`, `evaluate_all`) — match that style
   rather than restating the signature in prose.
-- README.md and ARCHITECTURE.md exist but are currently empty; this file is
-  the authoritative source of project context until those are filled in.
+- README.md and ARCHITECTURE.md are both filled in; this file, README.md,
+  and ARCHITECTURE.md together are the authoritative source of project
+  context — keep all three in sync when changing module structure or the
+  public API.

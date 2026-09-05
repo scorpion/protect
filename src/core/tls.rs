@@ -1,13 +1,77 @@
 use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
+use std::io::{self, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
+
+/// Failure modes for building or using TLS configuration on either hop
+/// (client-facing listener or upstream connection).
+#[derive(Debug, thiserror::Error)]
+pub enum TlsError {
+    #[error("opening TLS certificate file {path}")]
+    OpenCert {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("parsing TLS certificate file {path}")]
+    ParseCert {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("opening TLS key file {path}")]
+    OpenKey {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("parsing TLS key file {path}")]
+    ParseKey {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("no private key found in {path}")]
+    NoPrivateKey { path: PathBuf },
+    #[error("adding custom CA certificate to upstream trust store")]
+    AddCustomCa {
+        #[source]
+        source: rustls::Error,
+    },
+    #[error("adding native root certificate to upstream trust store")]
+    AddNativeCa {
+        #[source]
+        source: rustls::Error,
+    },
+    #[error("invalid upstream TLS server name {name:?}")]
+    InvalidServerName {
+        name: String,
+        #[source]
+        source: rustls::pki_types::InvalidDnsNameError,
+    },
+    #[error("building TLS server config from cert/key")]
+    ServerConfig {
+        #[source]
+        source: rustls::Error,
+    },
+    #[error("establishing LDAPS session with upstream")]
+    Connect {
+        #[source]
+        source: io::Error,
+    },
+    #[error("completing LDAPS handshake with client")]
+    Accept {
+        #[source]
+        source: io::Error,
+    },
+}
+
+type Result<T> = std::result::Result<T, TlsError>;
 
 /// rustls 0.23 requires a process-wide default crypto provider before any
 /// `ClientConfig`/`ServerConfig` can be built. Installing twice (e.g. across
@@ -42,14 +106,14 @@ impl UpstreamTls {
                 for cert in load_certs(path)? {
                     roots
                         .add(cert)
-                        .context("adding custom CA certificate to upstream trust store")?;
+                        .map_err(|source| TlsError::AddCustomCa { source })?;
                 }
             }
             None => {
                 for cert in rustls_native_certs::load_native_certs().certs {
                     roots
                         .add(cert)
-                        .context("adding native root certificate to upstream trust store")?;
+                        .map_err(|source| TlsError::AddNativeCa { source })?;
                 }
             }
         }
@@ -57,8 +121,12 @@ impl UpstreamTls {
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let server_name = ServerName::try_from(server_name.to_string())
-            .with_context(|| format!("invalid upstream TLS server name {server_name:?}"))?;
+        let server_name = ServerName::try_from(server_name.to_string()).map_err(|source| {
+            TlsError::InvalidServerName {
+                name: server_name.to_string(),
+                source,
+            }
+        })?;
 
         Ok(Self {
             connector: TlsConnector::from(Arc::new(config)),
@@ -70,7 +138,7 @@ impl UpstreamTls {
         self.connector
             .connect(self.server_name.clone(), tcp)
             .await
-            .context("establishing LDAPS session with upstream")
+            .map_err(|source| TlsError::Connect { source })
     }
 }
 
@@ -90,7 +158,7 @@ impl ListenTls {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .context("building TLS server config from cert/key")?;
+            .map_err(|source| TlsError::ServerConfig { source })?;
 
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
@@ -101,24 +169,36 @@ impl ListenTls {
         self.acceptor
             .accept(tcp)
             .await
-            .context("completing LDAPS handshake with client")
+            .map_err(|source| TlsError::Accept { source })
     }
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path)
-        .with_context(|| format!("opening TLS certificate file {}", path.display()))?;
+    let file = File::open(path).map_err(|source| TlsError::OpenCert {
+        path: path.to_path_buf(),
+        source,
+    })?;
     rustls_pemfile::certs(&mut BufReader::new(file))
-        .collect::<Result<Vec<_>, _>>()
-        .with_context(|| format!("parsing TLS certificate file {}", path.display()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| TlsError::ParseCert {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file =
-        File::open(path).with_context(|| format!("opening TLS key file {}", path.display()))?;
+    let file = File::open(path).map_err(|source| TlsError::OpenKey {
+        path: path.to_path_buf(),
+        source,
+    })?;
     rustls_pemfile::private_key(&mut BufReader::new(file))
-        .with_context(|| format!("parsing TLS key file {}", path.display()))?
-        .ok_or_else(|| anyhow!("no private key found in {}", path.display()))
+        .map_err(|source| TlsError::ParseKey {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .ok_or_else(|| TlsError::NoPrivateKey {
+            path: path.to_path_buf(),
+        })
 }
 
 #[cfg(test)]

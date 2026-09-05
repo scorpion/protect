@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+async-trait = "0.1.92"
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls", "tls-rustls-ring"] }
 rasn = "0.28.14"
 rasn-ldap = "0.28.14"
@@ -12,6 +13,7 @@ rustls = { version = "0.23.43", default-features = false, features = ["std", "tl
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2"
 serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
 toml = "0.9.9"

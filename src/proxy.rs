@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::connector::ldap::{LdapConnector, read_frame};
+use crate::core::connector::Connector;
 use crate::core::identity::Identity;
 use crate::core::net::MaybeTlsStream;
 use crate::core::policy::{Decision, Policy, PolicyContext, evaluate_all};
@@ -16,15 +16,33 @@ use crate::core::tls::ListenTls;
 /// whether the listener is configured to terminate TLS.
 type ClientStream = MaybeTlsStream<tokio_rustls::server::TlsStream<TcpStream>>;
 
+/// Failure modes for standing up or running the accept loop itself — as
+/// opposed to a single connection's errors, which are caught and logged
+/// per-connection rather than propagated here.
+#[derive(Debug, thiserror::Error)]
+pub enum ProxyError {
+    #[error("binding listener on {addr}")]
+    Bind {
+        addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("accepting connection")]
+    Accept(#[source] std::io::Error),
+}
+
 pub async fn run(
     listen_addr: SocketAddr,
     listen_tls: Option<ListenTls>,
-    connector: LdapConnector,
+    connector: Arc<dyn Connector>,
     policies: Vec<Arc<dyn Policy>>,
-) -> Result<()> {
+) -> std::result::Result<(), ProxyError> {
     let listener = TcpListener::bind(listen_addr)
         .await
-        .with_context(|| format!("binding listener on {listen_addr}"))?;
+        .map_err(|source| ProxyError::Bind {
+            addr: listen_addr,
+            source,
+        })?;
     tracing::info!(%listen_addr, "ai-protect listening");
 
     serve(listener, listen_tls, connector, policies).await
@@ -35,11 +53,11 @@ pub async fn run(
 pub async fn serve(
     listener: TcpListener,
     listen_tls: Option<ListenTls>,
-    connector: LdapConnector,
+    connector: Arc<dyn Connector>,
     policies: Vec<Arc<dyn Policy>>,
-) -> Result<()> {
+) -> std::result::Result<(), ProxyError> {
     loop {
-        let (client_stream, peer_addr) = listener.accept().await?;
+        let (client_stream, peer_addr) = listener.accept().await.map_err(ProxyError::Accept)?;
         let listen_tls = listen_tls.clone();
         let connector = connector.clone();
         let policies = policies.clone();
@@ -64,7 +82,7 @@ pub async fn serve(
 async fn handle_connection(
     client_stream: ClientStream,
     peer_addr: SocketAddr,
-    connector: LdapConnector,
+    connector: Arc<dyn Connector>,
     policies: Vec<Arc<dyn Policy>>,
 ) -> Result<()> {
     let upstream_stream = connector.connect_upstream().await?;
@@ -76,7 +94,8 @@ async fn handle_connection(
 
     let upstream_to_client = {
         let client_write = client_write.clone();
-        async move { relay_upstream_responses(&mut upstream_read, client_write).await }
+        let connector = connector.clone();
+        async move { relay_upstream_responses(&mut upstream_read, client_write, &connector).await }
     };
 
     let client_to_upstream = {
@@ -101,24 +120,25 @@ async fn handle_connection(
 }
 
 async fn relay_upstream_responses(
-    upstream_read: &mut (impl AsyncRead + Unpin),
+    upstream_read: &mut (impl AsyncRead + Unpin + Send),
     client_write: Arc<Mutex<WriteHalf<ClientStream>>>,
+    connector: &Arc<dyn Connector>,
 ) -> Result<()> {
-    while let Some(frame) = read_frame(upstream_read).await? {
+    while let Some(frame) = connector.read_frame(upstream_read).await? {
         client_write.lock().await.write_all(&frame).await?;
     }
     Ok(())
 }
 
 async fn relay_client_requests(
-    client_read: &mut (impl AsyncRead + Unpin),
+    client_read: &mut (impl AsyncRead + Unpin + Send),
     upstream_write: &mut (impl AsyncWrite + Unpin),
     client_write: Arc<Mutex<WriteHalf<ClientStream>>>,
-    connector: &LdapConnector,
+    connector: &Arc<dyn Connector>,
     policies: &[Arc<dyn Policy>],
     identity: &Identity,
 ) -> Result<()> {
-    while let Some(frame) = read_frame(client_read).await? {
+    while let Some(frame) = connector.read_frame(client_read).await? {
         let Some(action) = connector.decode(&frame)? else {
             upstream_write.write_all(&frame).await?;
             continue;
@@ -154,6 +174,7 @@ mod tests {
     use crate::connector::ldap::test_support::{
         decode_message, encode_message, modify_request_frame,
     };
+    use crate::connector::ldap::{LdapConnector, read_frame};
     use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy};
     use crate::core::tls::UpstreamTls;
     use crate::core::tls::test_support::self_signed_tls;
@@ -205,7 +226,7 @@ mod tests {
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        let connector = LdapConnector::new(upstream_addr, None);
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
         tokio::spawn(serve(proxy_listener, None, connector, allow_all_policies()));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -229,7 +250,7 @@ mod tests {
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        let connector = LdapConnector::new(upstream_addr, None);
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
         tokio::spawn(serve(proxy_listener, None, connector, block_all_policies()));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -289,7 +310,7 @@ mod tests {
         let listen_tls = ListenTls::from_files(tls.cert_file.path(), tls.key_file.path()).unwrap();
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        let connector = LdapConnector::new(upstream_addr, None);
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
         tokio::spawn(serve(
             proxy_listener,
             Some(listen_tls),
@@ -341,7 +362,8 @@ mod tests {
         });
 
         let upstream_tls = UpstreamTls::new(tls.server_name, Some(tls.cert_file.path())).unwrap();
-        let connector = LdapConnector::new(upstream_addr, Some(upstream_tls));
+        let connector: Arc<dyn Connector> =
+            Arc::new(LdapConnector::new(upstream_addr, Some(upstream_tls)));
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
