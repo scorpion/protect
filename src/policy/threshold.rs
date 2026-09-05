@@ -2,19 +2,31 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Deserializer};
+
 use crate::connector::Action;
 use crate::identity::Identity;
 
 use super::{Decision, Policy, PolicyContext};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ThresholdConfig {
     /// Blast radius of a single request that immediately trips a block,
     /// regardless of history (e.g. one request that itself claims 4,000 accounts).
     pub max_per_request: usize,
     /// Total blast radius allowed per identity within `window`.
     pub max_per_window: usize,
+    #[serde(rename = "window_secs", deserialize_with = "deserialize_secs")]
     pub window: Duration,
+}
+
+/// TOML has no native duration type, so the config file spells the window in
+/// plain seconds (`window_secs = 60`) and this maps it onto `Duration`.
+fn deserialize_secs<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Duration::from_secs(u64::deserialize(deserializer)?))
 }
 
 /// Blocks an action outright once it (or the identity's recent history)
@@ -79,6 +91,22 @@ impl Policy for ThresholdPolicy {
 mod tests {
     use super::*;
     use crate::connector::OperationKind;
+
+    #[test]
+    fn parses_window_secs_from_toml() {
+        let config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_per_request, 10);
+        assert_eq!(config.max_per_window, 50);
+        assert_eq!(config.window, Duration::from_secs(60));
+    }
 
     fn action(blast_radius: usize) -> Action {
         Action {

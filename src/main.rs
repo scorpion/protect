@@ -7,20 +7,20 @@ mod proxy;
 #[cfg(test)]
 mod test_support;
 
-use std::sync::Arc;
-
-use anyhow::Result;
-use policy::threshold::ThresholdPolicy;
-use policy::Policy;
+use anyhow::{Context, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config = config::Config::dev_default();
-    let connector = connector::ldap::LdapConnector::new(config.upstream_addr);
-    let threshold_policy: Arc<dyn Policy> = Arc::new(ThresholdPolicy::new(config.threshold));
-    let policies = vec![threshold_policy];
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.toml".to_string());
+    let config = config::Config::load(&config_path)?;
 
-    proxy::run(config.listen_addr, connector, policies).await
+    let connector = connector::ldap::LdapConnector::new(config.proxy.upstream_addr);
+    let policies = policy::config::load(&config.policy.file)
+        .with_context(|| format!("loading policies referenced by {config_path}"))?;
+
+    proxy::run(config.proxy.listen_addr, connector, policies).await
 }

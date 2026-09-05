@@ -3,3 +3,9 @@
 
 # Mac
 .DS_Store
+
+# Secrets
+.env
+config.toml
+policies/*
+!policies/*.example.toml

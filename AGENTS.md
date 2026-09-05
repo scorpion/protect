@@ -19,8 +19,12 @@ directions, byte-for-byte.
 
 - [src/main.rs](src/main.rs) — wires up config, connector, and policies, then
   hands off to the proxy loop. Start here to see how pieces fit together.
-- [src/config.rs](src/config.rs) — process configuration. Currently a single
-  hardcoded `Config::dev_default()`; no file-based config yet.
+- [src/config.rs](src/config.rs) — process configuration, loaded from a TOML
+  file (`config.toml` by default, or a path given as the first CLI arg; see
+  `config.example.toml` for the schema). Policy definitions are deliberately
+  *not* part of this file — `[policy].file` just points at the TOML file
+  `policy::config::load` (in `src/policy/config.rs`) parses into
+  `Vec<Arc<dyn Policy>>`.
 - [src/proxy/mod.rs](src/proxy/mod.rs) — the connection loop: accepts a
   client, dials upstream, and relays frames in both directions concurrently
   via `tokio::select!`. Client→upstream frames are decoded and evaluated
@@ -43,6 +47,13 @@ directions, byte-for-byte.
   `blast_radius` exceeds `max_per_request`, and separately tracks a sliding
   window of blast radius per `Identity` to block bursts that exceed
   `max_per_window` within `window`.
+- [src/policy/config.rs](src/policy/config.rs) — TOML schema for policy files
+  (`policies/ldap.toml`, one file per connector/backend). An ordered
+  `[[policy]]` array, each table tagged by `type` (only `"threshold"` today),
+  deserializes into the matching `Policy` impl's config and gets built into
+  the `Vec<Arc<dyn Policy>>` `main.rs` hands to the proxy. Adding a new
+  `Policy` impl means adding a variant to the `PolicyEntry` enum here, not
+  changing the file format.
 - [src/identity.rs](src/identity.rs) — `Identity`, currently just the peer's
   socket address as a string. No auth/bind-based identity yet.
 - [src/audit.rs](src/audit.rs) — structured `tracing` logging of every policy
@@ -75,13 +86,26 @@ directions, byte-for-byte.
 
 ## Building and running
 
+`cargo run` needs `config.toml` (and the policy file it points at) to exist —
+copy the tracked templates first:
+
+```sh
+cp config.example.toml config.toml
+cp policies/ldap.example.toml policies/ldap.toml
+```
+
 ```sh
 cargo check          # fast type/borrow check
 cargo build           # debug build
-cargo run             # runs against config::Config::dev_default():
-                       # listens on 127.0.0.1:3890, proxies to 127.0.0.1:389
+cargo run             # loads config.toml (127.0.0.1:3890 -> 127.0.0.1:389
+                       # by default), plus the policy file it references
+cargo run -- other-config.toml   # load config from a different path
 RUST_LOG=info cargo run   # tracing-subscriber reads RUST_LOG; default is silent
 ```
+
+Both `config.toml` and everything under `policies/` (except the tracked
+`*.example.toml` templates) are gitignored, since real deployment values may
+be sensitive — see `.gitignore`.
 
 There is no test suite yet (`cargo test` runs zero tests). If you add
 behavior, prefer adding `#[test]`/`#[tokio::test]` coverage alongside it —

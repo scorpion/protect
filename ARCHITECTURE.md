@@ -147,11 +147,31 @@ beyond the in-memory threshold window.
 
 ## Configuration
 
-[`Config`](src/config.rs) is a single hardcoded `dev_default()` today
-(listen on `127.0.0.1:3890`, proxy to `127.0.0.1:389`, threshold of 10 per
-request / 50 per 60s window). File-based config (TOML/YAML) is explicitly
-noted as not-yet-built in the doc comment — anticipate a config module that
-parses into the same `Config` struct rather than a structural change.
+Two independent TOML files, deliberately kept separate:
+
+- [`Config`](src/config.rs) (`config.toml`, template in
+  `config.example.toml`) — process-level settings: `[proxy]` listen/upstream
+  addresses, and `[policy].file` pointing at the policy file to load.
+  `Config::load` reads whichever path is given as the first CLI arg,
+  defaulting to `config.toml` in the working directory.
+- Policy definitions (`policies/ldap.toml`, template in
+  `policies/ldap.example.toml`) — an ordered list of `[[policy]]` tables,
+  each tagged by `type` and parsed by
+  [`policy::config::load`](src/policy/config.rs) into a `Vec<Arc<dyn
+  Policy>>`. The only type today is `"threshold"`, deserializing straight
+  into [`ThresholdConfig`](src/policy/threshold.rs) (durations are plain
+  `window_secs` integers, since TOML has no native duration type).
+
+This split exists because policy files are one-per-connector/backend and may
+encode deployment-specific thresholds or naming that shouldn't live in the
+same file — or necessarily the same commit history — as network config. Both
+`config.toml` and everything under `policies/` besides the tracked
+`*.example.toml` files are gitignored; `main.rs` fails fast with a message
+pointing at the matching example file if either is missing.
+
+Adding a new policy *type* is a Rust change (a `PolicyEntry` variant in
+`policy::config` plus the `Policy` impl); adding a new policy *instance* of
+an existing type is a config-only change (another `[[policy]]` table).
 
 ## Extension points
 
@@ -177,9 +197,8 @@ parses into the same `Config` struct rather than a structural change.
   threshold history.
 - No TLS on either the listener or the upstream connection.
 - `Identity` is address-based, not credential-based.
-- No config file loading — everything is compiled-in via
-  `Config::dev_default()`.
-- No automated test suite yet.
+- Only one connector/policy-file pair can be wired up at a time; `main.rs`
+  doesn't yet dispatch multiple `[policy].file`s for multiple connectors.
 
 These aren't oversights to work around silently; they're the next pieces of
 this architecture, and changes that touch those areas should extend the

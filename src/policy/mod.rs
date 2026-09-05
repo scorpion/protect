@@ -1,3 +1,4 @@
+pub mod config;
 pub mod threshold;
 
 use std::sync::Arc;

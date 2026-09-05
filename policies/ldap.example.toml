@@ -1,0 +1,17 @@
+# Copy to policies/ldap.toml and adjust for your environment:
+#   cp policies/ldap.example.toml policies/ldap.toml
+# policies/*.toml (besides this example) is gitignored — see .gitignore —
+# since real thresholds and targets may be deployment-specific.
+#
+# Each [[policy]] table is one policy instance, run in the order declared.
+# evaluate_all() stops at the first block, so put cheaper/stricter checks
+# first if ordering matters. `type` selects which Policy implementation
+# backs the entry; fields beyond `type` are that policy's own config.
+
+[[policy]]
+type = "threshold"
+# A single request whose own blast radius exceeds this is blocked outright.
+max_per_request = 10
+# Total blast radius allowed per identity within window_secs.
+max_per_window = 50
+window_secs = 60

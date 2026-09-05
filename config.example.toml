@@ -1,0 +1,16 @@
+# Copy to config.toml and adjust for your environment:
+#   cp config.example.toml config.toml
+# config.toml is gitignored (see .gitignore) since a real deployment's
+# addresses may be sensitive; this file is the tracked template.
+
+[proxy]
+# Address ai-protect listens on for incoming LDAP client connections.
+listen_addr = "127.0.0.1:3890"
+# Address of the real upstream LDAP directory this proxies to.
+upstream_addr = "127.0.0.1:389"
+
+[policy]
+# Path (relative to the working directory ai-protect is run from) to the
+# TOML file describing the policies to run against decoded actions, in
+# order. See policies/ldap.example.toml for the schema.
+file = "policies/ldap.toml"
