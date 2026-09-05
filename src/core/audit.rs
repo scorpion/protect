@@ -1,6 +1,6 @@
-use crate::connector::Action;
-use crate::identity::Identity;
-use crate::policy::Decision;
+use crate::core::action::Action;
+use crate::core::identity::Identity;
+use crate::core::policy::Decision;
 
 pub fn log_decision(identity: &Identity, action: &Action, decision: &Decision) {
     match decision {
@@ -27,7 +27,7 @@ pub fn log_decision(identity: &Identity, action: &Action, decision: &Decision) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::OperationKind;
+    use crate::core::action::OperationKind;
     use std::io;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;

@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer};
 
-use crate::connector::Action;
-use crate::identity::Identity;
+use crate::core::action::Action;
+use crate::core::identity::Identity;
 
 use super::{Decision, Policy, PolicyContext};
 
@@ -90,7 +90,7 @@ impl Policy for ThresholdPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::OperationKind;
+    use crate::core::action::OperationKind;
 
     #[test]
     fn parses_window_secs_from_toml() {

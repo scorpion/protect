@@ -7,10 +7,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use crate::connector::ldap::{read_frame, LdapConnector};
-use crate::identity::Identity;
-use crate::net::MaybeTlsStream;
-use crate::policy::{evaluate_all, Decision, Policy, PolicyContext};
-use crate::tls::ListenTls;
+use crate::core::identity::Identity;
+use crate::core::net::MaybeTlsStream;
+use crate::core::policy::{evaluate_all, Decision, Policy, PolicyContext};
+use crate::core::tls::ListenTls;
 
 /// The client-facing connection, either plaintext or LDAPS depending on
 /// whether the listener is configured to terminate TLS.
@@ -128,7 +128,7 @@ async fn relay_client_requests(
             identity: identity.clone(),
         };
         let decision = evaluate_all(policies, &action, &ctx);
-        crate::audit::log_decision(identity, &action, &decision);
+        crate::core::audit::log_decision(identity, &action, &decision);
 
         match decision {
             Decision::Allow => upstream_write.write_all(&frame).await?,
@@ -151,9 +151,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::policy::threshold::{ThresholdConfig, ThresholdPolicy};
+    use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy};
+    use crate::core::tls::UpstreamTls;
     use crate::test_support::{decode_message, encode_message, modify_request_frame, self_signed_tls};
-    use crate::tls::UpstreamTls;
 
     fn allow_all_policies() -> Vec<Arc<dyn Policy>> {
         vec![Arc::new(ThresholdPolicy::new(ThresholdConfig {

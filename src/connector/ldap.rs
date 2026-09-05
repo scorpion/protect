@@ -5,9 +5,9 @@ use rasn_ldap::{ChangeOperation, LdapMessage, LdapResult, ModifyResponse, Protoc
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
 
-use super::{Action, OperationKind};
-use crate::net::MaybeTlsStream;
-use crate::tls::UpstreamTls;
+use crate::core::action::{Action, OperationKind};
+use crate::core::net::MaybeTlsStream;
+use crate::core::tls::UpstreamTls;
 
 /// The upstream connection, either plaintext or LDAPS depending on how the
 /// connector was configured.

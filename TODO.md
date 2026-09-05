@@ -18,7 +18,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
       timeout, and no read/write timeout — a slow-loris client or a hung
       upstream pins a task and its memory indefinitely.
 - [ ] **No mutual TLS.** Both `ClientConfig`/`ServerConfig` in
-      [`src/tls.rs`](src/tls.rs) use `with_no_client_auth()`. Right now
+      [`src/core/tls.rs`](src/core/tls.rs) use `with_no_client_auth()`. Right now
       anything that can reach the listener and speak LDAP is trusted equally;
       client certificate auth would let the proxy authenticate *which* agent
       is connecting instead of just trusting its source IP.
@@ -26,7 +26,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
       either hop (see updated [ARCHITECTURE.md](ARCHITECTURE.md#transport-plaintext-or-tls)).
       Any environment standardized on port 389 + StartTLS instead of 636
       can't sit behind this proxy today.
-- [ ] **Native cert-store load errors are swallowed.** [`tls.rs:49`](src/tls.rs)
+- [ ] **Native cert-store load errors are swallowed.** [`tls.rs:49`](src/core/tls.rs)
       iterates `rustls_native_certs::load_native_certs().certs` and silently
       discards `.errors` — a partially-broken OS trust store fails open
       instead of being logged.
@@ -37,7 +37,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## High — identity & policy coverage
 
-- [ ] **Identity is source-IP-only.** [`Identity::from_peer_addr`](src/identity.rs)
+- [ ] **Identity is source-IP-only.** [`Identity::from_peer_addr`](src/core/identity.rs)
       means two agents behind the same NAT/egress (very common for
       containerized/agent-fleet deployments) share one blast-radius budget,
       and a reconnect resets nothing but also proves nothing. Derive identity
@@ -58,7 +58,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## High — reliability & scale
 
-- [ ] **Policy state is process-local and in-memory.** [`ThresholdPolicy`](src/policy/threshold.rs)
+- [ ] **Policy state is process-local and in-memory.** [`ThresholdPolicy`](src/core/policy/threshold.rs)
       keeps history in a `Mutex<HashMap<...>>` — a restart resets all
       counters, and running more than one instance for HA silently
       double-budgets every identity. Needs a shared backing store (e.g.
@@ -79,7 +79,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
 ## Medium — observability & operations
 
 - [ ] **No metrics.** Only `tracing` logs exist
-      ([`audit::log_decision`](src/audit.rs)); there's no
+      ([`audit::log_decision`](src/core/audit.rs)); there's no
       Prometheus/OpenTelemetry counters for allow/block rates, active
       connections, upstream latency, or TLS handshake failures.
 - [ ] **No structured log output option.** `tracing_subscriber::fmt::init()`

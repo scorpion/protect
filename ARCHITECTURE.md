@@ -64,7 +64,7 @@ on a `MaybeTlsStream` (plain or TLS) exactly as they would on a bare
 ## Component pipeline: Connector → Action → Policy → Decision
 
 The system is built around one seam: a normalized `Action` type
-([src/connector/mod.rs](src/connector/mod.rs)) that decouples "what wire
+([src/core/action.rs](src/core/action.rs)) that decouples "what wire
 protocol is this" from "should this be allowed."
 
 ```
@@ -93,7 +93,7 @@ protocol is this" from "should this be allowed."
   so a future connector recognizing a bulk operation (e.g. an LDAP
   extended-op batch, or a REST API's array payload) can report a number
   greater than one without changing anything downstream.
-- **Policy** ([src/policy/mod.rs](src/policy/mod.rs)) is pure decision
+- **Policy** ([src/core/policy/mod.rs](src/core/policy/mod.rs)) is pure decision
   logic: `fn evaluate(&self, action: &Action, ctx: &PolicyContext) ->
   Decision`. Policies don't know about sockets, frames, or LDAP result
   codes — only `Action` and `Identity`. `evaluate_all` runs the configured
@@ -116,18 +116,18 @@ or TLS, controlled by two optional config tables (`[proxy.listen_tls]`,
 modules make this an orthogonal concern that neither the connector's framing
 logic nor the proxy loop needs to branch on:
 
-- [`net::MaybeTlsStream`](src/net.rs) is a thin enum (`Plain(TcpStream)` /
+- [`net::MaybeTlsStream`](src/core/net.rs) is a thin enum (`Plain(TcpStream)` /
   `Tls(T)`) implementing `AsyncRead`/`AsyncWrite` by delegating to whichever
   variant is active. `LdapConnector::connect_upstream` and the listener's
   accept loop both return/wrap this type, so `read_frame`, `handle_connection`,
   and the two relay functions are written once against "an async
   duplex stream" and don't know or care whether TLS is underneath.
-- [`tls::UpstreamTls`](src/tls.rs) builds a `rustls` `ClientConfig` and
+- [`tls::UpstreamTls`](src/core/tls.rs) builds a `rustls` `ClientConfig` and
   performs the client-side LDAPS handshake against `upstream_addr`,
   validating the upstream's certificate against a configured `server_name`
   (required since directory certs are issued for hostnames, not the IP in
   `upstream_addr`) and trusting either the OS store or a configured
-  `ca_file`. [`tls::ListenTls`](src/tls.rs) builds a `ServerConfig` from a
+  `ca_file`. [`tls::ListenTls`](src/core/tls.rs) builds a `ServerConfig` from a
   cert/key pair and performs the server-side handshake for clients
   connecting to `listen_addr`. Both are `Option`al and independent: ai-protect
   can terminate LDAPS for clients while speaking plaintext LDAP upstream, do
@@ -143,7 +143,7 @@ mid-session) is not implemented on either side.
 
 ## Policy: blast-radius thresholding
 
-The only policy implemented, [`ThresholdPolicy`](src/policy/threshold.rs),
+The only policy implemented, [`ThresholdPolicy`](src/core/policy/threshold.rs),
 encodes "4 accounts is fine, 4,000 is not" with two independent checks:
 
 1. **Per-request cap** (`max_per_request`): a single action whose own
@@ -165,7 +165,7 @@ Redis) for the window to be enforced correctly across instances.
 
 ## Identity
 
-[`Identity`](src/identity.rs) is currently just the client's TCP peer
+[`Identity`](src/core/identity.rs) is currently just the client's TCP peer
 address, stringified. It exists as its own type (rather than passing
 `SocketAddr` around directly) so that policies and audit logging depend on
 an abstraction, not a transport detail — the intent is for this to become
@@ -176,7 +176,7 @@ distinguish two clients behind the same NAT/address.
 
 ## Audit logging
 
-[`audit::log_decision`](src/audit.rs) is called once per evaluated action,
+[`audit::log_decision`](src/core/audit.rs) is called once per evaluated action,
 for both `Allow` and `Block`, and is intentionally decoupled from policy
 logic itself — policies decide, audit only records. It emits structured
 `tracing` events (`info` for allow, `warn` for block) carrying identity,
@@ -200,9 +200,9 @@ Two independent TOML files, deliberately kept separate:
 - Policy definitions (`policies/ldap.toml`, template in
   `policies/ldap.example.toml`) — an ordered list of `[[policy]]` tables,
   each tagged by `type` and parsed by
-  [`policy::config::load`](src/policy/config.rs) into a `Vec<Arc<dyn
+  [`policy::config::load`](src/core/policy/config.rs) into a `Vec<Arc<dyn
   Policy>>`. The only type today is `"threshold"`, deserializing straight
-  into [`ThresholdConfig`](src/policy/threshold.rs) (durations are plain
+  into [`ThresholdConfig`](src/core/policy/threshold.rs) (durations are plain
   `window_secs` integers, since TOML has no native duration type).
 
 This split exists because policy files are one-per-connector/backend and may

@@ -3,8 +3,8 @@ pub mod threshold;
 
 use std::sync::Arc;
 
-use crate::connector::Action;
-use crate::identity::Identity;
+use crate::core::action::Action;
+use crate::core::identity::Identity;
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -34,7 +34,7 @@ pub fn evaluate_all(policies: &[Arc<dyn Policy>], action: &Action, ctx: &PolicyC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::OperationKind;
+    use crate::core::action::OperationKind;
 
     struct AlwaysAllow;
     impl Policy for AlwaysAllow {

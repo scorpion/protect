@@ -52,9 +52,9 @@ fn parse(raw: &str) -> Result<Vec<Arc<dyn Policy>>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::connector::{Action, OperationKind};
-    use crate::identity::Identity;
-    use crate::policy::{Decision, PolicyContext, evaluate_all};
+    use crate::core::action::{Action, OperationKind};
+    use crate::core::identity::Identity;
+    use crate::core::policy::{Decision, PolicyContext, evaluate_all};
 
     use super::*;
 

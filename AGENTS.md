@@ -17,20 +17,25 @@ directions, byte-for-byte.
 
 ## Module map
 
+`src/core/` holds everything shared across connectors and the proxy loop —
+the `Action` seam, identity, audit logging, transport (`net`/`tls`), and the
+policy engine — as opposed to `src/connector/`, which is protocol-specific
+(LDAP today), and `src/proxy/`, which is the connection-handling orchestration.
+
 - [src/main.rs](src/main.rs) — wires up config, connector, and policies, then
   hands off to the proxy loop. Start here to see how pieces fit together.
 - [src/config.rs](src/config.rs) — process configuration, loaded from a TOML
   file (`config.toml` by default, or a path given as the first CLI arg; see
   `config.example.toml` for the schema). Policy definitions are deliberately
   *not* part of this file — `[policy].file` just points at the TOML file
-  `policy::config::load` (in `src/policy/config.rs`) parses into
+  `policy::config::load` (in `src/core/policy/config.rs`) parses into
   `Vec<Arc<dyn Policy>>`.
 - [src/proxy/mod.rs](src/proxy/mod.rs) — the connection loop: accepts a
   client, dials upstream, and relays frames in both directions concurrently
   via `tokio::select!`. Client→upstream frames are decoded and evaluated
   against policy before being forwarded or rejected; upstream→client frames
   pass through untouched.
-- [src/connector/mod.rs](src/connector/mod.rs) — defines `Action` /
+- [src/core/action.rs](src/core/action.rs) — defines `Action` /
   `OperationKind`, the normalized representation a connector produces so the
   policy engine never has to understand a wire protocol.
 - [src/connector/ldap.rs](src/connector/ldap.rs) — the only connector today.
@@ -39,24 +44,24 @@ directions, byte-for-byte.
   account-lock attribute (`LOCK_ATTRIBUTES`, covering AD/OpenLDAP/389 DS
   schemas) as an `Action`. Also builds the `UnwillingToPerform` rejection
   response sent back to a blocked client.
-- [src/policy/mod.rs](src/policy/mod.rs) — the `Policy` trait
+- [src/core/policy/mod.rs](src/core/policy/mod.rs) — the `Policy` trait
   (`evaluate(&Action, &PolicyContext) -> Decision`) and `evaluate_all`, which
   runs every configured policy and stops at the first `Block`.
-- [src/policy/threshold.rs](src/policy/threshold.rs) — `ThresholdPolicy`, the
+- [src/core/policy/threshold.rs](src/core/policy/threshold.rs) — `ThresholdPolicy`, the
   only policy implemented so far. Blocks a single request whose
   `blast_radius` exceeds `max_per_request`, and separately tracks a sliding
   window of blast radius per `Identity` to block bursts that exceed
   `max_per_window` within `window`.
-- [src/policy/config.rs](src/policy/config.rs) — TOML schema for policy files
+- [src/core/policy/config.rs](src/core/policy/config.rs) — TOML schema for policy files
   (`policies/ldap.toml`, one file per connector/backend). An ordered
   `[[policy]]` array, each table tagged by `type` (only `"threshold"` today),
   deserializes into the matching `Policy` impl's config and gets built into
   the `Vec<Arc<dyn Policy>>` `main.rs` hands to the proxy. Adding a new
   `Policy` impl means adding a variant to the `PolicyEntry` enum here, not
   changing the file format.
-- [src/identity.rs](src/identity.rs) — `Identity`, currently just the peer's
+- [src/core/identity.rs](src/core/identity.rs) — `Identity`, currently just the peer's
   socket address as a string. No auth/bind-based identity yet.
-- [src/audit.rs](src/audit.rs) — structured `tracing` logging of every policy
+- [src/core/audit.rs](src/core/audit.rs) — structured `tracing` logging of every policy
   decision (allow or block), independent of the policy logic itself.
 
 ## Architecture notes worth knowing before changing things
@@ -64,7 +69,7 @@ directions, byte-for-byte.
 - **Connector → Action → Policy → Decision** is the core pipeline. A new
   backend (e.g. a different directory protocol, or a non-LDAP admin API)
   means a new module under `src/connector/` that produces `Action`s; it
-  should not require touching `src/policy/`. A new rule means a new
+  should not require touching `src/core/policy/`. A new rule means a new
   `Policy` impl; it should not require touching `src/connector/`.
 - Policies are pure decision logic — `evaluate_all` stops at the first
   block, so ordering in the `Vec<Arc<dyn Policy>>` built in `main.rs` matters
