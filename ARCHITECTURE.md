@@ -45,7 +45,7 @@ about, and forwards everything else as opaque bytes.
 ```
 
 Two directions of the connection are driven concurrently by
-[`proxy::handle_connection`](src/proxy/mod.rs) via `tokio::select!`:
+[`proxy::handle_connection`](src/proxy.rs) via `tokio::select!`:
 
 - **client → upstream**: every frame is decoded; only frames that decode to
   an `Action` are evaluated by policy. Everything else — binds, searches,
@@ -93,7 +93,7 @@ protocol is this" from "should this be allowed."
   so a future connector recognizing a bulk operation (e.g. an LDAP
   extended-op batch, or a REST API's array payload) can report a number
   greater than one without changing anything downstream.
-- **Policy** ([src/core/policy/mod.rs](src/core/policy/mod.rs)) is pure decision
+- **Policy** ([src/core/policy.rs](src/core/policy.rs)) is pure decision
   logic: `fn evaluate(&self, action: &Action, ctx: &PolicyContext) ->
   Decision`. Policies don't know about sockets, frames, or LDAP result
   codes — only `Action` and `Identity`. `evaluate_all` runs the configured
@@ -209,8 +209,8 @@ This split exists because policy files are one-per-connector/backend and may
 encode deployment-specific thresholds or naming that shouldn't live in the
 same file — or necessarily the same commit history — as network config. Both
 `config.toml` and everything under `policies/` besides the tracked
-`*.example.toml` files are gitignored; `main.rs` fails fast with a message
-pointing at the matching example file if either is missing.
+`*.example.toml` files are gitignored; `ai_protect::run` fails fast with a
+message pointing at the matching example file if either is missing.
 
 Adding a new policy *type* is a Rust change (a `PolicyEntry` variant in
 `policy::config` plus the `Policy` impl); adding a new policy *instance* of
@@ -221,18 +221,19 @@ an existing type is a config-only change (another `[[policy]]` table).
 - **New backend protocol** (e.g. a different directory API, or a non-LDAP
   admin surface): add a module under `src/connector/` that reads its own
   framing and produces `Action`s for the operations worth policing. Wire it
-  up in `main.rs` alongside (or instead of) `LdapConnector`. The proxy loop
-  and policy engine need no changes as long as the connector exposes
-  `decode`/rejection-building analogous to `LdapConnector`'s.
+  up in `ai_protect::run` alongside (or instead of) `LdapConnector`. The
+  proxy loop and policy engine need no changes as long as the connector
+  exposes `decode`/rejection-building analogous to `LdapConnector`'s.
 - **New policy rule**: implement `Policy` and add it to the `Vec<Arc<dyn
-  Policy>>` built in `main.rs`. Because `evaluate_all` stops at the first
-  block, place cheap/fast-failing policies earlier if ordering matters for
-  performance; place stateful policies with care since only `Allow`s should
-  typically advance their state (see `ThresholdPolicy`).
+  Policy>>` built in `ai_protect::run`. Because `evaluate_all` stops at the
+  first block, place cheap/fast-failing policies earlier if ordering matters
+  for performance; place stateful policies with care since only `Allow`s
+  should typically advance their state (see `ThresholdPolicy`).
 - **Multiple upstreams / multiple listeners**: not modeled yet.
   `proxy::run` takes one `listen_addr` and one connector bound to one
   `upstream_addr`; supporting several would mean either multiple `run` tasks
-  in `main.rs` or extending `Config` to a list and adding a dispatch layer.
+  in `ai_protect::run` or extending `Config` to a list and adding a dispatch
+  layer.
 
 ## Known gaps (by design, at this stage)
 
@@ -244,8 +245,9 @@ an existing type is a config-only change (another `[[policy]]` table).
   directory or client that expects to upgrade a plaintext port 389
   connection mid-session isn't accommodated.
 - `Identity` is address-based, not credential-based.
-- Only one connector/policy-file pair can be wired up at a time; `main.rs`
-  doesn't yet dispatch multiple `[policy].file`s for multiple connectors.
+- Only one connector/policy-file pair can be wired up at a time;
+  `ai_protect::run` doesn't yet dispatch multiple `[policy].file`s for
+  multiple connectors.
 
 These aren't oversights to work around silently; they're the next pieces of
 this architecture, and changes that touch those areas should extend the

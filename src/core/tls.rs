@@ -3,11 +3,11 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::net::TcpStream;
-use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
+use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
 
 /// rustls 0.23 requires a process-wide default crypto provider before any
 /// `ClientConfig`/`ServerConfig` can be built. Installing twice (e.g. across

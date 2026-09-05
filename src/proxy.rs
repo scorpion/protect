@@ -6,10 +6,10 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::connector::ldap::{read_frame, LdapConnector};
+use crate::connector::ldap::{LdapConnector, read_frame};
 use crate::core::identity::Identity;
 use crate::core::net::MaybeTlsStream;
-use crate::core::policy::{evaluate_all, Decision, Policy, PolicyContext};
+use crate::core::policy::{Decision, Policy, PolicyContext, evaluate_all};
 use crate::core::tls::ListenTls;
 
 /// The client-facing connection, either plaintext or LDAPS depending on
@@ -153,7 +153,9 @@ mod tests {
     use super::*;
     use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy};
     use crate::core::tls::UpstreamTls;
-    use crate::test_support::{decode_message, encode_message, modify_request_frame, self_signed_tls};
+    use crate::test_support::{
+        decode_message, encode_message, modify_request_frame, self_signed_tls,
+    };
 
     fn allow_all_policies() -> Vec<Arc<dyn Policy>> {
         vec![Arc::new(ThresholdPolicy::new(ThresholdConfig {
@@ -176,8 +178,12 @@ mod tests {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
 
-        let request_frame =
-            modify_request_frame(1, "cn=alice,dc=example,dc=com", "userAccountControl", b"514");
+        let request_frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
         let response_frame = encode_message(
             1,
             ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
@@ -215,7 +221,8 @@ mod tests {
 
         tokio::spawn(async move {
             let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
-            let result = timeout(Duration::from_millis(200), read_frame(&mut upstream_stream)).await;
+            let result =
+                timeout(Duration::from_millis(200), read_frame(&mut upstream_stream)).await;
             assert!(result.is_err(), "blocked request must never reach upstream");
         });
 
@@ -225,8 +232,12 @@ mod tests {
         tokio::spawn(serve(proxy_listener, None, connector, block_all_policies()));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
-        let request_frame =
-            modify_request_frame(7, "cn=alice,dc=example,dc=com", "userAccountControl", b"514");
+        let request_frame = modify_request_frame(
+            7,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
         client_stream.write_all(&request_frame).await.unwrap();
 
         let rejection = read_frame(&mut client_stream).await.unwrap().unwrap();
@@ -250,8 +261,12 @@ mod tests {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
 
-        let request_frame =
-            modify_request_frame(1, "cn=alice,dc=example,dc=com", "userAccountControl", b"514");
+        let request_frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
         let response_frame = encode_message(
             1,
             ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
@@ -297,8 +312,12 @@ mod tests {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
 
-        let request_frame =
-            modify_request_frame(1, "cn=alice,dc=example,dc=com", "userAccountControl", b"514");
+        let request_frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
         let response_frame = encode_message(
             1,
             ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(

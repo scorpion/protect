@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rasn_ldap::{ChangeOperation, LdapMessage, LdapResult, ModifyResponse, ProtocolOp, ResultCode};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
@@ -59,8 +59,10 @@ impl LdapConnector {
         };
 
         let touches_lock_attribute = modify.changes.iter().any(|change| {
-            matches!(change.operation, ChangeOperation::Add | ChangeOperation::Replace)
-                && LOCK_ATTRIBUTES.contains(&change.modification.r#type.0.to_lowercase().as_str())
+            matches!(
+                change.operation,
+                ChangeOperation::Add | ChangeOperation::Replace
+            ) && LOCK_ATTRIBUTES.contains(&change.modification.r#type.0.to_lowercase().as_str())
         });
 
         if !touches_lock_attribute {
@@ -144,9 +146,17 @@ mod tests {
 
     #[test]
     fn decodes_lock_attribute_modify_as_account_lock_action() {
-        let frame = modify_request_frame(1, "cn=alice,dc=example,dc=com", "userAccountControl", b"514");
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
 
-        let action = connector().decode(&frame).unwrap().expect("expected an action");
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
 
         assert_eq!(action.backend, "ldap");
         assert_eq!(action.operation, OperationKind::AccountLock);
@@ -156,7 +166,12 @@ mod tests {
 
     #[test]
     fn ignores_modify_of_unrelated_attribute() {
-        let frame = modify_request_frame(1, "cn=alice,dc=example,dc=com", "description", b"new description");
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "description",
+            b"new description",
+        );
 
         let action = connector().decode(&frame).unwrap();
 
@@ -174,7 +189,12 @@ mod tests {
 
     #[test]
     fn lock_attribute_match_is_case_insensitive() {
-        let frame = modify_request_frame(1, "cn=alice,dc=example,dc=com", "USERACCOUNTCONTROL", b"514");
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "USERACCOUNTCONTROL",
+            b"514",
+        );
 
         let action = connector().decode(&frame).unwrap();
 
@@ -183,9 +203,16 @@ mod tests {
 
     #[test]
     fn build_rejection_preserves_message_id_and_reason() {
-        let frame = modify_request_frame(42, "cn=alice,dc=example,dc=com", "userAccountControl", b"514");
+        let frame = modify_request_frame(
+            42,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
 
-        let rejection = connector().build_rejection(&frame, "too many locks").unwrap();
+        let rejection = connector()
+            .build_rejection(&frame, "too many locks")
+            .unwrap();
         let message = decode_message(&rejection);
 
         assert_eq!(message.message_id, 42);
@@ -200,7 +227,12 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_reads_short_form_length() {
-        let frame = modify_request_frame(1, "cn=alice,dc=example,dc=com", "userAccountControl", b"514");
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
         let mut cursor = std::io::Cursor::new(frame.clone());
 
         let read = read_frame(&mut cursor).await.unwrap().unwrap();
@@ -213,8 +245,16 @@ mod tests {
         // A large attribute value forces BER into long-form length encoding
         // (content > 127 bytes), which exercises the other branch of read_frame.
         let big_value = vec![b'x'; 300];
-        let frame = modify_request_frame(1, "cn=alice,dc=example,dc=com", "userAccountControl", &big_value);
-        assert!(frame[1] & 0x80 != 0, "expected long-form length for this test to be meaningful");
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            &big_value,
+        );
+        assert!(
+            frame[1] & 0x80 != 0,
+            "expected long-form length for this test to be meaningful"
+        );
         let mut cursor = std::io::Cursor::new(frame.clone());
 
         let read = read_frame(&mut cursor).await.unwrap().unwrap();

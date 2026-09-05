@@ -13,7 +13,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
       before a single byte of content is read. Add a sane max-frame-size cap
       (config or const) and close the connection over it.
 - [ ] **No connection limits or timeouts.** The accept loop in
-      [`proxy::serve`](src/proxy/mod.rs) spawns an unbounded task per
+      [`proxy::serve`](src/proxy.rs) spawns an unbounded task per
       connection with no cap on concurrent connections, no idle-connection
       timeout, and no read/write timeout — a slow-loris client or a hung
       upstream pins a task and its memory indefinitely.
@@ -63,15 +63,15 @@ priority; within a group, roughly in the order you'd want to tackle them.
       counters, and running more than one instance for HA silently
       double-budgets every identity. Needs a shared backing store (e.g.
       Redis) before this can run as more than a single process.
-- [ ] **Single connector/listener only.** `main.rs` wires up exactly one
-      `LdapConnector` behind one listener; there's no way to front more than
-      one directory or protocol from a single deployment (see
+- [ ] **Single connector/listener only.** `ai_protect::run` wires up exactly
+      one `LdapConnector` behind one listener; there's no way to front more
+      than one directory or protocol from a single deployment (see
       [ARCHITECTURE.md "Multiple upstreams / multiple listeners"](ARCHITECTURE.md#extension-points)).
 - [ ] **No config hot-reload.** Changing thresholds, addresses, or TLS
       settings requires a process restart, which currently also hard-drops
       every in-flight connection (see next item).
 - [ ] **No graceful shutdown.** There's no `SIGTERM`/`SIGINT` handling in
-      [`main.rs`](src/main.rs) (tokio's `signal` feature isn't even enabled
+      [`main.rs`](src/main.rs)/[`lib.rs`](src/lib.rs) (tokio's `signal` feature isn't even enabled
       in [`Cargo.toml`](Cargo.toml)) and no draining of in-flight connections
       — a rolling restart or deploy hard-cuts active LDAP sessions instead of
       finishing them.
@@ -104,7 +104,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
       there if it's a placeholder for planned work.
 - [ ] **`README.md` is stale.** Its Status line still says "no TLS ... no
       test suite yet," which predates both the TLS work and the current test
-      suite across `net.rs`/`tls.rs`/`config.rs`/`proxy/mod.rs`/etc. — update
+      suite across `net.rs`/`tls.rs`/`config.rs`/`proxy.rs`/etc. — update
       it alongside this TODO so it doesn't mislead a new reader.
 - [ ] **No fuzzing of the decode path.** `read_frame` and the `rasn` BER
       decode in [`LdapConnector::decode`](src/connector/ldap.rs) are the only

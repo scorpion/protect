@@ -22,7 +22,11 @@ pub trait Policy: Send + Sync {
 
 /// Runs every policy in order and stops at the first block, so the caller
 /// gets one authoritative decision regardless of how many rules are configured.
-pub fn evaluate_all(policies: &[Arc<dyn Policy>], action: &Action, ctx: &PolicyContext) -> Decision {
+pub fn evaluate_all(
+    policies: &[Arc<dyn Policy>],
+    action: &Action,
+    ctx: &PolicyContext,
+) -> Decision {
     for policy in policies {
         if let Decision::Block { reason } = policy.evaluate(action, ctx) {
             return Decision::Block { reason };

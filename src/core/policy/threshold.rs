@@ -180,8 +180,14 @@ mod tests {
         let alice = Identity("alice".into());
         let bob = Identity("bob".into());
 
-        assert!(matches!(policy.evaluate(&action(1), &ctx_for(&alice)), Decision::Allow));
-        assert!(matches!(policy.evaluate(&action(1), &ctx_for(&bob)), Decision::Allow));
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&alice)),
+            Decision::Allow
+        ));
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&bob)),
+            Decision::Allow
+        ));
         assert!(matches!(
             policy.evaluate(&action(1), &ctx_for(&alice)),
             Decision::Block { .. }
@@ -197,7 +203,10 @@ mod tests {
         });
         let identity = Identity("agent-1".into());
 
-        assert!(matches!(policy.evaluate(&action(1), &ctx_for(&identity)), Decision::Allow));
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&identity)),
+            Decision::Allow
+        ));
         assert!(matches!(
             policy.evaluate(&action(1), &ctx_for(&identity)),
             Decision::Block { .. }
@@ -205,6 +214,9 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(40));
 
-        assert!(matches!(policy.evaluate(&action(1), &ctx_for(&identity)), Decision::Allow));
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&identity)),
+            Decision::Allow
+        ));
     }
 }

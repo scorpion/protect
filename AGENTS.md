@@ -22,7 +22,9 @@ the `Action` seam, identity, audit logging, transport (`net`/`tls`), and the
 policy engine — as opposed to `src/connector/`, which is protocol-specific
 (LDAP today), and `src/proxy/`, which is the connection-handling orchestration.
 
-- [src/main.rs](src/main.rs) — wires up config, connector, and policies, then
+- [src/main.rs](src/main.rs) — thin binary entry point: reads the config
+  path CLI arg and hands off to `ai_protect::run`.
+- [src/lib.rs](src/lib.rs) — wires up config, connector, and policies, then
   hands off to the proxy loop. Start here to see how pieces fit together.
 - [src/config.rs](src/config.rs) — process configuration, loaded from a TOML
   file (`config.toml` by default, or a path given as the first CLI arg; see
@@ -30,7 +32,7 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   *not* part of this file — `[policy].file` just points at the TOML file
   `policy::config::load` (in `src/core/policy/config.rs`) parses into
   `Vec<Arc<dyn Policy>>`.
-- [src/proxy/mod.rs](src/proxy/mod.rs) — the connection loop: accepts a
+- [src/proxy.rs](src/proxy.rs) — the connection loop: accepts a
   client, dials upstream, and relays frames in both directions concurrently
   via `tokio::select!`. Client→upstream frames are decoded and evaluated
   against policy before being forwarded or rejected; upstream→client frames
@@ -44,7 +46,7 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   account-lock attribute (`LOCK_ATTRIBUTES`, covering AD/OpenLDAP/389 DS
   schemas) as an `Action`. Also builds the `UnwillingToPerform` rejection
   response sent back to a blocked client.
-- [src/core/policy/mod.rs](src/core/policy/mod.rs) — the `Policy` trait
+- [src/core/policy.rs](src/core/policy.rs) — the `Policy` trait
   (`evaluate(&Action, &PolicyContext) -> Decision`) and `evaluate_all`, which
   runs every configured policy and stops at the first `Block`.
 - [src/core/policy/threshold.rs](src/core/policy/threshold.rs) — `ThresholdPolicy`, the

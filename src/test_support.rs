@@ -7,7 +7,7 @@ use rasn_ldap::{
     AuthenticationChoice, BindRequest, ChangeOperation, LdapMessage, ModifyRequest,
     ModifyRequestChanges, PartialAttribute, ProtocolOp,
 };
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tempfile::NamedTempFile;
 
 pub fn encode_message(message_id: u32, protocol_op: ProtocolOp) -> Vec<u8> {
