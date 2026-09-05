@@ -6,6 +6,12 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
 
 use super::{Action, OperationKind};
+use crate::net::MaybeTlsStream;
+use crate::tls::UpstreamTls;
+
+/// The upstream connection, either plaintext or LDAPS depending on how the
+/// connector was configured.
+pub type UpstreamStream = MaybeTlsStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 /// Attribute names (lowercased) whose modification we treat as an account
 /// lock/unlock across common directory schemas (AD, OpenLDAP, 389 DS).
@@ -19,17 +25,26 @@ const LOCK_ATTRIBUTES: &[&str] = &[
 #[derive(Clone)]
 pub struct LdapConnector {
     upstream_addr: SocketAddr,
+    upstream_tls: Option<UpstreamTls>,
 }
 
 impl LdapConnector {
-    pub fn new(upstream_addr: SocketAddr) -> Self {
-        Self { upstream_addr }
+    pub fn new(upstream_addr: SocketAddr, upstream_tls: Option<UpstreamTls>) -> Self {
+        Self {
+            upstream_addr,
+            upstream_tls,
+        }
     }
 
-    pub async fn connect_upstream(&self) -> Result<TcpStream> {
-        TcpStream::connect(self.upstream_addr)
+    pub async fn connect_upstream(&self) -> Result<UpstreamStream> {
+        let tcp = TcpStream::connect(self.upstream_addr)
             .await
-            .with_context(|| format!("connecting to upstream LDAP at {}", self.upstream_addr))
+            .with_context(|| format!("connecting to upstream LDAP at {}", self.upstream_addr))?;
+
+        match &self.upstream_tls {
+            None => Ok(MaybeTlsStream::Plain(tcp)),
+            Some(tls) => Ok(MaybeTlsStream::Tls(tls.connect(tcp).await?)),
+        }
     }
 
     /// Decode a full LDAP message frame and, if it represents an operation the
@@ -124,7 +139,7 @@ mod tests {
     use crate::test_support::{bind_request_frame, decode_message, modify_request_frame};
 
     fn connector() -> LdapConnector {
-        LdapConnector::new("127.0.0.1:389".parse().unwrap())
+        LdapConnector::new("127.0.0.1:389".parse().unwrap(), None)
     }
 
     #[test]

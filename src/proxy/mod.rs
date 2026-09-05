@@ -2,17 +2,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use crate::connector::ldap::{read_frame, LdapConnector};
 use crate::identity::Identity;
+use crate::net::MaybeTlsStream;
 use crate::policy::{evaluate_all, Decision, Policy, PolicyContext};
+use crate::tls::ListenTls;
+
+/// The client-facing connection, either plaintext or LDAPS depending on
+/// whether the listener is configured to terminate TLS.
+type ClientStream = MaybeTlsStream<tokio_rustls::server::TlsStream<TcpStream>>;
 
 pub async fn run(
     listen_addr: SocketAddr,
+    listen_tls: Option<ListenTls>,
     connector: LdapConnector,
     policies: Vec<Arc<dyn Policy>>,
 ) -> Result<()> {
@@ -21,23 +27,34 @@ pub async fn run(
         .with_context(|| format!("binding listener on {listen_addr}"))?;
     tracing::info!(%listen_addr, "ai-protect listening");
 
-    serve(listener, connector, policies).await
+    serve(listener, listen_tls, connector, policies).await
 }
 
 /// Accepts connections from an already-bound listener. Split out from `run`
 /// so tests can bind an ephemeral port and drive the accept loop directly.
 pub async fn serve(
     listener: TcpListener,
+    listen_tls: Option<ListenTls>,
     connector: LdapConnector,
     policies: Vec<Arc<dyn Policy>>,
 ) -> Result<()> {
     loop {
         let (client_stream, peer_addr) = listener.accept().await?;
+        let listen_tls = listen_tls.clone();
         let connector = connector.clone();
         let policies = policies.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(client_stream, peer_addr, connector, policies).await {
+            let result = async {
+                let client_stream = match &listen_tls {
+                    None => MaybeTlsStream::Plain(client_stream),
+                    Some(tls) => MaybeTlsStream::Tls(tls.accept(client_stream).await?),
+                };
+                handle_connection(client_stream, peer_addr, connector, policies).await
+            }
+            .await;
+
+            if let Err(err) = result {
                 tracing::warn!(%peer_addr, error = %err, "connection ended with error");
             }
         });
@@ -45,7 +62,7 @@ pub async fn serve(
 }
 
 async fn handle_connection(
-    client_stream: TcpStream,
+    client_stream: ClientStream,
     peer_addr: SocketAddr,
     connector: LdapConnector,
     policies: Vec<Arc<dyn Policy>>,
@@ -53,8 +70,8 @@ async fn handle_connection(
     let upstream_stream = connector.connect_upstream().await?;
     let identity = Identity::from_peer_addr(peer_addr);
 
-    let (mut client_read, client_write) = client_stream.into_split();
-    let (mut upstream_read, mut upstream_write) = upstream_stream.into_split();
+    let (mut client_read, client_write) = tokio::io::split(client_stream);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream_stream);
     let client_write = Arc::new(Mutex::new(client_write));
 
     let upstream_to_client = {
@@ -85,7 +102,7 @@ async fn handle_connection(
 
 async fn relay_upstream_responses(
     upstream_read: &mut (impl AsyncRead + Unpin),
-    client_write: Arc<Mutex<OwnedWriteHalf>>,
+    client_write: Arc<Mutex<WriteHalf<ClientStream>>>,
 ) -> Result<()> {
     while let Some(frame) = read_frame(upstream_read).await? {
         client_write.lock().await.write_all(&frame).await?;
@@ -96,7 +113,7 @@ async fn relay_upstream_responses(
 async fn relay_client_requests(
     client_read: &mut (impl AsyncRead + Unpin),
     upstream_write: &mut (impl AsyncWrite + Unpin),
-    client_write: Arc<Mutex<OwnedWriteHalf>>,
+    client_write: Arc<Mutex<WriteHalf<ClientStream>>>,
     connector: &LdapConnector,
     policies: &[Arc<dyn Policy>],
     identity: &Identity,
@@ -135,7 +152,8 @@ mod tests {
 
     use super::*;
     use crate::policy::threshold::{ThresholdConfig, ThresholdPolicy};
-    use crate::test_support::{decode_message, encode_message, modify_request_frame};
+    use crate::test_support::{decode_message, encode_message, modify_request_frame, self_signed_tls};
+    use crate::tls::UpstreamTls;
 
     fn allow_all_policies() -> Vec<Arc<dyn Policy>> {
         vec![Arc::new(ThresholdPolicy::new(ThresholdConfig {
@@ -180,8 +198,8 @@ mod tests {
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        let connector = LdapConnector::new(upstream_addr);
-        tokio::spawn(serve(proxy_listener, connector, allow_all_policies()));
+        let connector = LdapConnector::new(upstream_addr, None);
+        tokio::spawn(serve(proxy_listener, None, connector, allow_all_policies()));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
         client_stream.write_all(&request_frame).await.unwrap();
@@ -203,8 +221,8 @@ mod tests {
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        let connector = LdapConnector::new(upstream_addr);
-        tokio::spawn(serve(proxy_listener, connector, block_all_policies()));
+        let connector = LdapConnector::new(upstream_addr, None);
+        tokio::spawn(serve(proxy_listener, None, connector, block_all_policies()));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
         let request_frame =
@@ -223,5 +241,96 @@ mod tests {
 
         // Give the upstream task a moment to finish asserting it never received the frame.
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    #[tokio::test]
+    async fn client_facing_ldaps_relays_to_plaintext_upstream() {
+        let tls = self_signed_tls("localhost");
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let request_frame =
+            modify_request_frame(1, "cn=alice,dc=example,dc=com", "userAccountControl", b"514");
+        let response_frame = encode_message(
+            1,
+            ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                ResultCode::Success,
+                "".into(),
+                "".into(),
+            ))),
+        );
+
+        let expected_request = request_frame.clone();
+        let canned_response = response_frame.clone();
+        tokio::spawn(async move {
+            let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
+            let received = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+            assert_eq!(received, expected_request);
+            upstream_stream.write_all(&canned_response).await.unwrap();
+        });
+
+        let listen_tls = ListenTls::from_files(tls.cert_file.path(), tls.key_file.path()).unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector = LdapConnector::new(upstream_addr, None);
+        tokio::spawn(serve(
+            proxy_listener,
+            Some(listen_tls),
+            connector,
+            allow_all_policies(),
+        ));
+
+        let client_dialer = UpstreamTls::new(tls.server_name, Some(tls.cert_file.path())).unwrap();
+        let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut client_stream = client_dialer.connect(tcp).await.unwrap();
+
+        client_stream.write_all(&request_frame).await.unwrap();
+        let received_response = read_frame(&mut client_stream).await.unwrap().unwrap();
+        assert_eq!(received_response, response_frame);
+    }
+
+    #[tokio::test]
+    async fn proxy_reaches_upstream_over_ldaps() {
+        let tls = self_signed_tls("dc01.corp.example.com");
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let request_frame =
+            modify_request_frame(1, "cn=alice,dc=example,dc=com", "userAccountControl", b"514");
+        let response_frame = encode_message(
+            1,
+            ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                ResultCode::Success,
+                "".into(),
+                "".into(),
+            ))),
+        );
+
+        let expected_request = request_frame.clone();
+        let canned_response = response_frame.clone();
+        let upstream_acceptor =
+            ListenTls::from_files(tls.cert_file.path(), tls.key_file.path()).unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = upstream_listener.accept().await.unwrap();
+            let mut upstream_stream = upstream_acceptor.accept(tcp).await.unwrap();
+            let received = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+            assert_eq!(received, expected_request);
+            upstream_stream.write_all(&canned_response).await.unwrap();
+        });
+
+        let upstream_tls = UpstreamTls::new(tls.server_name, Some(tls.cert_file.path())).unwrap();
+        let connector = LdapConnector::new(upstream_addr, Some(upstream_tls));
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(serve(proxy_listener, None, connector, allow_all_policies()));
+
+        let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        client_stream.write_all(&request_frame).await.unwrap();
+
+        let received_response = read_frame(&mut client_stream).await.unwrap().unwrap();
+        assert_eq!(received_response, response_frame);
     }
 }

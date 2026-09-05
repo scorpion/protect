@@ -19,7 +19,9 @@ about, and forwards everything else as opaque bytes.
  client                    ai-protect                      upstream LDAP
    |                            |                                  |
    |---- TCP connect ---------->|                                  |
+   |<=== TLS handshake ========>| (only if [proxy.listen_tls] set) |
    |                            |----- TCP connect --------------->|
+   |                            |<==== TLS handshake ==============| (only if [proxy.upstream_tls] set)
    |                            |                                  |
    |==== frame (BER) =========>| read_frame()                     |
    |                            |   |                               |
@@ -53,6 +55,11 @@ Two directions of the connection are driven concurrently by
 
 The connection ends (and both directions are torn down) when either side
 closes, hits an I/O error, or a decode error occurs.
+
+TLS, where configured, is negotiated once up front on each hop and is
+otherwise invisible to this loop: `read_frame`/`decode`/relaying all operate
+on a `MaybeTlsStream` (plain or TLS) exactly as they would on a bare
+`TcpStream` — see [Transport](#transport-plaintext-or-tls) below.
 
 ## Component pipeline: Connector → Action → Policy → Decision
 
@@ -100,6 +107,39 @@ protocol is this" from "should this be allowed."
 This separation is the main thing to preserve when extending the system:
 *a new backend is a new connector, not a change to policy; a new rule is a
 new policy, not a change to any connector.*
+
+## Transport: plaintext or TLS
+
+Each hop — client-facing and upstream — independently negotiates plaintext
+or TLS, controlled by two optional config tables (`[proxy.listen_tls]`,
+`[proxy.upstream_tls]`; see [Configuration](#configuration)). Two small
+modules make this an orthogonal concern that neither the connector's framing
+logic nor the proxy loop needs to branch on:
+
+- [`net::MaybeTlsStream`](src/net.rs) is a thin enum (`Plain(TcpStream)` /
+  `Tls(T)`) implementing `AsyncRead`/`AsyncWrite` by delegating to whichever
+  variant is active. `LdapConnector::connect_upstream` and the listener's
+  accept loop both return/wrap this type, so `read_frame`, `handle_connection`,
+  and the two relay functions are written once against "an async
+  duplex stream" and don't know or care whether TLS is underneath.
+- [`tls::UpstreamTls`](src/tls.rs) builds a `rustls` `ClientConfig` and
+  performs the client-side LDAPS handshake against `upstream_addr`,
+  validating the upstream's certificate against a configured `server_name`
+  (required since directory certs are issued for hostnames, not the IP in
+  `upstream_addr`) and trusting either the OS store or a configured
+  `ca_file`. [`tls::ListenTls`](src/tls.rs) builds a `ServerConfig` from a
+  cert/key pair and performs the server-side handshake for clients
+  connecting to `listen_addr`. Both are `Option`al and independent: ai-protect
+  can terminate LDAPS for clients while speaking plaintext LDAP upstream, do
+  the reverse, both, or neither.
+
+Neither direction does mutual TLS (client certificate authentication) —
+`ClientConfig`/`ServerConfig` are both built with `with_no_client_auth()`.
+
+Both hops are implicit TLS only (LDAPS on a dedicated port, negotiated
+before any LDAP bytes are exchanged) — StartTLS (the RFC 4511 extended
+operation that upgrades a plaintext connection on the standard LDAP port
+mid-session) is not implemented on either side.
 
 ## Policy: blast-radius thresholding
 
@@ -151,9 +191,12 @@ Two independent TOML files, deliberately kept separate:
 
 - [`Config`](src/config.rs) (`config.toml`, template in
   `config.example.toml`) — process-level settings: `[proxy]` listen/upstream
-  addresses, and `[policy].file` pointing at the policy file to load.
-  `Config::load` reads whichever path is given as the first CLI arg,
-  defaulting to `config.toml` in the working directory.
+  addresses, optional `[proxy.upstream_tls]` (`server_name`, optional
+  `ca_file`) and `[proxy.listen_tls]` (`cert_file`, `key_file`) tables
+  controlling TLS on each hop (see [Transport](#transport-plaintext-or-tls)),
+  and `[policy].file` pointing at the policy file to load. `Config::load`
+  reads whichever path is given as the first CLI arg, defaulting to
+  `config.toml` in the working directory.
 - Policy definitions (`policies/ldap.toml`, template in
   `policies/ldap.example.toml`) — an ordered list of `[[policy]]` tables,
   each tagged by `type` and parsed by
@@ -195,7 +238,11 @@ an existing type is a config-only change (another `[[policy]]` table).
 
 - No persistent/shared state — a restart or a second instance resets
   threshold history.
-- No TLS on either the listener or the upstream connection.
+- No mutual TLS — `[proxy.listen_tls]`/`[proxy.upstream_tls]` cover
+  server-side certificates only, not client certificate authentication.
+- No StartTLS — only implicit TLS (LDAPS) is supported on either hop, so a
+  directory or client that expects to upgrade a plaintext port 389
+  connection mid-session isn't accommodated.
 - `Identity` is address-based, not credential-based.
 - Only one connector/policy-file pair can be wired up at a time; `main.rs`
   doesn't yet dispatch multiple `[policy].file`s for multiple connectors.

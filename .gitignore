@@ -1,3 +1,7 @@
+# Application
+policies/*
+!policies/*.example.toml
+
 # Rust
 /target
 
@@ -7,5 +11,4 @@
 # Secrets
 .env
 config.toml
-policies/*
-!policies/*.example.toml
+certs/

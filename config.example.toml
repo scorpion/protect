@@ -9,6 +9,25 @@ listen_addr = "127.0.0.1:3890"
 # Address of the real upstream LDAP directory this proxies to.
 upstream_addr = "127.0.0.1:389"
 
+# Uncomment to connect to upstream_addr via LDAPS (implicit TLS, typically
+# port 636) instead of plaintext LDAP. server_name is used for SNI and to
+# validate the upstream's certificate against its DNS name — required
+# because upstream_addr above is an IP:port and directory certificates are
+# usually issued for a hostname, not an IP. Set ca_file if that certificate
+# is signed by an internal/enterprise CA not in the OS trust store; if
+# omitted, the OS trust store is used.
+# [proxy.upstream_tls]
+# server_name = "dc01.corp.example.com"
+# ca_file = "certs/internal-ca.pem"
+
+# Uncomment to have ai-protect itself terminate LDAPS (typically port 636)
+# for incoming client connections, instead of plaintext LDAP on listen_addr.
+# cert_file/key_file are PEM-encoded and their paths are resolved relative
+# to the working directory ai-protect is run from.
+# [proxy.listen_tls]
+# cert_file = "certs/server.pem"
+# key_file = "certs/server.key"
+
 [policy]
 # Path (relative to the working directory ai-protect is run from) to the
 # TOML file describing the policies to run against decoded actions, in
