@@ -8,8 +8,6 @@ pub mod config;
 pub mod connector;
 pub mod core;
 pub mod proxy;
-#[cfg(test)]
-mod test_support;
 
 use anyhow::{Context, Result};
 

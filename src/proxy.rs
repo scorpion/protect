@@ -151,11 +151,12 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::connector::ldap::test_support::{
+        decode_message, encode_message, modify_request_frame,
+    };
     use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy};
     use crate::core::tls::UpstreamTls;
-    use crate::test_support::{
-        decode_message, encode_message, modify_request_frame, self_signed_tls,
-    };
+    use crate::core::tls::test_support::self_signed_tls;
 
     fn allow_all_policies() -> Vec<Arc<dyn Policy>> {
         vec![Arc::new(ThresholdPolicy::new(ThresholdConfig {

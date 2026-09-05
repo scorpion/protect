@@ -120,3 +120,38 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
         .with_context(|| format!("parsing TLS key file {}", path.display()))?
         .ok_or_else(|| anyhow!("no private key found in {}", path.display()))
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::io::Write;
+
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use tempfile::NamedTempFile;
+
+    /// A self-signed cert/key pair (as temp PEM files) valid for `name`, plus
+    /// `name` itself for convenience. Being self-signed, the cert doubles as its
+    /// own trusted CA for tests that need to configure a custom trust root.
+    pub struct TestTls {
+        pub server_name: &'static str,
+        pub cert_file: NamedTempFile,
+        pub key_file: NamedTempFile,
+    }
+
+    pub fn self_signed_tls(server_name: &'static str) -> TestTls {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed([server_name.to_string()])
+                .expect("generate self-signed test certificate");
+
+        TestTls {
+            server_name,
+            cert_file: pem_temp_file(&cert.pem()),
+            key_file: pem_temp_file(&signing_key.serialize_pem()),
+        }
+    }
+
+    fn pem_temp_file(pem: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().expect("create temp PEM file");
+        file.write_all(pem.as_bytes()).expect("write temp PEM file");
+        file
+    }
+}
