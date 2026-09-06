@@ -48,6 +48,26 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   against policy before being forwarded or rejected; upstream→client frames
   pass through untouched. Generic over `Arc<dyn Connector>` — this module
   has no compile-time dependency on LDAP or any other specific backend.
+  Also owns `ConnectionLimits`: a `Semaphore` caps concurrent connections
+  (anything over `max_connections` is closed immediately instead of
+  queued), and every read/write on both hops races an `io_timeout` that
+  doubles as an idle-connection timeout — together the mitigation for a
+  slow-loris client or a hung upstream pinning a task indefinitely. Also
+  peeks the first frame off a still-plaintext connection to
+  opportunistically negotiate RFC 4511 StartTLS (`[proxy.listen_starttls]`)
+  before falling into the normal per-frame loop.
+- [src/core/net.rs](src/core/net.rs) — `MaybeTlsStream`, a thin enum
+  (`Plain(TcpStream)` / `Tls(T)`) implementing `AsyncRead`/`AsyncWrite` by
+  delegating to whichever variant is active, so `read_frame`, the relay
+  loop, and connectors are written once against "an async duplex stream"
+  regardless of whether TLS is underneath.
+- [src/core/tls.rs](src/core/tls.rs) — `UpstreamTls`/`ListenTls`, building
+  `rustls` client/server configs for each hop: implicit TLS (LDAPS), an
+  optional custom CA (`ca_file`) instead of the OS trust store, and mutual
+  TLS in both directions (`client_ca_file` on the listener via
+  `WebPkiClientVerifier`, `client_cert` on the upstream hop). Also logs
+  (rather than silently discarding) any error `rustls-native-certs` hits
+  loading the OS trust store.
 - [src/core/action.rs](src/core/action.rs) — defines `Action` /
   `OperationKind`, the normalized representation a connector produces so the
   policy engine never has to understand a wire protocol.

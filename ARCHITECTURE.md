@@ -203,6 +203,27 @@ is ubiquitous across supported directory versions; either hop can be
 tightened independently by removing `tls12` from the `rustls`/
 `tokio-rustls` feature lists.
 
+## Connection limits & timeouts
+
+[`proxy::ConnectionLimits`](src/proxy.rs) bounds two things a slow-loris
+client or a hung upstream could otherwise use to pin the process
+indefinitely:
+
+- **Concurrent connections** (`max_connections`, default 1024): a
+  `Semaphore` sized to this limit gates the accept loop. A connection that
+  can't acquire a permit is closed immediately rather than queued — no
+  unbounded backlog of waiting tasks.
+- **Per-I/O timeout** (`io_timeout`, default 60s): every individual
+  read/write on both hops — including TLS handshakes — races this deadline
+  via `tokio::time::timeout`. Because it applies per operation rather than
+  per connection, it also functions as an idle-connection timeout: a client
+  or upstream that goes quiet for longer than `io_timeout` gets
+  disconnected.
+
+Both are configurable per deployment (`max_connections`/`io_timeout_secs`
+in `[proxy]`, see `config.example.toml`) or programmatically
+(`ProxyBuilder::limits`).
+
 ## Policy: blast-radius thresholding
 
 The only policy implemented, [`ThresholdPolicy`](src/core/policy/threshold.rs),

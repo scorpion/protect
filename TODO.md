@@ -87,10 +87,13 @@ priority; within a group, roughly in the order you'd want to tackle them.
       passes through unpoliced. Decide if "account lock" is the intentional
       v1 scope or if delete/add need equivalent coverage before calling this
       blast-radius protection in general.
-- [ ] **No `ExtendedRequest` handling** — some directories expose
-      account-disable-equivalent operations (e.g. RFC 3062 password modify)
-      as extended operations rather than `Modify`, which this connector
-      doesn't inspect at all.
+- [ ] **`ExtendedRequest` isn't policed.** [`LdapConnector::upgrade_request`](src/connector/ldap.rs)
+      now inspects `ExtendedRequest`s, but only to recognize the StartTLS
+      OID for the TLS-upgrade handshake — it's not part of the
+      `decode`/policy path. Some directories expose account-disable-equivalent
+      operations (e.g. RFC 3062 password modify) as extended operations
+      rather than `Modify`; those still pass through with no policy
+      evaluation at all.
 
 ## High — reliability & scale
 
@@ -134,10 +137,11 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## Low — cleanup & polish
 
-- [ ] **Unused dependency:** `ldap3` is declared in [`Cargo.toml`](Cargo.toml)
+- [x] **Unused dependency:** `ldap3` is declared in [`Cargo.toml`](Cargo.toml)
       but nothing in `src/` references it (the LDAP wire protocol work is
       all hand-rolled via `rasn`/`rasn-ldap`). Remove it or document why it's
-      there if it's a placeholder for planned work.
+      there if it's a placeholder for planned work. Fixed: removed from
+      `Cargo.toml`/`Cargo.lock`.
 - [ ] **No fuzzing of the decode path.** `read_frame` and the `rasn` BER
       decode in [`LdapConnector::decode`](src/connector/ldap.rs) are the only
       code that touches fully untrusted bytes; worth a fuzz target given a

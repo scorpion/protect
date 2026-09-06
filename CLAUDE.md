@@ -54,6 +54,15 @@ Core pipeline, in `src/proxy.rs`'s connection loop (`tokio::select!`, both direc
 Connector.read_frame → Connector.decode → Action → Policy.evaluate_all → Decision (Allow/Block)
 ```
 
+- **`src/proxy.rs`** — the accept loop and per-connection relay. Owns
+  `ConnectionLimits`: a `Semaphore` sized to `max_connections` rejects
+  anything over the cap immediately instead of queuing it, and every
+  read/write on both hops (TLS handshakes included) races an `io_timeout`
+  that doubles as an idle-connection timeout — together the mitigation for
+  a slow-loris client or a hung upstream pinning a task indefinitely. Also
+  peeks the first frame off a still-plaintext connection to opportunistically
+  negotiate RFC 4511 StartTLS (`[proxy.listen_starttls]`) before falling
+  into the normal per-frame loop.
 - **`src/core/connector.rs`** — the `Connector` trait
   (`connect_upstream`/`read_frame`/`decode`/`build_rejection`/
   `upgrade_request`) that `src/proxy.rs` is written against as `Arc<dyn
