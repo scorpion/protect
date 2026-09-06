@@ -111,18 +111,22 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   window of blast radius per `Identity` to block bursts that exceed
   `max_per_window` within `window`. Its history is an in-memory
   `Mutex<HashMap<..>>` on the hot path, always — an optional `state_db`
-  (SQLite, via [src/core/policy/store.rs](src/core/policy/store.rs)) is
-  loaded once at startup and, if set, kept in sync by a background task
-  (`flush_interval`, default 2s) that writes newly-admitted actions and
-  reloads the whole table, off the hot path via `spawn_blocking`. This is
-  how history survives a restart and is approximately shared by multiple
-  `ai-protect` instances pointed at the same file — see "SQLite-backed
+  (a [`HistoryStore`](src/core/policy/store) backend) is loaded once at
+  startup and, if set, kept in sync by a background task (`flush_interval`,
+  default 2s) that writes newly-admitted actions and reloads the whole
+  store, off the hot path. This is how history survives a restart and is
+  approximately shared by multiple `ai-protect` instances pointed at the
+  same backend — see "SQLite-backed policy state" and "Valkey-backed
   policy state" below.
-- [src/core/policy/store.rs](src/core/policy/store.rs) — `HistoryStore`,
-  the SQLite persistence `ThresholdPolicy` optionally layers on top of its
-  in-memory history, plus `Anchor`, which round-trips `Instant` (monotonic,
+- [src/core/policy/store/](src/core/policy/store/) — the `HistoryStore`
+  trait `ThresholdPolicy` persists/shares its in-memory history through,
+  plus `Anchor` (in `mod.rs`), which round-trips `Instant` (monotonic,
   meaningless across a restart) through epoch milliseconds (portable) and
-  back.
+  back. Two backends implement it: [`sqlite.rs`](src/core/policy/store/sqlite.rs)
+  (`SqliteStore`, a local file — the default, no external service needed)
+  and [`valkey.rs`](src/core/policy/store/valkey.rs) (`ValkeyStore`, a
+  Redis-protocol-compatible network service, for HA across hosts with no
+  shared disk — see the `ha` profile in `compose.yaml` for a local one).
 - [src/core/policy/config.rs](src/core/policy/config.rs) — TOML schema for policy files
   (`policies/ldap.toml`, one file per connector/backend). An ordered
   `[[policy]]` array, each table tagged by `type` (only `"threshold"` today),

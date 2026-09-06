@@ -27,3 +27,15 @@ window_secs = 60
 # observe each other's rows.
 # state_db = "db.sqlite"
 # flush_interval_secs = 2
+
+# Alternatively, for HA across hosts with no shared disk, point state_db at
+# a Valkey (https://valkey.io) or Redis instance instead of a SQLite file —
+# a local one for testing is `docker compose --profile ha up -d valkey`.
+# Same sharing/durability semantics as SQLite above, except the shared
+# state lives in the Valkey instance rather than a shared file/volume. Two
+# [[policy]] entries must use distinct key_prefix values for the same
+# reason they must use distinct SQLite files.
+# See ARCHITECTURE.md#valkey-backed-policy-state.
+# [policy.state_db]
+# url = "redis://127.0.0.1:6379"
+# key_prefix = "ai_protect:threshold"

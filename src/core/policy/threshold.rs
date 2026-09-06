@@ -8,8 +8,36 @@ use serde::{Deserialize, Deserializer};
 use crate::core::action::Action;
 use crate::core::identity::Identity;
 
-use super::store::{Anchor, HistoryStore};
+use super::store::{Anchor, HistoryStore, SqliteStore, ValkeyStore};
 use super::{Decision, Policy, PolicyContext};
+
+/// Where `ThresholdPolicy` persists/shares its sliding-window history.
+/// Deserializes from either a bare string — a SQLite file path, today's
+/// original config shape, unchanged — or a table naming a Valkey/Redis
+/// backend (`state_db = { url = "redis://valkey:6379", key_prefix = "..." }`).
+/// See [`super::store`] for how the two backends differ.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum StateDbConfig {
+    Sqlite(PathBuf),
+    Valkey(ValkeyStateDbConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValkeyStateDbConfig {
+    pub url: String,
+    /// Namespaces this policy's keys so multiple `ThresholdPolicy`s (or an
+    /// unrelated application) can share one Valkey instance without their
+    /// histories colliding. Two `ThresholdPolicy`s must not share one
+    /// prefix — pruning/history would mix between their windows, exactly
+    /// as with two policies pointed at the same SQLite file.
+    #[serde(default = "default_valkey_key_prefix")]
+    pub key_prefix: String,
+}
+
+fn default_valkey_key_prefix() -> String {
+    "ai_protect:threshold".to_string()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThresholdConfig {
@@ -20,14 +48,12 @@ pub struct ThresholdConfig {
     pub max_per_window: usize,
     #[serde(rename = "window_secs", deserialize_with = "deserialize_secs")]
     pub window: Duration,
-    /// Optional SQLite file this policy's history survives a restart in and
-    /// (approximately, on a `flush_interval` delay) shares with any other
-    /// `ai-protect` instance pointed at the same file. `None` (the default)
-    /// keeps today's pure in-memory, single-process-only behavior. Two
-    /// `ThresholdPolicy`s must not share one file — pruning/history would
-    /// mix between their windows.
+    /// Optional backing store this policy's history survives a restart in
+    /// and (approximately, on a `flush_interval` delay) shares with any
+    /// other `ai-protect` instance pointed at the same store. `None` (the
+    /// default) keeps today's pure in-memory, single-process-only behavior.
     #[serde(default)]
-    pub state_db: Option<PathBuf>,
+    pub state_db: Option<StateDbConfig>,
     /// How often admitted actions are flushed to `state_db` and history is
     /// refreshed from it. Only meaningful when `state_db` is set. Defaults
     /// to 2 seconds: frequent enough that a multi-instance deployment's
@@ -60,7 +86,7 @@ where
 /// `ThresholdPolicy` so the no-`state_db` path (the common case, and every
 /// existing test) touches none of it.
 struct PersistentState {
-    store: Arc<HistoryStore>,
+    store: Arc<dyn HistoryStore>,
     pending: Mutex<Vec<(Identity, Instant)>>,
 }
 
@@ -74,43 +100,67 @@ pub struct ThresholdPolicy {
 }
 
 impl ThresholdPolicy {
-    /// Opening `state_db` (if configured) and loading its existing history
-    /// happens here, synchronously, since it's a one-time startup cost, not
-    /// the request hot path. A failure to open it is logged and degrades to
-    /// pure in-memory behavior rather than stopping the proxy from starting
-    /// — durability/sharing is a best-effort enhancement, not a hard
-    /// dependency for this policy to function.
+    /// Opening `state_db` (if configured) happens here, synchronously,
+    /// since it's a one-time startup cost, not the request hot path. A
+    /// failure to open it is logged and degrades to pure in-memory behavior
+    /// rather than stopping the proxy from starting — durability/sharing is
+    /// a best-effort enhancement, not a hard dependency for this policy to
+    /// function.
+    ///
+    /// Only `SqliteStore` can warm `history` from existing state
+    /// synchronously here (its `sync_now` is plain blocking I/O, safe to
+    /// call from a non-async constructor); a `ValkeyStore` needs an async
+    /// connection, so a Valkey-backed policy starts with empty history and
+    /// catches up within one `flush_interval` via the same background task
+    /// that later performs cross-instance sync (see
+    /// `ValkeyStore::open`).
     pub fn new(config: ThresholdConfig) -> Self {
-        let state = config.state_db.as_deref().and_then(|path| {
-            HistoryStore::open(path)
-                .inspect_err(|err| {
+        let mut history = HashMap::new();
+
+        let state = match &config.state_db {
+            Some(StateDbConfig::Sqlite(path)) => match SqliteStore::open(path) {
+                Ok(store) => {
+                    let anchor = Anchor::now();
+                    let cutoff = anchor.epoch_millis_before(config.window);
+                    match store.sync_now(&[], cutoff) {
+                        Ok(rows) => history = rows_into_history(&anchor, rows, config.window),
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "failed to load threshold policy history from state db"
+                        ),
+                    }
+                    Some(PersistentState {
+                        store: Arc::new(store),
+                        pending: Mutex::new(Vec::new()),
+                    })
+                }
+                Err(err) => {
                     tracing::warn!(
                         error = %err,
                         path = %path.display(),
                         "failed to open threshold policy state db; continuing without persistence"
                     );
-                })
-                .ok()
-                .map(|store| PersistentState {
-                    store: Arc::new(store),
-                    pending: Mutex::new(Vec::new()),
-                })
-        });
-
-        let history = state
-            .as_ref()
-            .map(|state| {
-                let anchor = Anchor::now();
-                let cutoff = anchor.epoch_millis_before(config.window);
-                match state.store.sync(&[], cutoff) {
-                    Ok(rows) => rows_into_history(&anchor, rows, config.window),
+                    None
+                }
+            },
+            Some(StateDbConfig::Valkey(valkey)) => {
+                match ValkeyStore::open(&valkey.url, valkey.key_prefix.clone()) {
+                    Ok(store) => Some(PersistentState {
+                        store: Arc::new(store),
+                        pending: Mutex::new(Vec::new()),
+                    }),
                     Err(err) => {
-                        tracing::warn!(error = %err, "failed to load threshold policy history from state db");
-                        HashMap::new()
+                        tracing::warn!(
+                            error = %err,
+                            url = %valkey.url,
+                            "failed to open threshold policy state db; continuing without persistence"
+                        );
+                        None
                     }
                 }
-            })
-            .unwrap_or_default();
+            }
+            None => None,
+        };
 
         Self {
             config,
@@ -140,10 +190,11 @@ impl ThresholdPolicy {
 
     /// Drains actions admitted since the last cycle, writes them to
     /// `state_db`, prunes anything the window has aged out, and folds the
-    /// resulting whole-table snapshot back into local history — the step
+    /// resulting whole-store snapshot back into local history — the step
     /// that picks up rows written by any other instance pointed at the same
-    /// file. Always off the hot path: the SQLite round trip runs in
-    /// `spawn_blocking`, never on the tokio worker thread evaluating live
+    /// backend. Always off the hot path: each `HistoryStore` impl keeps its
+    /// own I/O (a blocking SQLite call via `spawn_blocking`, an async
+    /// Valkey round trip) off the tokio worker thread evaluating live
     /// requests.
     ///
     /// A request admitted by `evaluate` locally is visible to *this*
@@ -163,16 +214,10 @@ impl ThresholdPolicy {
         };
         let cutoff = anchor.epoch_millis_before(self.config.window);
 
-        let store = state.store.clone();
-        let synced = tokio::task::spawn_blocking(move || store.sync(&new_events, cutoff)).await;
-        let rows = match synced {
-            Ok(Ok(rows)) => rows,
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "threshold policy state db sync failed");
-                return;
-            }
+        let rows = match state.store.sync(&new_events, cutoff).await {
+            Ok(rows) => rows,
             Err(err) => {
-                tracing::warn!(error = %err, "threshold policy state db sync task panicked");
+                tracing::warn!(error = %err, "threshold policy state db sync failed");
                 return;
             }
         };
@@ -284,6 +329,66 @@ mod tests {
         assert_eq!(config.window, Duration::from_secs(60));
     }
 
+    #[test]
+    fn parses_state_db_as_sqlite_path_from_bare_string() {
+        let config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            state_db = "db.sqlite"
+            "#,
+        )
+        .unwrap();
+
+        match config.state_db {
+            Some(StateDbConfig::Sqlite(path)) => assert_eq!(path, PathBuf::from("db.sqlite")),
+            other => panic!("expected a Sqlite state_db, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_state_db_as_valkey_table_with_default_key_prefix() {
+        let config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            [state_db]
+            url = "redis://valkey:6379"
+            "#,
+        )
+        .unwrap();
+
+        match config.state_db {
+            Some(StateDbConfig::Valkey(valkey)) => {
+                assert_eq!(valkey.url, "redis://valkey:6379");
+                assert_eq!(valkey.key_prefix, "ai_protect:threshold");
+            }
+            other => panic!("expected a Valkey state_db, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_state_db_valkey_key_prefix_override() {
+        let config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            [state_db]
+            url = "redis://valkey:6379"
+            key_prefix = "custom"
+            "#,
+        )
+        .unwrap();
+
+        match config.state_db {
+            Some(StateDbConfig::Valkey(valkey)) => assert_eq!(valkey.key_prefix, "custom"),
+            other => panic!("expected a Valkey state_db, got {other:?}"),
+        }
+    }
+
     fn action(blast_radius: usize) -> Action {
         Action {
             backend: "ldap",
@@ -379,6 +484,29 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_in_memory_when_valkey_url_is_invalid() {
+        // `ValkeyStore::open` only parses the URL — it never connects — so
+        // this is a pure unit test: a malformed URL is the one failure mode
+        // that surfaces synchronously, and it must degrade to in-memory
+        // behavior rather than panicking `ThresholdPolicy::new`.
+        let policy = ThresholdPolicy::new(ThresholdConfig {
+            max_per_request: 10,
+            max_per_window: 10,
+            window: Duration::from_secs(60),
+            state_db: Some(StateDbConfig::Valkey(ValkeyStateDbConfig {
+                url: "not-a-valid-url".into(),
+                key_prefix: "ai_protect_test".into(),
+            })),
+            flush_interval: Duration::from_secs(2),
+        });
+        let identity = Identity("agent-1".into());
+
+        let decision = policy.evaluate(&action(4), &ctx_for(&identity));
+
+        assert!(matches!(decision, Decision::Allow));
+    }
+
+    #[test]
     fn window_expiry_allows_further_actions() {
         let policy = ThresholdPolicy::new(ThresholdConfig {
             max_per_request: 10,
@@ -411,7 +539,7 @@ mod tests {
             max_per_request: 10,
             max_per_window: 1,
             window,
-            state_db: Some(path.to_path_buf()),
+            state_db: Some(StateDbConfig::Sqlite(path.to_path_buf())),
             flush_interval: Duration::from_secs(2),
         }
     }
@@ -456,6 +584,53 @@ mod tests {
         // instance_b never saw the action itself, but the budget
         // instance_a consumed becomes visible through the shared file once
         // it pulls a fresh snapshot.
+        instance_b.sync_once().await;
+
+        assert!(matches!(
+            instance_b.evaluate(&action(1), &ctx_for(&identity)),
+            Decision::Block { .. }
+        ));
+    }
+
+    // Exercises the same cross-instance sharing as
+    // `state_db_sync_shares_history_across_instances` above, but through a
+    // Valkey-backed `state_db` end to end (config parsing, `ThresholdPolicy`,
+    // and `ValkeyStore` together). Skipped unless a real server is
+    // available — see `store::valkey::tests` for how to run one locally.
+    #[tokio::test]
+    #[ignore]
+    async fn state_db_valkey_sync_shares_history_across_instances() {
+        let Some(url) = std::env::var("VALKEY_TEST_URL").ok() else {
+            eprintln!("skipping: VALKEY_TEST_URL not set");
+            return;
+        };
+        let key_prefix = format!(
+            "ai_protect_test:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let config = |window: Duration| ThresholdConfig {
+            max_per_request: 10,
+            max_per_window: 1,
+            window,
+            state_db: Some(StateDbConfig::Valkey(ValkeyStateDbConfig {
+                url: url.clone(),
+                key_prefix: key_prefix.clone(),
+            })),
+            flush_interval: Duration::from_secs(2),
+        };
+        let identity = Identity("agent-1".into());
+
+        let instance_a = ThresholdPolicy::new(config(Duration::from_secs(60)));
+        let instance_b = ThresholdPolicy::new(config(Duration::from_secs(60)));
+
+        assert!(matches!(
+            instance_a.evaluate(&action(1), &ctx_for(&identity)),
+            Decision::Allow
+        ));
+        instance_a.sync_once().await;
         instance_b.sync_once().await;
 
         assert!(matches!(

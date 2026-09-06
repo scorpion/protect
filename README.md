@@ -79,9 +79,14 @@ cp policies/ldap.example.toml policies/ldap.toml
   [policies/ldap.example.toml](policies/ldap.example.toml)) — an ordered
   list of `[[policy]]` tables. The only type today is `"threshold"`
   (`max_per_request`, `max_per_window`, `window_secs`), plus an optional
-  `state_db` (SQLite file) and `flush_interval_secs` if you want its
-  history to survive a restart or be approximately shared across multiple
-  `ai-protect` instances — see [ARCHITECTURE.md](ARCHITECTURE.md#sqlite-backed-policy-state).
+  `state_db` and `flush_interval_secs` if you want its history to survive a
+  restart or be approximately shared across multiple `ai-protect`
+  instances: either a SQLite file path (single-instance restart durability,
+  or sharing across instances with a shared disk/volume) or a
+  `{ url = "redis://...", key_prefix = "..." }` table naming a
+  Valkey/Redis-protocol server (sharing across hosts with no shared disk —
+  a local one is available via `docker compose --profile ha up -d valkey`)
+  — see [ARCHITECTURE.md](ARCHITECTURE.md#sqlite-backed-policy-state).
 
 Both files are gitignored (see [.gitignore](.gitignore)); `ai-protect`
 fails fast with a message pointing at the matching example file if either

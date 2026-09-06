@@ -137,24 +137,31 @@ priority; within a group, roughly in the order you'd want to tackle them.
       double-budgets every identity. Needs a shared backing store (e.g.
       Redis) before this can run as more than a single process. Fixed: the
       in-memory map stays the hot path unconditionally (`evaluate` never
-      does I/O), and an optional `state_db` (SQLite, via the new
-      [`HistoryStore`](src/core/policy/store.rs)) layers durability and
-      approximate cross-instance sharing on top of it — chosen over Redis
-      so this doesn't add an external service dependency for a
-      single-binary proxy. `ThresholdPolicy::new` loads existing history
-      from `state_db` once at startup (restart durability), and a
-      background task per policy wakes every `flush_interval` (default 2s)
-      to write newly-admitted actions and reload the whole table, always
-      via `spawn_blocking` so a slow disk never stalls a live connection's
-      tokio worker. Two instances pointed at the same file converge on a
-      shared budget within one `flush_interval` of each other — see
-      "SQLite-backed policy state" in [ARCHITECTURE.md](ARCHITECTURE.md#sqlite-backed-policy-state).
-      Opt-in (`state_db` unset keeps today's pure in-memory behavior) and
-      best-effort (a failure to open it logs a warning and falls back to
-      in-memory rather than stopping the proxy from starting). Known
-      limitation: this needs a shared filesystem (e.g. a shared volume),
-      not a network service — a genuinely distributed deployment across
-      hosts with no shared disk still needs something like Redis.
+      does I/O), and an optional `state_db` layers durability and
+      approximate cross-instance sharing on top of it via a
+      [`HistoryStore`](src/core/policy/store/mod.rs) backend — either
+      [`SqliteStore`](src/core/policy/store/sqlite.rs) (a local file,
+      chosen as the default so a single-binary proxy doesn't need an
+      external service) or [`ValkeyStore`](src/core/policy/store/valkey.rs)
+      (a network service — Redis-protocol-compatible, for HA across hosts
+      with no shared disk, which SQLite's file-based sharing can't reach).
+      `ThresholdPolicy::new` loads existing history from `state_db` once at
+      startup (restart durability; a `ValkeyStore` skips this specific step
+      since connecting is async — see its doc comment — and catches up on
+      the first background sync instead), and a background task per policy
+      wakes every `flush_interval` (default 2s) to write newly-admitted
+      actions and reload the whole table/keyspace, off the tokio runtime
+      either way (`spawn_blocking` for SQLite, a native async round trip
+      for Valkey). Two instances pointed at the same file or Valkey
+      instance converge on a shared budget within one `flush_interval` of
+      each other — see "SQLite-backed policy state" and "Valkey-backed
+      policy state" in
+      [ARCHITECTURE.md](ARCHITECTURE.md#sqlite-backed-policy-state). Opt-in
+      (`state_db` unset keeps today's pure in-memory behavior) and
+      best-effort (a failure to open either backend logs a warning and
+      falls back to in-memory rather than stopping the proxy from
+      starting). A local `valkey` service (`docker compose --profile ha up
+      -d valkey`) is available for testing this backend.
 - [ ] **Single connector/listener only.** `ai_protect::run` wires up exactly
       one `LdapConnector` behind one listener; there's no way to front more
       than one directory or protocol from a single deployment (see

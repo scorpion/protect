@@ -124,6 +124,26 @@ mod tests {
         assert!(matches!(decision, Decision::Block { .. }));
     }
 
+    #[tokio::test]
+    async fn parses_threshold_entry_with_valkey_state_db_table() {
+        let policies = parse(
+            r#"
+            [[policy]]
+            type = "threshold"
+            max_per_request = 3
+            max_per_window = 100
+            window_secs = 60
+
+            [policy.state_db]
+            url = "redis://127.0.0.1:6379"
+            key_prefix = "ai_protect:threshold"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(policies.len(), 1);
+    }
+
     #[test]
     fn preserves_declared_order_across_multiple_entries() {
         let policies = parse(

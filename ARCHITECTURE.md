@@ -264,15 +264,17 @@ the *only* copy: a restart resets it, and it isn't shared across multiple
 
 ### SQLite-backed policy state
 
-Setting `state_db` on a `[[policy]]` threshold entry (see
-`policies/ldap.example.toml`) layers durability and approximate
-cross-instance sharing on top, without touching the hot path:
+`state_db` on a `[[policy]]` threshold entry (see
+`policies/ldap.example.toml`) selects a [`HistoryStore`](src/core/policy/store/mod.rs)
+backend that layers durability and approximate cross-instance sharing on
+top of `ThresholdPolicy`'s in-memory history, without touching the hot
+path. A bare string (`state_db = "db.sqlite"`) selects
+[`SqliteStore`](src/core/policy/store/sqlite.rs), the default backend:
 
 - **Startup**: [`ThresholdPolicy::new`](src/core/policy/threshold.rs) opens
-  `state_db` (via [`HistoryStore`](src/core/policy/store.rs)), prunes rows
-  older than `window`, and loads what's left into the in-memory map — so a
-  restart resumes mid-window instead of resetting everyone's budget to
-  zero.
+  the SQLite file, prunes rows older than `window`, and loads what's left
+  into the in-memory map — so a restart resumes mid-window instead of
+  resetting everyone's budget to zero.
 - **Steady state**: a background task, one per `ThresholdPolicy`, wakes
   every `flush_interval` (default 2s) and, entirely off the tokio runtime
   (`spawn_blocking`): writes whatever this instance admitted since the
@@ -285,17 +287,53 @@ cross-instance sharing on top, without touching the hot path:
 - **Multi-instance**: two `ai-protect` processes pointed at the same
   `state_db` file each see the other's admitted actions within one
   `flush_interval` of each other — a real, if eventually-consistent,
-  shared budget, replacing what an in-memory-only deployment would need
-  Redis for. This only works when both processes can reach the same file
-  (shared disk/volume, not a network service), and two *different*
+  shared budget. This only works when both processes can reach the same
+  file (shared disk/volume, not a network service) — see "Valkey-backed
+  policy state" below for hosts with no shared disk. Two *different*
   threshold policies must never point at the same file — nothing keys a
   row to which policy wrote it, so their windows would prune and observe
   each other's rows.
-- **Failure mode**: if `state_db` can't be opened (bad path, permissions,
+- **Failure mode**: if the file can't be opened (bad path, permissions,
   disk full), `ThresholdPolicy::new` logs a warning and falls back to pure
   in-memory behavior rather than stopping the proxy from starting — this
   feature is a best-effort enhancement to availability-critical code, not
   a hard dependency.
+
+### Valkey-backed policy state
+
+A table (`state_db = { url = "redis://valkey:6379", key_prefix = "..." }`)
+selects [`ValkeyStore`](src/core/policy/store/valkey.rs) instead: a
+Redis-protocol-compatible network service (Valkey — <https://valkey.io> —
+or Redis itself), for a multi-instance HA deployment spread across hosts
+with no shared filesystem. A local instance is available via `docker
+compose --profile ha up -d valkey` (see `compose.yaml`).
+
+Each identity's events live in a Valkey sorted set keyed by
+`{key_prefix}:history:{identity}`, scored by epoch milliseconds, so pruning
+by age (`ZREMRANGEBYSCORE`) and reading survivors back in order (`ZRANGE
+... WITHSCORES`) are both native per-identity operations — unlike
+`SqliteStore`, which scans/deletes across its one global table every
+sync. Identities are discovered with `SCAN` (matching `{key_prefix}:history:*`)
+rather than a maintained index, so an instance picks up keys another
+instance wrote without either needing to register them anywhere. As with
+SQLite, two different threshold policies must use distinct `key_prefix`
+values or their windows will prune/observe each other's keys.
+
+The steady-state sync loop is otherwise identical to `SqliteStore`'s
+(same `ThresholdPolicy::sync_once`, same `flush_interval`), except the I/O
+is a native async round trip via `redis`'s `ConnectionManager` (which
+multiplexes over one connection and reconnects automatically) rather than
+a blocking call handed to `spawn_blocking`.
+
+One asymmetry with `SqliteStore`: `ValkeyStore::open` only parses the
+connection URL — connecting is async, and `ThresholdPolicy::new` is a
+synchronous, no-executor-required constructor — so a Valkey-backed policy
+cannot warm its in-memory history from existing state at startup the way
+a SQLite-backed one does. It starts with empty history and catches up
+within one `flush_interval` via the same background task that performs
+cross-instance sync. The failure mode is otherwise the same as SQLite's:
+an invalid URL (the one failure `open` can detect synchronously) logs a
+warning and falls back to pure in-memory behavior.
 
 ## Identity
 
