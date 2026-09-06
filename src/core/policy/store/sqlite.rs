@@ -4,8 +4,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::Connection;
 
 use super::HistoryStore;
@@ -56,7 +57,7 @@ fn blocking_sync(
     new_events: &[(String, i64)],
     cutoff_epoch_millis: i64,
 ) -> rusqlite::Result<HashMap<String, Vec<i64>>> {
-    let mut conn = conn.lock().unwrap();
+    let mut conn = conn.lock();
     let tx = conn.transaction()?;
     {
         let mut insert = tx.prepare(

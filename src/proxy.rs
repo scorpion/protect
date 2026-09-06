@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use parking_lot::Mutex as StdMutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, watch};
@@ -352,8 +353,10 @@ async fn handle_connection(
 /// `pending`, keyed by LDAP message ID; the upstream direction
 /// (`relay_upstream_responses`) resolves it — promoting `identity` on
 /// success, discarding the claim either way — when the matching response
-/// arrives. A plain `std::sync::Mutex` is enough for both fields: every hold
-/// is a short, synchronous map/scalar operation with no `.await` in between.
+/// arrives. A `parking_lot::Mutex` is enough for both fields: every hold is a
+/// short, synchronous map/scalar operation with no `.await` in between, and
+/// unlike `std::sync::Mutex`, it doesn't poison on a panic while held, so a
+/// panic here can't wedge every future decision on this connection.
 struct BindState {
     identity: StdMutex<Identity>,
     pending: StdMutex<HashMap<u32, String>>,
@@ -389,11 +392,11 @@ fn resolve_pending_bind(
     let Some((message_id, success)) = connector.bind_response(frame)? else {
         return Ok(());
     };
-    let Some(dn) = bind_state.pending.lock().unwrap().remove(&message_id) else {
+    let Some(dn) = bind_state.pending.lock().remove(&message_id) else {
         return Ok(());
     };
     if success {
-        *bind_state.identity.lock().unwrap() = Identity::from_bind_dn(dn);
+        *bind_state.identity.lock() = Identity::from_bind_dn(dn);
     }
     Ok(())
 }
@@ -440,11 +443,7 @@ async fn handle_client_frame(
     // claim that's never actually password-verified upstream can't buy a
     // fresh, empty blast-radius budget under a made-up name.
     if let Some((message_id, dn)) = ctx.connector.bind_request(&frame)? {
-        ctx.bind_state
-            .pending
-            .lock()
-            .unwrap()
-            .insert(message_id, dn);
+        ctx.bind_state.pending.lock().insert(message_id, dn);
     }
 
     let Some(action) = ctx.connector.decode(&frame)? else {
@@ -454,7 +453,7 @@ async fn handle_client_frame(
         .await;
     };
 
-    let identity = ctx.bind_state.identity.lock().unwrap().clone();
+    let identity = ctx.bind_state.identity.lock().clone();
     let policy_ctx = PolicyContext {
         identity: identity.clone(),
     };

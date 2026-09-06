@@ -1,8 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer};
 
 use crate::core::action::Action;
@@ -304,7 +305,7 @@ impl ThresholdPolicy {
 
         let anchor = Anchor::now();
         let new_events: Vec<(String, i64)> = {
-            let mut pending = state.pending.lock().unwrap();
+            let mut pending = state.pending.lock();
             std::mem::take(&mut *pending)
                 .into_iter()
                 .map(|(identity, instant)| (identity.0, anchor.to_epoch_millis(instant)))
@@ -326,7 +327,7 @@ impl ThresholdPolicy {
         // double-count this instance's own events on every cycle, since
         // they'd never leave `history` even as fresh copies of them keep
         // arriving from the round trip.
-        let mut history = self.history.lock().unwrap();
+        let mut history = self.history.lock();
         for (identity, timestamps) in rows_into_history(&anchor, rows, self.config.window) {
             history.insert(identity, timestamps);
         }
@@ -415,7 +416,7 @@ impl Policy for ThresholdPolicy {
         }
 
         let key = self.history_key(ctx);
-        let mut history = self.history.lock().unwrap();
+        let mut history = self.history.lock();
         if !history.contains_key(&key) {
             // Make room before admitting a never-before-seen identity —
             // including one that's about to be blocked below, since even a
@@ -459,7 +460,7 @@ impl Policy for ThresholdPolicy {
         drop(history);
 
         if let Some(state) = &self.state {
-            let mut pending = state.pending.lock().unwrap();
+            let mut pending = state.pending.lock();
             for _ in 0..action.blast_radius {
                 pending.push((key.clone(), now));
             }
@@ -716,7 +717,7 @@ mod tests {
             policy.evaluate(&action(1), &ctx_for(&bob)),
             Decision::Allow
         ));
-        assert_eq!(policy.history.lock().unwrap().len(), 2);
+        assert_eq!(policy.history.lock().len(), 2);
 
         // alice is the stalest (least recently active) of the two tracked
         // identities, so admitting carol should evict her, not bob.
@@ -725,7 +726,7 @@ mod tests {
             Decision::Allow
         ));
 
-        let history = policy.history.lock().unwrap();
+        let history = policy.history.lock();
         assert_eq!(history.len(), 2);
         assert!(!history.contains_key(&alice), "alice should be evicted");
         assert!(history.contains_key(&bob));

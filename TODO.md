@@ -207,7 +207,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## Low — hardening & process
 
-- [ ] **`Mutex::lock().unwrap()` poisoning is a single point of permanent
+- [x] **`Mutex::lock().unwrap()` poisoning is a single point of permanent
       failure in stateful policy/store code.** `ThresholdPolicy.history`,
       `SqliteStore.conn`, and similar shared locks all panic-and-poison on
       an internal panic while held; once poisoned, every future policy
@@ -217,6 +217,22 @@ priority; within a group, roughly in the order you'd want to tackle them.
       decode/framing code is already fuzzed), but given how central these
       locks are, consider a non-poisoning mutex (e.g. `parking_lot`) as
       defense in depth.
+      Fixed: switched every synchronous, non-`.await`-holding shared lock
+      to `parking_lot::Mutex` — `ThresholdPolicy.history`/
+      `PersistentState.pending` in
+      [`src/core/policy/threshold.rs`](src/core/policy/threshold.rs),
+      `SqliteStore.conn` in
+      [`src/core/policy/store/sqlite.rs`](src/core/policy/store/sqlite.rs),
+      and connection-scoped `BindState.identity`/`BindState.pending` in
+      [`src/proxy.rs`](src/proxy.rs). `parking_lot::Mutex::lock()` returns
+      the guard directly (no `LockResult`/poisoning), so a panic while any
+      of these is held no longer wedges every subsequent policy decision on
+      that instance/connection for the rest of the process's life. Left
+      as-is: `client_write`/`ValkeyStore.conn`'s `tokio::sync::Mutex`s
+      (already non-poisoning, and held across `.await` points where
+      parking_lot's guard can't be), and the test-only `SharedBuffer` mutex
+      in `src/core/audit.rs`. No behavior change on the non-panic path;
+      existing test suite covers it unchanged.
 - [ ] **Confirm `cargo audit` is currently clean.** Not independently
       verified in this review (no network install attempted); CI already
       runs it on every push/PR (`security_audit` job in
