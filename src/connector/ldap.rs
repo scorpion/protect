@@ -2,8 +2,11 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use rasn_ldap::{ChangeOperation, LdapMessage, LdapResult, ModifyResponse, ProtocolOp, ResultCode};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use rasn_ldap::{
+    ChangeOperation, ExtendedRequest, ExtendedResponse, LdapMessage, LdapResult, ModifyResponse,
+    ProtocolOp, ResultCode,
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::core::action::{Action, OperationKind};
@@ -32,10 +35,26 @@ const LOCK_ATTRIBUTES: &[&str] = &[
 /// fit well under this.
 const MAX_FRAME_CONTENT_LEN: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// RFC 4511 §4.14.1 — the extended-operation OID a client sends to request
+/// upgrading a plaintext connection to TLS mid-session, instead of dialing
+/// implicit TLS (LDAPS) from the start.
+pub(crate) const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
+
+/// Message ID used for the StartTLS request `connect_upstream` sends when
+/// negotiating StartTLS with the upstream. Arbitrary but fixed: it's always
+/// the first message on a freshly dialed connection, so there's no
+/// in-flight request it could collide with.
+const START_TLS_UPSTREAM_MESSAGE_ID: u32 = 1;
+
 #[derive(Clone)]
 pub struct LdapConnector {
     upstream_addr: SocketAddr,
     upstream_tls: Option<UpstreamTls>,
+    /// When true, `connect_upstream` dials the upstream in plaintext and
+    /// negotiates RFC 4511 StartTLS before handing off to the TLS handshake
+    /// described by `upstream_tls`, instead of dialing straight into
+    /// implicit TLS (LDAPS). Has no effect if `upstream_tls` is `None`.
+    upstream_starttls: bool,
 }
 
 impl LdapConnector {
@@ -43,20 +62,67 @@ impl LdapConnector {
         Self {
             upstream_addr,
             upstream_tls,
+            upstream_starttls: false,
         }
     }
 
+    /// Negotiate TLS with the upstream via RFC 4511 StartTLS (dial
+    /// plaintext, exchange the StartTLS extended request/response, then
+    /// perform the TLS handshake described by `upstream_tls`) instead of
+    /// implicit TLS from the first byte — for directories standardized on
+    /// the plaintext LDAP port plus StartTLS rather than a dedicated LDAPS
+    /// port. No effect unless `upstream_tls` is also set.
+    pub fn with_starttls(mut self, enabled: bool) -> Self {
+        self.upstream_starttls = enabled;
+        self
+    }
+
     pub async fn connect_upstream(&self) -> Result<UpstreamStream> {
-        let tcp = TcpStream::connect(self.upstream_addr)
+        let mut tcp = TcpStream::connect(self.upstream_addr)
             .await
             .with_context(|| format!("connecting to upstream LDAP at {}", self.upstream_addr))?;
         tcp.set_nodelay(true)
             .context("setting TCP_NODELAY on upstream connection")?;
 
-        match &self.upstream_tls {
-            None => Ok(MaybeTlsStream::Plain(tcp)),
-            Some(tls) => Ok(MaybeTlsStream::Tls(tls.connect(tcp).await?)),
+        let Some(tls) = &self.upstream_tls else {
+            return Ok(MaybeTlsStream::Plain(tcp));
+        };
+        if self.upstream_starttls {
+            negotiate_starttls(&mut tcp).await?;
         }
+        Ok(MaybeTlsStream::Tls(tls.connect(tcp).await?))
+    }
+
+    /// Recognizes an RFC 4511 StartTLS extended request and builds the
+    /// success response confirming it, so the proxy can send it over the
+    /// still-plaintext connection immediately before performing the TLS
+    /// handshake in place. Returns `None` for every other frame (including
+    /// extended requests for other OIDs), which the proxy forwards like any
+    /// other frame.
+    pub fn upgrade_request(&self, frame: &[u8]) -> Result<Option<Vec<u8>>> {
+        let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
+        let ProtocolOp::ExtendedReq(ExtendedRequest { request_name, .. }) = &message.protocol_op
+        else {
+            return Ok(None);
+        };
+        if request_name.as_ref() != START_TLS_OID.as_bytes() {
+            return Ok(None);
+        }
+
+        let response = LdapMessage::new(
+            message.message_id,
+            ProtocolOp::ExtendedResp(ExtendedResponse {
+                result_code: ResultCode::Success,
+                matched_dn: "".into(),
+                diagnostic_message: "".into(),
+                referral: None,
+                response_name: None,
+                response_value: None,
+            }),
+        );
+        Ok(Some(
+            rasn::ber::encode(&response).context("encoding StartTLS response")?,
+        ))
     }
 
     /// Decode a full LDAP message frame and, if it represents an operation the
@@ -135,6 +201,42 @@ impl Connector for LdapConnector {
     fn build_rejection(&self, frame: &[u8], reason: &str) -> Result<Vec<u8>> {
         self.build_rejection(frame, reason)
     }
+
+    fn upgrade_request(&self, frame: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.upgrade_request(frame)
+    }
+}
+
+/// Sends an RFC 4511 StartTLS extended request over `tcp` (still plaintext)
+/// and waits for a success response, so the caller can then perform the TLS
+/// handshake in place. Used when the upstream directory expects StartTLS on
+/// its plaintext port instead of implicit TLS (LDAPS) on a dedicated one.
+async fn negotiate_starttls(tcp: &mut TcpStream) -> Result<()> {
+    let request = LdapMessage::new(
+        START_TLS_UPSTREAM_MESSAGE_ID,
+        ProtocolOp::ExtendedReq(ExtendedRequest {
+            request_name: START_TLS_OID.as_bytes().into(),
+            request_value: None,
+        }),
+    );
+    let frame = rasn::ber::encode(&request).context("encoding StartTLS request")?;
+    tcp.write_all(&frame)
+        .await
+        .context("sending StartTLS request to upstream")?;
+
+    let response_frame = read_frame(tcp)
+        .await?
+        .context("upstream closed the connection before responding to StartTLS")?;
+    let response: LdapMessage =
+        rasn::ber::decode(&response_frame).context("decoding upstream's StartTLS response")?;
+    let ProtocolOp::ExtendedResp(ExtendedResponse { result_code, .. }) = response.protocol_op
+    else {
+        bail!("upstream did not respond to StartTLS with an ExtendedResponse");
+    };
+    if result_code != ResultCode::Success {
+        bail!("upstream rejected StartTLS: {result_code:?}");
+    }
+    Ok(())
 }
 
 /// Read exactly one BER-encoded LDAP message frame (tag + definite-length +
@@ -239,15 +341,64 @@ pub(crate) mod test_support {
             )),
         )
     }
+
+    pub fn extended_request_frame(message_id: u32, oid: &str) -> Vec<u8> {
+        encode_message(
+            message_id,
+            ProtocolOp::ExtendedReq(rasn_ldap::ExtendedRequest {
+                request_name: oid.as_bytes().into(),
+                request_value: None,
+            }),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{bind_request_frame, decode_message, modify_request_frame};
+    use super::test_support::{
+        bind_request_frame, decode_message, extended_request_frame, modify_request_frame,
+    };
     use super::*;
 
     fn connector() -> LdapConnector {
         LdapConnector::new("127.0.0.1:389".parse().unwrap(), None)
+    }
+
+    #[test]
+    fn upgrade_request_confirms_starttls_and_preserves_message_id() {
+        let frame = extended_request_frame(9, START_TLS_OID);
+
+        let response = connector()
+            .upgrade_request(&frame)
+            .unwrap()
+            .expect("expected a StartTLS confirmation response");
+        let message = decode_message(&response);
+
+        assert_eq!(message.message_id, 9);
+        match message.protocol_op {
+            ProtocolOp::ExtendedResp(ExtendedResponse { result_code, .. }) => {
+                assert_eq!(result_code, ResultCode::Success);
+            }
+            other => panic!("expected ExtendedResp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upgrade_request_ignores_other_extended_operations() {
+        let frame = extended_request_frame(1, "1.2.3.4.5.6.7.8.9");
+
+        let response = connector().upgrade_request(&frame).unwrap();
+
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn upgrade_request_ignores_non_extended_operations() {
+        let frame = bind_request_frame(1, "cn=alice,dc=example,dc=com");
+
+        let response = connector().upgrade_request(&frame).unwrap();
+
+        assert!(response.is_none());
     }
 
     #[test]

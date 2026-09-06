@@ -25,6 +25,12 @@ upstream_addr = "127.0.0.1:389"
 # [proxy.upstream_tls.client_cert]
 # cert_file = "certs/ai-protect-client.pem"
 # key_file = "certs/ai-protect-client.key"
+#
+# Uncomment if the upstream expects RFC 4511 StartTLS on its plaintext port
+# instead of implicit TLS (LDAPS) on a dedicated one: ai-protect dials
+# plaintext, negotiates StartTLS, then performs the handshake described by
+# [proxy.upstream_tls] above.
+# starttls = true
 
 # Uncomment to have ai-protect itself terminate LDAPS (typically port 636)
 # for incoming client connections, instead of plaintext LDAP on listen_addr.
@@ -38,6 +44,14 @@ upstream_addr = "127.0.0.1:389"
 # proxy authenticates *which* agent is connecting instead of just trusting
 # whoever can reach the socket.
 # client_ca_file = "certs/agent-ca.pem"
+
+# Uncomment instead of [proxy.listen_tls] to accept plaintext connections
+# on listen_addr but let a client upgrade to TLS mid-session via RFC 4511
+# StartTLS. Same fields as [proxy.listen_tls]; ignored if listen_tls above
+# is also set (implicit TLS wins).
+# [proxy.listen_starttls]
+# cert_file = "certs/server.pem"
+# key_file = "certs/server.key"
 
 # Maximum concurrent client connections; connections beyond this are closed
 # immediately instead of queued. Defaults to 1024.

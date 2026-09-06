@@ -32,4 +32,18 @@ pub trait Connector: Send + Sync {
 
     /// Build a protocol-appropriate rejection response for a blocked frame.
     fn build_rejection(&self, frame: &[u8], reason: &str) -> anyhow::Result<Vec<u8>>;
+
+    /// If `frame` is a request to upgrade the connection carrying it to TLS
+    /// mid-session (LDAP's RFC 4511 StartTLS extended operation is the only
+    /// example today), returns the protocol response confirming the
+    /// upgrade — sent over the current, still-plaintext transport
+    /// immediately before the proxy performs the TLS handshake in place.
+    /// `Ok(None)` means "not an upgrade request," and the proxy treats
+    /// `frame` as an ordinary request instead. Defaults to "this protocol
+    /// has no such mechanism," so connectors that don't support an
+    /// in-session upgrade need no changes.
+    fn upgrade_request(&self, frame: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        let _ = frame;
+        Ok(None)
+    }
 }

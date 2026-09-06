@@ -39,10 +39,21 @@ priority; within a group, roughly in the order you'd want to tackle them.
       present when the upstream itself requires mTLS. This is authentication
       only — `Identity` (see below) is still address-based, not tied to the
       presented certificate.
-- [ ] **StartTLS unsupported.** Only implicit TLS (LDAPS) is implemented on
+- [x] **StartTLS unsupported.** Only implicit TLS (LDAPS) is implemented on
       either hop (see updated [ARCHITECTURE.md](ARCHITECTURE.md#transport-plaintext-or-tls)).
       Any environment standardized on port 389 + StartTLS instead of 636
-      can't sit behind this proxy today.
+      can't sit behind this proxy today. Fixed: `Connector` gained an
+      `upgrade_request` hook (default no-op) that `LdapConnector` implements
+      for RFC 4511 StartTLS. Client-facing: `[proxy.listen_starttls]`
+      accepts plaintext and `proxy::serve` peeks the first frame off each
+      connection, confirming and upgrading in place on a StartTLS request
+      and otherwise feeding that frame into the normal pipeline unchanged
+      (opportunistic, never required; ignored if `[proxy.listen_tls]` is
+      also set). Upstream: `LdapConnector::with_starttls(true)`
+      (`[proxy.upstream_tls].starttls`) negotiates StartTLS before handing
+      off to the same TLS handshake implicit TLS uses. Both ends reuse
+      `ListenTls`/`UpstreamTls`, so mTLS/trust-store/SNI behavior is
+      identical regardless of how the handshake was triggered.
 - [ ] **Native cert-store load errors are swallowed.** [`tls.rs:49`](src/core/tls.rs)
       iterates `rustls_native_certs::load_native_certs().certs` and silently
       discards `.errors` — a partially-broken OS trust store fails open

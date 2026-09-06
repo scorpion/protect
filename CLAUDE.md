@@ -55,15 +55,21 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
 ```
 
 - **`src/core/connector.rs`** — the `Connector` trait
-  (`connect_upstream`/`read_frame`/`decode`/`build_rejection`) that
-  `src/proxy.rs` is written against as `Arc<dyn Connector>`, with zero
-  compile-time knowledge of LDAP or any specific backend.
+  (`connect_upstream`/`read_frame`/`decode`/`build_rejection`/
+  `upgrade_request`) that `src/proxy.rs` is written against as `Arc<dyn
+  Connector>`, with zero compile-time knowledge of LDAP or any specific
+  backend. `upgrade_request` has a default no-op impl (`Ok(None)`), so
+  only a connector that supports an in-session TLS upgrade (LDAP's
+  StartTLS) needs to override it.
 - **`src/connector/ldap.rs`** — the only `Connector` impl. Owns BER frame
   parsing (RFC 4511 §5.1, not delegated to a higher-level LDAP library,
   since raw frame boundaries are needed to forward unmodified bytes),
   `rasn`/`rasn-ldap` decoding of `ModifyRequest`s, recognizing
   `LOCK_ATTRIBUTES` across AD/OpenLDAP/389 DS schemas, and building the
-  `UnwillingToPerform` rejection sent to a blocked client.
+  `UnwillingToPerform` rejection sent to a blocked client. Also recognizes
+  RFC 4511 StartTLS extended requests (`upgrade_request`) and, via
+  `with_starttls`, can negotiate StartTLS itself when dialing the upstream
+  instead of using implicit TLS.
 - **`src/core/action.rs`** — `Action`/`OperationKind`, the backend-agnostic
   seam: what's attempted, what it targets, and its `blast_radius` (always
   `1` today; exists so a future bulk-op connector can report >1 without any
@@ -86,8 +92,11 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
 - **`src/core/net.rs`** / **`src/core/tls.rs`** — `MaybeTlsStream`
   (`Plain(TcpStream)` / `Tls(T)`) makes TLS-or-not transparent to framing
   and relay code; each hop (`[proxy.listen_tls]`, `[proxy.upstream_tls]`)
-  independently and optionally runs LDAPS. No mutual TLS, no StartTLS —
-  implicit TLS only.
+  independently and optionally runs LDAPS, with optional mutual TLS
+  (`client_ca_file` on the listener, `client_cert` on the upstream hop).
+  Either hop can instead start plaintext and upgrade mid-session via RFC
+  4511 StartTLS (`[proxy.listen_starttls]`, `[proxy.upstream_tls].starttls`)
+  rather than dialing implicit TLS from the first byte.
 - **`src/config.rs`** — process config (`config.toml`: listen/upstream
   addrs, TLS tables, `[policy].file` pointer). Deliberately separate from
   policy definitions (`policies/ldap.toml`, parsed by

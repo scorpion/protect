@@ -56,13 +56,31 @@ pub async fn run_with_config(config: &config::Config) -> Result<()> {
             core::tls::UpstreamTls::new(&tls.server_name, tls.ca_file.as_deref(), client_cert)
         })
         .transpose()?;
+    let upstream_starttls = config
+        .proxy
+        .upstream_tls
+        .as_ref()
+        .is_some_and(|tls| tls.starttls);
     let connector: Arc<dyn core::connector::Connector> = Arc::new(
-        connector::ldap::LdapConnector::new(config.proxy.upstream_addr, upstream_tls),
+        connector::ldap::LdapConnector::new(config.proxy.upstream_addr, upstream_tls)
+            .with_starttls(upstream_starttls),
     );
 
     let listen_tls = config
         .proxy
         .listen_tls
+        .as_ref()
+        .map(|tls| {
+            core::tls::ListenTls::from_files(
+                &tls.cert_file,
+                &tls.key_file,
+                tls.client_ca_file.as_deref(),
+            )
+        })
+        .transpose()?;
+    let listen_starttls = config
+        .proxy
+        .listen_starttls
         .as_ref()
         .map(|tls| {
             core::tls::ListenTls::from_files(
@@ -86,6 +104,9 @@ pub async fn run_with_config(config: &config::Config) -> Result<()> {
         .limits(limits);
     if let Some(listen_tls) = listen_tls {
         builder = builder.listen_tls(listen_tls);
+    }
+    if let Some(listen_starttls) = listen_starttls {
+        builder = builder.listen_starttls(listen_starttls);
     }
     builder.serve().await
 }

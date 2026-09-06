@@ -52,17 +52,22 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   `OperationKind`, the normalized representation a connector produces so the
   policy engine never has to understand a wire protocol.
 - [src/core/connector.rs](src/core/connector.rs) — the `Connector` trait
-  (`connect_upstream`/`read_frame`/`decode`/`build_rejection`) that
-  `src/proxy.rs` is written against, plus `DuplexStream`, the boxable
-  `AsyncRead + AsyncWrite` object every connector's upstream connection is
-  returned as. This is what makes "a new backend is a new connector, not a
-  proxy.rs change" literally true rather than aspirational.
+  (`connect_upstream`/`read_frame`/`decode`/`build_rejection`/
+  `upgrade_request`) that `src/proxy.rs` is written against, plus
+  `DuplexStream`, the boxable `AsyncRead + AsyncWrite` object every
+  connector's upstream connection is returned as. This is what makes "a
+  new backend is a new connector, not a proxy.rs change" literally true
+  rather than aspirational. `upgrade_request` defaults to `Ok(None)`
+  ("this protocol has no in-session TLS upgrade"), so it's opt-in per
+  connector.
 - [src/connector/ldap.rs](src/connector/ldap.rs) — the only connector today.
   Reads BER-framed LDAP messages off the wire (`read_frame`), decodes
   `ModifyRequest`s via `rasn`/`rasn-ldap`, and flags ones touching a known
   account-lock attribute (`LOCK_ATTRIBUTES`, covering AD/OpenLDAP/389 DS
   schemas) as an `Action`. Also builds the `UnwillingToPerform` rejection
-  response sent back to a blocked client. Exposes this as both inherent
+  response sent back to a blocked client, and recognizes RFC 4511 StartTLS
+  extended requests (`upgrade_request`) so a client can upgrade a
+  plaintext connection to TLS mid-session. Exposes this as both inherent
   methods (used directly by its own tests) and an `impl Connector`.
 - [src/core/policy.rs](src/core/policy.rs) — the `Policy` trait
   (`evaluate(&Action, &PolicyContext) -> Decision`) and `evaluate_all`, which

@@ -44,6 +44,12 @@ pub struct ProxyConfig {
     /// for incoming client connections.
     #[serde(default)]
     pub listen_tls: Option<ListenTlsConfig>,
+    /// Present to accept plaintext connections on `listen_addr` but let a
+    /// client upgrade to TLS mid-session via RFC 4511 StartTLS instead of
+    /// dialing implicit LDAPS from the first byte. Ignored if `listen_tls`
+    /// is also set.
+    #[serde(default)]
+    pub listen_starttls: Option<ListenTlsConfig>,
     /// Maximum number of client connections handled concurrently; beyond
     /// this, new connections are closed immediately instead of queued.
     #[serde(default = "default_max_connections")]
@@ -79,6 +85,13 @@ pub struct UpstreamTlsConfig {
     /// whoever dials in.
     #[serde(default)]
     pub client_cert: Option<ClientCertConfig>,
+    /// When true, `connect_upstream` dials the upstream in plaintext and
+    /// negotiates RFC 4511 StartTLS before performing the TLS handshake
+    /// described by this table, instead of dialing straight into implicit
+    /// TLS (LDAPS) — for directories standardized on the plaintext LDAP
+    /// port plus StartTLS rather than a dedicated LDAPS port.
+    #[serde(default)]
+    pub starttls: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +229,36 @@ mod tests {
         assert_eq!(listen_tls.key_file, PathBuf::from("certs/server.key"));
         assert!(upstream_tls.client_cert.is_none());
         assert!(listen_tls.client_ca_file.is_none());
+        assert!(!upstream_tls.starttls);
+        assert!(config.proxy.listen_starttls.is_none());
+    }
+
+    #[test]
+    fn parses_config_with_starttls() {
+        let config: Config = toml::from_str(
+            r#"
+            [proxy]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addr = "127.0.0.1:389"
+
+            [proxy.upstream_tls]
+            server_name = "dc01.corp.example.com"
+            starttls = true
+
+            [proxy.listen_starttls]
+            cert_file = "certs/server.pem"
+            key_file = "certs/server.key"
+
+            [policy]
+            file = "policies/ldap.toml"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.proxy.upstream_tls.unwrap().starttls);
+        let listen_starttls = config.proxy.listen_starttls.unwrap();
+        assert_eq!(listen_starttls.cert_file, PathBuf::from("certs/server.pem"));
+        assert_eq!(listen_starttls.key_file, PathBuf::from("certs/server.key"));
     }
 
     #[test]

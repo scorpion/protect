@@ -17,6 +17,7 @@ use crate::proxy::{self, ConnectionLimits};
 pub struct ProxyBuilder {
     listen_addr: SocketAddr,
     listen_tls: Option<ListenTls>,
+    listen_starttls: Option<ListenTls>,
     connector: Option<Arc<dyn Connector>>,
     policies: Vec<Arc<dyn Policy>>,
     limits: ConnectionLimits,
@@ -28,6 +29,7 @@ impl ProxyBuilder {
         Self {
             listen_addr,
             listen_tls: None,
+            listen_starttls: None,
             connector: None,
             policies: Vec::new(),
             limits: ConnectionLimits::default(),
@@ -38,6 +40,16 @@ impl ProxyBuilder {
     /// Omit this to listen in plaintext.
     pub fn listen_tls(mut self, listen_tls: ListenTls) -> Self {
         self.listen_tls = Some(listen_tls);
+        self
+    }
+
+    /// Accept plaintext connections on `listen_addr`, but let a client
+    /// upgrade to TLS mid-session via RFC 4511 StartTLS, using
+    /// `listen_starttls` for the handshake once one requests it. Ignored if
+    /// `listen_tls` is also set — implicit TLS wins and StartTLS is moot
+    /// once the connection is already encrypted from the first byte.
+    pub fn listen_starttls(mut self, listen_starttls: ListenTls) -> Self {
+        self.listen_starttls = Some(listen_starttls);
         self
     }
 
@@ -75,6 +87,7 @@ impl ProxyBuilder {
         proxy::run(
             self.listen_addr,
             self.listen_tls,
+            self.listen_starttls,
             connector,
             self.policies,
             self.limits,

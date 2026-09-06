@@ -156,10 +156,39 @@ forwarded upstream. This is authentication only — it doesn't yet feed into
 `Identity` (still address-based, see [Identity](#identity)) or per-client
 policy.
 
-Both hops are implicit TLS only (LDAPS on a dedicated port, negotiated
-before any LDAP bytes are exchanged) — StartTLS (the RFC 4511 extended
-operation that upgrades a plaintext connection on the standard LDAP port
-mid-session) is not implemented on either side.
+Both hops can also negotiate TLS mid-session via RFC 4511 StartTLS instead
+of dialing implicit TLS (LDAPS) from the first byte — for directories and
+clients standardized on the plaintext LDAP port plus StartTLS rather than a
+dedicated LDAPS port:
+
+- **Client-facing**: `[proxy.listen_starttls]` (same shape as
+  `[proxy.listen_tls]` — `cert_file`/`key_file`, optional `client_ca_file`
+  for mTLS) accepts plaintext connections and, in `proxy::serve`, peeks the
+  first frame off each one. `Connector::upgrade_request` — a
+  protocol-specific hook with a default no-op impl, so only a connector
+  that supports this needs to implement it — decides whether that frame is
+  an upgrade request; `LdapConnector`'s impl recognizes the StartTLS OID
+  (`1.3.6.1.4.1.1466.20037`) and builds the confirming `ExtendedResponse`.
+  The proxy sends that response over the still-plaintext socket, then runs
+  the same `ListenTls::accept` handshake implicit TLS uses, and only then
+  starts relaying. A frame that isn't an upgrade request is fed into the
+  ordinary per-frame pipeline instead of being lost, so a client that never
+  asks for StartTLS is relayed exactly as before — the upgrade is
+  opportunistic, never required. Ignored if `[proxy.listen_tls]` is also
+  set, since an already-encrypted connection has no plaintext phase to
+  upgrade from.
+- **Upstream**: `LdapConnector::with_starttls(true)` (config:
+  `[proxy.upstream_tls].starttls`) makes `connect_upstream` dial the
+  upstream in plaintext, send its own StartTLS `ExtendedRequest`, wait for
+  a success `ExtendedResponse`, and only then run the same
+  `UpstreamTls::connect` handshake implicit TLS uses. No effect unless
+  `upstream_tls` is also set, since StartTLS only decides *when* to start
+  the handshake, not with what parameters.
+
+Either mechanism ends by handing off to the exact same `ListenTls`/
+`UpstreamTls` handshake code implicit TLS uses, so mutual TLS, trust
+stores, and SNI validation all work identically regardless of how the
+handshake was triggered.
 
 ## Policy: blast-radius thresholding
 
@@ -214,12 +243,15 @@ Two independent TOML files, deliberately kept separate:
   `config.example.toml`) — process-level settings: `[proxy]` listen/upstream
   addresses, optional `[proxy.upstream_tls]` (`server_name`, optional
   `ca_file`, optional `[proxy.upstream_tls.client_cert]` for mTLS to the
-  upstream) and `[proxy.listen_tls]` (`cert_file`, `key_file`, optional
-  `client_ca_file` for mTLS from clients) tables controlling TLS on each hop
-  (see [Transport](#transport-plaintext-or-tls)), and `[policy].file`
-  pointing at the policy file to load. `Config::load` reads whichever path
-  is given as the first CLI arg, defaulting to `config.toml` in the working
-  directory.
+  upstream, `starttls` to negotiate TLS via RFC 4511 StartTLS instead of
+  dialing implicit TLS) and `[proxy.listen_tls]` (`cert_file`, `key_file`,
+  optional `client_ca_file` for mTLS from clients) tables controlling TLS
+  on each hop, plus `[proxy.listen_starttls]` (same shape as
+  `[proxy.listen_tls]`) to accept plaintext and let a client upgrade via
+  StartTLS instead (see [Transport](#transport-plaintext-or-tls)), and
+  `[policy].file` pointing at the policy file to load. `Config::load` reads
+  whichever path is given as the first CLI arg, defaulting to
+  `config.toml` in the working directory.
 - Policy definitions (`policies/ldap.toml`, template in
   `policies/ldap.example.toml`) — an ordered list of `[[policy]]` tables,
   each tagged by `type` and parsed by
@@ -274,9 +306,6 @@ an existing type is a config-only change (another `[[policy]]` table).
 
 - No persistent/shared state — a restart or a second instance resets
   threshold history.
-- No StartTLS — only implicit TLS (LDAPS) is supported on either hop, so a
-  directory or client that expects to upgrade a plaintext port 389
-  connection mid-session isn't accommodated.
 - `Identity` is address-based, not credential-based.
 - Only one connector/policy-file pair can be wired up at a time;
   `ai_protect::run` doesn't yet dispatch multiple `[policy].file`s for
