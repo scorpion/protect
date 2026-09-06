@@ -28,6 +28,14 @@ upstream_addr = "127.0.0.1:389"
 # cert_file = "certs/server.pem"
 # key_file = "certs/server.key"
 
+# Maximum concurrent client connections; connections beyond this are closed
+# immediately instead of queued. Defaults to 1024.
+# max_connections = 1024
+# Seconds allowed for any single read or write on either hop of a
+# connection (TLS handshakes included) before it's dropped as stalled —
+# also acts as an idle-connection timeout. Defaults to 60.
+# io_timeout_secs = 60
+
 [policy]
 # Path (relative to the working directory ai-protect is run from) to the
 # TOML file describing the policies to run against decoded actions, in

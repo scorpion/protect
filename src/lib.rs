@@ -63,9 +63,15 @@ pub async fn run_with_config(config: &config::Config) -> Result<()> {
 
     let policies = core::policy::config::load(&config.policy.file)?;
 
+    let limits = proxy::ConnectionLimits {
+        max_connections: config.proxy.max_connections,
+        io_timeout: std::time::Duration::from_secs(config.proxy.io_timeout_secs),
+    };
+
     let mut builder = builder::ProxyBuilder::new(config.proxy.listen_addr)
         .connector(connector)
-        .policies(policies);
+        .policies(policies)
+        .limits(limits);
     if let Some(listen_tls) = listen_tls {
         builder = builder.listen_tls(listen_tls);
     }

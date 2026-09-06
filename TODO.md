@@ -6,17 +6,26 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## Critical — security / DoS
 
-- [ ] **Unbounded frame allocation.** [`read_frame`](src/connector/ldap.rs)
+- [x] **Unbounded frame allocation.** [`read_frame`](src/connector/ldap.rs)
       trusts the BER length prefix and does `vec![0u8; content_len]` with no
       upper bound — a client can claim a length up to ~4 GiB
       (`u32::MAX`) and force a multi-gigabyte allocation per connection
       before a single byte of content is read. Add a sane max-frame-size cap
-      (config or const) and close the connection over it.
-- [ ] **No connection limits or timeouts.** The accept loop in
+      (config or const) and close the connection over it. Fixed: `read_frame`
+      now rejects any claimed content length over `MAX_FRAME_CONTENT_LEN`
+      (16 MiB) before allocating, returning an error that propagates up and
+      closes the connection.
+- [x] **No connection limits or timeouts.** The accept loop in
       [`proxy::serve`](src/proxy.rs) spawns an unbounded task per
       connection with no cap on concurrent connections, no idle-connection
       timeout, and no read/write timeout — a slow-loris client or a hung
-      upstream pins a task and its memory indefinitely.
+      upstream pins a task and its memory indefinitely. Fixed: added
+      `ConnectionLimits` (`max_connections`, `io_timeout`), configurable via
+      `[proxy]` in `config.toml` (`max_connections`, `io_timeout_secs`,
+      defaulting to 1024/60s) or `ProxyBuilder::limits`. A `Semaphore` caps
+      concurrent connections, closing anything over the limit immediately;
+      every read/write on both hops (TLS handshakes included) races against
+      `io_timeout`, doubling as an idle timeout.
 - [ ] **No mutual TLS.** Both `ClientConfig`/`ServerConfig` in
       [`src/core/tls.rs`](src/core/tls.rs) use `with_no_client_auth()`. Right now
       anything that can reach the listener and speak LDAP is trusted equally;
@@ -102,10 +111,6 @@ priority; within a group, roughly in the order you'd want to tackle them.
       but nothing in `src/` references it (the LDAP wire protocol work is
       all hand-rolled via `rasn`/`rasn-ldap`). Remove it or document why it's
       there if it's a placeholder for planned work.
-- [ ] **`README.md` is stale.** Its Status line still says "no TLS ... no
-      test suite yet," which predates both the TLS work and the current test
-      suite across `net.rs`/`tls.rs`/`config.rs`/`proxy.rs`/etc. — update
-      it alongside this TODO so it doesn't mislead a new reader.
 - [ ] **No fuzzing of the decode path.** `read_frame` and the `rasn` BER
       decode in [`LdapConnector::decode`](src/connector/ldap.rs) are the only
       code that touches fully untrusted bytes; worth a fuzz target given a

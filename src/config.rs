@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::proxy::ConnectionLimits;
+
 /// Failure modes for loading `Config` from a TOML file.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -42,6 +44,23 @@ pub struct ProxyConfig {
     /// for incoming client connections.
     #[serde(default)]
     pub listen_tls: Option<ListenTlsConfig>,
+    /// Maximum number of client connections handled concurrently; beyond
+    /// this, new connections are closed immediately instead of queued.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Seconds allowed for any single read or write on either hop of a
+    /// connection (TLS handshakes included) before it's dropped as stalled
+    /// — also acts as an idle-connection timeout.
+    #[serde(default = "default_io_timeout_secs")]
+    pub io_timeout_secs: u64,
+}
+
+fn default_max_connections() -> usize {
+    ConnectionLimits::default().max_connections
+}
+
+fn default_io_timeout_secs() -> u64 {
+    ConnectionLimits::default().io_timeout.as_secs()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,6 +132,34 @@ mod tests {
         assert_eq!(config.policy.file, PathBuf::from("policies/ldap.toml"));
         assert!(config.proxy.upstream_tls.is_none());
         assert!(config.proxy.listen_tls.is_none());
+        assert_eq!(
+            config.proxy.max_connections,
+            ConnectionLimits::default().max_connections
+        );
+        assert_eq!(
+            config.proxy.io_timeout_secs,
+            ConnectionLimits::default().io_timeout.as_secs()
+        );
+    }
+
+    #[test]
+    fn parses_connection_limit_overrides() {
+        let config: Config = toml::from_str(
+            r#"
+            [proxy]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addr = "127.0.0.1:389"
+            max_connections = 10
+            io_timeout_secs = 5
+
+            [policy]
+            file = "policies/ldap.toml"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.proxy.max_connections, 10);
+        assert_eq!(config.proxy.io_timeout_secs, 5);
     }
 
     #[test]

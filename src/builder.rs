@@ -9,7 +9,7 @@ use crate::core::connector::Connector;
 use crate::core::policy::Policy;
 use crate::core::tls::ListenTls;
 use crate::error::{Error, Result};
-use crate::proxy;
+use crate::proxy::{self, ConnectionLimits};
 
 /// Builds a proxy from in-memory pieces — a connector and policies you
 /// construct yourself — and runs it. This is the entry point for embedding
@@ -19,6 +19,7 @@ pub struct ProxyBuilder {
     listen_tls: Option<ListenTls>,
     connector: Option<Arc<dyn Connector>>,
     policies: Vec<Arc<dyn Policy>>,
+    limits: ConnectionLimits,
 }
 
 impl ProxyBuilder {
@@ -29,6 +30,7 @@ impl ProxyBuilder {
             listen_tls: None,
             connector: None,
             policies: Vec::new(),
+            limits: ConnectionLimits::default(),
         }
     }
 
@@ -59,13 +61,26 @@ impl ProxyBuilder {
         self
     }
 
+    /// Overrides the default concurrent-connection cap and I/O timeout
+    /// (1024 connections / 60s — see `ConnectionLimits::default`).
+    pub fn limits(mut self, limits: ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     /// Binds `listen_addr` and runs the accept loop. Only returns on error
     /// (the accept loop otherwise runs forever).
     pub async fn serve(self) -> Result<()> {
         let connector = self.connector.ok_or(Error::MissingConnector)?;
-        proxy::run(self.listen_addr, self.listen_tls, connector, self.policies)
-            .await
-            .map_err(Error::from)
+        proxy::run(
+            self.listen_addr,
+            self.listen_tls,
+            connector,
+            self.policies,
+            self.limits,
+        )
+        .await
+        .map_err(Error::from)
     }
 }
 
