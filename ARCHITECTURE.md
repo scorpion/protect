@@ -356,6 +356,22 @@ requests per second the process is handling. By default that map is also
 the *only* copy: a restart resets it, and it isn't shared across multiple
 `ai-protect` instances.
 
+The age-based pruning described above only removes a given identity's own
+stale timestamps, and only when that identity is evaluated again — an
+identity seen exactly once (a bind DN claimed before one throwaway action,
+then never reused) leaves an empty `VecDeque` sitting in the map forever
+otherwise, since nothing ever visits it again to notice it's empty. This is
+what let an unauthenticated caller grow the map without bound by churning
+through a fresh, made-up identity per request, even one that's immediately
+blocked (a blocked action still creates the map entry — it just never gets
+a timestamp pushed into it). `max_tracked_identities` (config, defaults to
+100,000) caps this independently: once reached, admitting a brand-new
+identity evicts the tracked identity with the least recently recorded
+activity first — see `evict_stalest_until` in
+[src/core/policy/threshold.rs](src/core/policy/threshold.rs) — bounding
+memory (and `state_db` storage, if configured) to a fixed size regardless
+of how many distinct identities a caller churns through.
+
 ### SQLite-backed policy state
 
 `state_db` on a `[[policy]]` threshold entry (see
@@ -491,8 +507,11 @@ each getting its own empty `PerIdentity` budget once — if ever — it binds
 successfully). A `ThresholdScope::Global` policy entry (see
 [Policy: blast-radius thresholding](#policy-blast-radius-thresholding))
 is the backstop for that: a shared ceiling identity churn can't reset,
-regardless of how many identities are involved. Unbounded growth of the
-`Identity`-keyed history map itself remains open — see TODO.md.
+regardless of how many identities are involved. `max_tracked_identities`
+(see "Policy: blast-radius thresholding" above) separately bounds how many
+distinct identities' history the map itself will hold onto, evicting the
+least recently active once the cap is reached, so unbounded identity
+churn can grow *turnover* in the map but not its size.
 
 ## Audit logging
 
@@ -723,9 +742,10 @@ Adding another listener/upstream pair is likewise config-only — another
   — not from an authenticated principal such as a validated mTLS client
   certificate. A caller can still churn through an unbounded number of
   distinct DNs (each gets its own fresh `PerIdentity` budget); a
-  `ThresholdScope::Global` backstop bounds the aggregate regardless, but
-  nothing yet bounds the `Identity`-keyed history map's cardinality — see
-  TODO.md.
+  `ThresholdScope::Global` backstop bounds the aggregate regardless, and
+  `max_tracked_identities` bounds the `Identity`-keyed history map's
+  cardinality (evicting the least recently active identity once the cap is
+  reached — see [Identity](#identity)).
 - Every `[[proxy]]` entry hardcodes `LdapConnector` as its connector; the
   config-driven path (as opposed to `ProxyBuilder`, used directly) can front
   several LDAP upstreams but not a mix of protocols in one process without a

@@ -207,6 +207,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
         }));
 

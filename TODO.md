@@ -57,7 +57,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
       claims (which now just never promote), each only bounded by the
       `Global` backstop's aggregate ceiling, not a per-caller one. Unbounded
       history-map cardinality and the IP/DN identity-namespace collision
-      remain open — see the following two items.
+      were tracked as the following two items — both since fixed.
 - [x] **Identity namespace collision between peer-IP and bind-DN
       derivation.** [`Identity`](src/core/identity.rs) is one flat,
       un-namespaced string used both for `Identity::from_peer_addr`
@@ -79,7 +79,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
       `ThresholdPolicy`'s history map. See the
       `peer_ip_and_bind_dn_never_collide_even_with_matching_text` test in
       `src/core/identity.rs`.
-- [ ] **Unbounded identity cardinality enables unauthenticated memory/disk
+- [x] **Unbounded identity cardinality enables unauthenticated memory/disk
       exhaustion.** Every actionable request — even one immediately
       blocked by the window check — creates a permanent entry in
       [`ThresholdPolicy`](src/core/policy/threshold.rs)'s
@@ -101,6 +101,24 @@ priority; within a group, roughly in the order you'd want to tackle them.
       really any DN accepted into `Action.target`), and bound the history
       map's cardinality (LRU eviction or a hard cap with a logged warning)
       independently of the existing age-based pruning.
+      Fixed: two independent bounds. (1) A new `cap_dn` helper in
+      [`src/connector/ldap.rs`](src/connector/ldap.rs) caps every DN
+      extracted from a decoded message (bind DN, and modify/del/add/
+      password-modify `Action.target`) at 256 bytes; a DN over that replaces
+      itself with a small fixed-shape marker carrying its true length and a
+      stable hash of its full content, so oversized DNs stay bounded in size
+      without colliding into each other. (2) A new `max_tracked_identities`
+      config field on `ThresholdConfig` (default 100,000) hard-caps
+      `ThresholdPolicy`'s history map: once reached, admitting a
+      never-before-seen identity evicts the tracked identity with the least
+      recently recorded activity first (`evict_stalest_until`), applied both
+      on the request hot path (`evaluate`) and when folding a `state_db`
+      snapshot back in (`sync_once`/`ThresholdPolicy::new`), so the same
+      cap holds however history got populated. See
+      `caps_tracked_identity_count_by_evicting_the_stalest_one` in
+      `src/core/policy/threshold.rs` and
+      `cap_dn_bounds_the_size_of_an_oversized_dn` in
+      `src/connector/ldap.rs`.
 
 ## High
 

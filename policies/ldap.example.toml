@@ -18,6 +18,14 @@ window_secs = 60
 # scope = "per_identity" is the default and can be omitted; see the global
 # backstop entry below for the other option.
 
+# Hard cap on the number of distinct identities tracked at once. Once
+# reached, admitting a never-before-seen identity evicts the tracked
+# identity with the least recently recorded activity to make room (logged
+# at warn), bounding memory/state_db growth regardless of how many distinct
+# identities an unauthenticated caller churns through. Defaults to 100000;
+# uncomment only to override.
+# max_tracked_identities = 100000
+
 # Uncomment to persist this policy's history to SQLite: it survives a
 # restart (loaded back in at startup) and, if multiple ai-protect instances
 # point at the same file, is approximately shared between them (each sees

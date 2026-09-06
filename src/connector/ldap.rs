@@ -37,6 +37,42 @@ const LOCK_ATTRIBUTES: &[&str] = &[
 /// fit well under this.
 const MAX_FRAME_CONTENT_LEN: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// Hard cap on the length of a DN string, extracted from a decoded LDAP
+/// message, before it's used as an `Identity` (bind DN) or `Action::target`
+/// (modify/del/add object, password-modify user identity). Without this, a
+/// DN can be as large as `MAX_FRAME_CONTENT_LEN` allows (16 MiB), so an
+/// unauthenticated caller could grow `ThresholdPolicy`'s
+/// `Identity`-keyed history map (and its `state_db`-backed persistence, if
+/// configured) by a large, attacker-chosen amount per entry — see TODO.md.
+/// A real DN is a handful of RDNs and is nowhere close to this length.
+const MAX_DN_LEN: usize = 256;
+
+/// Bounds a DN's size before it's used for policy/identity purposes.
+/// Shorter DNs pass through untouched. A DN over `MAX_DN_LEN` is replaced by
+/// a small, fixed-shape marker carrying its true length and a stable hash of
+/// its full content (not just a truncated prefix) — so two distinct
+/// oversized DNs that happen to share a prefix still don't collide into the
+/// same `Identity`/history bucket, while the representation itself stays
+/// bounded in size regardless of how large the original DN was. The hash
+/// uses `DefaultHasher`'s fixed (unrandomized) keys deliberately, so the
+/// same oversized DN maps to the same marker within one process run and
+/// across a restart — required for `state_db`-backed history and the
+/// sliding window itself to keep working for a caller using one
+/// consistently oversized DN.
+fn cap_dn(dn: String) -> String {
+    if dn.len() <= MAX_DN_LEN {
+        return dn;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dn.hash(&mut hasher);
+    format!(
+        "(oversized DN, {} bytes, hash {:016x})",
+        dn.len(),
+        hasher.finish()
+    )
+}
+
 /// RFC 4511 §4.14.1 — the extended-operation OID a client sends to request
 /// upgrading a plaintext connection to TLS mid-session, instead of dialing
 /// implicit TLS (LDAPS) from the start.
@@ -193,20 +229,20 @@ impl LdapConnector {
                 Ok(Some(Action {
                     backend: "ldap",
                     operation: OperationKind::AccountLock,
-                    target: modify.object.0.clone(),
+                    target: cap_dn(modify.object.0.clone()),
                     blast_radius: 1,
                 }))
             }
             ProtocolOp::DelRequest(del) => Ok(Some(Action {
                 backend: "ldap",
                 operation: OperationKind::Delete,
-                target: del.0.0.clone(),
+                target: cap_dn(del.0.0.clone()),
                 blast_radius: 1,
             })),
             ProtocolOp::AddRequest(add) => Ok(Some(Action {
                 backend: "ldap",
                 operation: OperationKind::Create,
-                target: add.entry.0.clone(),
+                target: cap_dn(add.entry.0.clone()),
                 blast_radius: 1,
             })),
             ProtocolOp::ExtendedReq(ExtendedRequest {
@@ -228,7 +264,7 @@ impl LdapConnector {
                             .context("decoding RFC 3062 PasswdModifyRequestValue")?;
                         match parsed.user_identity {
                             Some(identity) => {
-                                String::from_utf8_lossy(identity.as_ref()).into_owned()
+                                cap_dn(String::from_utf8_lossy(identity.as_ref()).into_owned())
                             }
                             None => "(bound identity)".to_string(),
                         }
@@ -258,7 +294,9 @@ impl LdapConnector {
     /// ID). Anonymous binds (empty DN) and SASL binds (the `name` field
     /// there isn't password-verified the way it is for a simple bind — the
     /// real identity comes from the SASL mechanism) return `None`, leaving
-    /// any pending claim alone, as does every non-bind frame.
+    /// any pending claim alone, as does every non-bind frame. The DN is
+    /// passed through `cap_dn` before returning, since it eventually becomes
+    /// an `Identity` — see `cap_dn`'s doc comment.
     pub fn bind_request(&self, frame: &[u8]) -> Result<Option<(u32, String)>> {
         let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
         let ProtocolOp::BindRequest(bind) = &message.protocol_op else {
@@ -268,7 +306,7 @@ impl LdapConnector {
         {
             return Ok(None);
         }
-        Ok(Some((message.message_id, bind.name.0.clone())))
+        Ok(Some((message.message_id, cap_dn(bind.name.0.clone()))))
     }
 
     /// Decode a response frame and, if it's a `BindResponse`, return its
@@ -729,6 +767,46 @@ mod tests {
         let claim = connector().bind_request(&frame).unwrap();
 
         assert_eq!(claim, Some((7, "cn=alice,dc=example,dc=com".to_string())));
+    }
+
+    #[test]
+    fn cap_dn_passes_short_dns_through_unchanged() {
+        let dn = "cn=alice,dc=example,dc=com".to_string();
+
+        assert_eq!(cap_dn(dn.clone()), dn);
+    }
+
+    #[test]
+    fn cap_dn_bounds_the_size_of_an_oversized_dn() {
+        let huge_dn = "a".repeat(MAX_DN_LEN * 4);
+
+        let capped = cap_dn(huge_dn);
+
+        assert!(capped.len() < MAX_DN_LEN);
+    }
+
+    #[test]
+    fn cap_dn_is_stable_and_distinguishes_distinct_oversized_dns() {
+        let a = "a".repeat(MAX_DN_LEN * 4);
+        let b = "b".repeat(MAX_DN_LEN * 4);
+
+        // Same input always caps to the same output (required so a
+        // sliding-window budget for one oversized-DN caller stays coherent
+        // across separate requests), but two distinct oversized DNs must
+        // not collapse into the same capped identity.
+        assert_eq!(cap_dn(a.clone()), cap_dn(a.clone()));
+        assert_ne!(cap_dn(a), cap_dn(b));
+    }
+
+    #[test]
+    fn bind_request_caps_an_oversized_claimed_dn() {
+        let huge_dn = "cn=".to_string() + &"a".repeat(MAX_DN_LEN * 4);
+        let frame = bind_request_frame(7, &huge_dn);
+
+        let (message_id, claimed_dn) = connector().bind_request(&frame).unwrap().unwrap();
+
+        assert_eq!(message_id, 7);
+        assert!(claimed_dn.len() < MAX_DN_LEN);
     }
 
     #[test]

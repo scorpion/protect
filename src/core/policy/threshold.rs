@@ -101,10 +101,31 @@ pub struct ThresholdConfig {
         deserialize_with = "deserialize_secs"
     )]
     pub flush_interval: Duration,
+    /// Hard upper bound on the number of distinct identities tracked at
+    /// once in this policy's sliding-window history. The existing
+    /// age-based pruning in `evaluate` only removes a given identity's own
+    /// stale timestamps, and only when that same identity is evaluated
+    /// again — an identity seen exactly once (an unauthenticated caller
+    /// churning through fresh bind DNs, one per throwaway action) has
+    /// nothing left in its `VecDeque` after the window passes but still
+    /// occupies a `HashMap` entry forever. Once this cap is reached,
+    /// admitting a brand-new identity evicts the tracked identity with the
+    /// least recently recorded activity to make room, logged at `warn` —
+    /// see `evict_stalest_until`. Defaults to 100,000: comfortably above
+    /// any real deployment's distinct concurrent callers, while bounding
+    /// worst-case memory (and, if `state_db` is set, storage) to a fixed
+    /// amount regardless of how many distinct identities an attacker churns
+    /// through.
+    #[serde(default = "default_max_tracked_identities")]
+    pub max_tracked_identities: usize,
 }
 
 fn default_flush_interval() -> Duration {
     Duration::from_secs(2)
+}
+
+fn default_max_tracked_identities() -> usize {
+    100_000
 }
 
 /// TOML has no native duration type, so the config file spells the window in
@@ -158,7 +179,10 @@ impl ThresholdPolicy {
                     let anchor = Anchor::now();
                     let cutoff = anchor.epoch_millis_before(config.window);
                     match store.sync_now(&[], cutoff) {
-                        Ok(rows) => history = rows_into_history(&anchor, rows, config.window),
+                        Ok(rows) => {
+                            history = rows_into_history(&anchor, rows, config.window);
+                            evict_stalest_until(&mut history, config.max_tracked_identities);
+                        }
                         Err(err) => tracing::warn!(
                             error = %err,
                             "failed to load threshold policy history from state db"
@@ -276,6 +300,40 @@ impl ThresholdPolicy {
         for (identity, timestamps) in rows_into_history(&anchor, rows, self.config.window) {
             history.insert(identity, timestamps);
         }
+        evict_stalest_until(&mut history, self.config.max_tracked_identities);
+    }
+}
+
+/// Evicts the identity with the least recently recorded activity — the
+/// smallest last-seen timestamp across its own history, not insertion order
+/// — until `history` has at most `target_len` entries, logging each
+/// eviction at `warn`. An identity with no timestamps left (already aged
+/// out by its own per-request pruning in `evaluate`, but not yet removed
+/// from the map) sorts before every identity with at least one, since
+/// `back()` on an empty `VecDeque` is `None` and `None < Some(_)` — exactly
+/// the identity that should go first.
+///
+/// Called two ways: `evaluate` passes `cap - 1` *before* inserting a
+/// brand-new identity, so the map never exceeds `cap` even momentarily;
+/// `ThresholdPolicy::new`/`sync_once` pass `cap` *after* folding in a whole
+/// `state_db` snapshot, since those insert in bulk and only need the map
+/// back at or under the cap afterward. See
+/// `ThresholdConfig::max_tracked_identities`.
+fn evict_stalest_until(history: &mut HashMap<Identity, VecDeque<Instant>>, target_len: usize) {
+    while history.len() > target_len {
+        let Some(stalest) = history
+            .iter()
+            .min_by_key(|(_, timestamps)| timestamps.back().copied())
+            .map(|(identity, _)| identity.clone())
+        else {
+            break;
+        };
+        history.remove(&stalest);
+        tracing::warn!(
+            identity = %stalest.0,
+            target_len,
+            "threshold policy history at max_tracked_identities capacity; evicted least-recently-active identity to make room"
+        );
     }
 }
 
@@ -328,6 +386,17 @@ impl Policy for ThresholdPolicy {
 
         let key = self.history_key(ctx);
         let mut history = self.history.lock().unwrap();
+        if !history.contains_key(&key) {
+            // Make room before admitting a never-before-seen identity —
+            // including one that's about to be blocked below, since even a
+            // blocked action still creates an (empty) history entry and an
+            // attacker gets no cheaper a way to grow the map by staying
+            // under max_per_request/max_per_window than by exceeding it.
+            evict_stalest_until(
+                &mut history,
+                self.config.max_tracked_identities.saturating_sub(1),
+            );
+        }
         let entry = history.entry(key.clone()).or_default();
 
         let now = Instant::now();
@@ -474,6 +543,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
@@ -491,6 +561,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
@@ -508,6 +579,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
@@ -530,6 +602,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
         });
         let alice = Identity("alice".into());
@@ -550,6 +623,49 @@ mod tests {
     }
 
     #[test]
+    fn caps_tracked_identity_count_by_evicting_the_stalest_one() {
+        // A cap of 2: admitting a third, never-before-seen identity must
+        // evict one of the first two rather than growing the map to 3 —
+        // this is what actually bounds an unauthenticated caller churning
+        // through fresh bind DNs, one per throwaway action (see TODO.md).
+        let policy = ThresholdPolicy::new(ThresholdConfig {
+            max_per_request: 10,
+            max_per_window: 10,
+            window: Duration::from_secs(60),
+            state_db: None,
+            flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 2,
+            scope: ThresholdScope::PerIdentity,
+        });
+        let alice = Identity("alice".into());
+        let bob = Identity("bob".into());
+        let carol = Identity("carol".into());
+
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&alice)),
+            Decision::Allow
+        ));
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&bob)),
+            Decision::Allow
+        ));
+        assert_eq!(policy.history.lock().unwrap().len(), 2);
+
+        // alice is the stalest (least recently active) of the two tracked
+        // identities, so admitting carol should evict her, not bob.
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&carol)),
+            Decision::Allow
+        ));
+
+        let history = policy.history.lock().unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(!history.contains_key(&alice), "alice should be evicted");
+        assert!(history.contains_key(&bob));
+        assert!(history.contains_key(&carol));
+    }
+
+    #[test]
     fn global_scope_shares_one_budget_across_every_identity() {
         // The whole point of a `Global` instance: unlike `PerIdentity`,
         // switching identities can't buy a fresh budget, since every
@@ -560,6 +676,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::Global,
         });
         let alice = Identity("alice".into());
@@ -614,6 +731,7 @@ mod tests {
                 key_prefix: "ai_protect_test".into(),
             })),
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
@@ -631,6 +749,7 @@ mod tests {
             window: Duration::from_millis(20),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
@@ -659,6 +778,7 @@ mod tests {
             window,
             state_db: Some(StateDbConfig::Sqlite(path.to_path_buf())),
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
         }
     }
@@ -739,6 +859,7 @@ mod tests {
                 key_prefix: key_prefix.clone(),
             })),
             flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
         };
         let identity = Identity("agent-1".into());
