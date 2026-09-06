@@ -2,6 +2,7 @@
 policies/*
 !policies/*.example.toml
 db.sqlite*
+/logs/
 
 # Rust
 /target

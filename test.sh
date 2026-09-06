@@ -108,6 +108,13 @@ WORKDIR="$(mktemp -d)"
 TEST_USER_ID="e2e-ai-protect-$$"
 TEST_USER_DN="uid=${TEST_USER_ID},ou=people,${BASE_DN}"
 
+# ai-protect writes its structured JSON audit log to ./logs/ldap.log
+# (relative to its own cwd, which is this repo's root throughout this
+# script) regardless of which [[proxy]] entry is running -- reset it here
+# so the "Structured JSON audit log" check below verifies what this run
+# actually produced, not a stale file left over from an earlier run.
+rm -f logs/ldap.log
+
 # ---------------------------------------------------------------------------
 # Bring up the real upstream directory
 # ---------------------------------------------------------------------------
@@ -411,6 +418,37 @@ else
 fi
 
 stop_proxy
+
+# ---------------------------------------------------------------------------
+# 4. Structured JSON audit log: every proxy instance above shares one
+#    ./logs/ldap.log (see the reset near the top of this script), so by now
+#    it should hold both an allow and a block decision as single-line JSON
+#    objects with fields flattened to the top level (not nested under
+#    "fields"), which is what a log shipper/SIEM expects to parse.
+# ---------------------------------------------------------------------------
+
+section "Structured JSON audit log"
+
+if [ -s logs/ldap.log ]; then
+    pass "logs/ldap.log was written to"
+else
+    fail "logs/ldap.log is missing or empty"
+fi
+
+first_line=$(head -n1 logs/ldap.log)
+if echo "$first_line" | grep -Eq '^\{.*"timestamp":"[^"]+".*"level":"[A-Z]+".*\}$'; then
+    pass "logs/ldap.log lines are JSON objects with the expected fields"
+else
+    fail "first line of logs/ldap.log doesn't look like JSON: $first_line"
+fi
+
+if grep -q '"message":"action allowed"' logs/ldap.log \
+        && grep -q '"message":"action blocked"' logs/ldap.log \
+        && grep -q '"reason":' logs/ldap.log; then
+    pass "logs/ldap.log captured both allow and block decisions with flattened fields"
+else
+    fail "logs/ldap.log missing expected allow/block/reason fields"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -255,12 +255,25 @@ priority; within a group, roughly in the order you'd want to tackle them.
       `config.toml` — one process-wide endpoint, opt-in, covering every
       `[[proxy]]` entry. See "Metrics" in
       [ARCHITECTURE.md](ARCHITECTURE.md#metrics).
-- [ ] **No structured log output option.** `tracing_subscriber::fmt::init()`
+- [x] **No structured log output option.** `tracing_subscriber::fmt::init()`
       in [`main.rs`](src/main.rs) emits human-readable text only; a JSON
       formatter option would make shipping to a SIEM much less painful, and
       the audit trail (this system's stated forensic record, per
       [ARCHITECTURE.md](ARCHITECTURE.md#audit-logging)) is worth making
-      easy to ingest.
+      easy to ingest. Fixed: `main.rs` now installs two `tracing` output
+      layers sharing one `RUST_LOG`-driven filter — stdout keeps the
+      existing human-readable text (unchanged), and a new
+      `tracing-appender` non-blocking writer sends structured JSON (fields
+      flattened to the top level, not nested under `"fields"`) to
+      `./logs/ldap.log`, created on startup if missing. Every event reaches
+      both; nothing is unique to either side. The path is fixed rather
+      than config-driven — a stable location to point a log shipper or
+      `logrotate` at. Known limitation: the file never rotates itself
+      (`rolling::never`, to keep the exact filename `ldap.log`) and the
+      path is relative to the process's working directory — an unbounded
+      deployment needs an external rotator, and a non-writable/relative
+      cwd (e.g. some container setups) needs attention. See "Audit
+      logging" in [ARCHITECTURE.md](ARCHITECTURE.md#audit-logging).
 - [ ] **No health/readiness endpoint** for orchestrator liveness/readiness
       probes (k8s, etc.).
 - [ ] **No deployment packaging** — no Dockerfile, systemd unit, or Helm

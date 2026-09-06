@@ -22,8 +22,16 @@ the `Action` seam, identity, audit logging, transport (`net`/`tls`), and the
 policy engine — as opposed to `src/connector/`, which is protocol-specific
 (LDAP today), and `src/proxy/`, which is the connection-handling orchestration.
 
-- [src/main.rs](src/main.rs) — thin binary entry point: reads the config
-  path CLI arg and hands off to `ai_protect::run`.
+- [src/main.rs](src/main.rs) — thin binary entry point: installs the
+  `tracing` subscriber (two layers sharing one `RUST_LOG`-driven
+  `EnvFilter`: human-readable text on stdout, unchanged from before, plus
+  structured JSON — fields flattened to the top level, not nested under
+  `"fields"` — written non-blockingly via `tracing-appender` to
+  `./logs/ldap.log`, the file a log shipper/SIEM or `logrotate` is pointed
+  at), reads the config path CLI arg, and hands off to `ai_protect::run`.
+  This lives here rather than in the library: `run_with_config`/
+  `ProxyBuilder` never touch subscriber setup, so an embedder's own
+  `tracing` configuration is untouched.
 - [src/lib.rs](src/lib.rs) — the library's three public entry points
   (`run`, `run_with_config`, `builder::ProxyBuilder`) covering different
   amounts of "load this from a file" — see its module doc comment and
@@ -270,7 +278,9 @@ RUST_LOG=info cargo run   # tracing-subscriber reads RUST_LOG; default is silent
 
 Both `config.toml` and everything under `policies/` (except the tracked
 `*.example.toml` templates) are gitignored, since real deployment values may
-be sensitive — see `.gitignore`.
+be sensitive — see `.gitignore`. `logs/` (holding `ldap.log`, the structured
+JSON audit trail — see `src/main.rs` above) is gitignored too, as runtime
+output rather than tracked content.
 
 Run the test suite with `cargo test`. If you add behavior, prefer adding
 `#[test]`/`#[tokio::test]` coverage alongside it — `ThresholdPolicy` and

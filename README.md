@@ -120,6 +120,11 @@ Logging is off by default; enable it with `RUST_LOG`:
 RUST_LOG=info cargo run
 ```
 
+When enabled, every log line goes to both stdout (human-readable) and
+`./logs/ldap.log` (structured JSON, fields flattened to the top level) —
+the latter is what to point a log shipper or SIEM at. See "Audit logging"
+in [ARCHITECTURE.md](ARCHITECTURE.md#audit-logging).
+
 ## Local testing
 
 [compose.yaml](compose.yaml) runs a disposable

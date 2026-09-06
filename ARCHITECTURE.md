@@ -460,6 +460,37 @@ is the system's forensic trail: everything a policy blocked, and why, is
 recoverable from logs even though the process holds no persistent state
 beyond the in-memory threshold window.
 
+`audit::log_decision` itself doesn't know or care where those events end up
+— that's [`src/main.rs`](src/main.rs)'s job, as the one place that installs
+a `tracing` subscriber (the library entry points never do — see
+[Using ai-protect as a library](AGENTS.md#using-ai-protect-as-a-library)).
+It installs two output layers sharing one `RUST_LOG`-driven `EnvFilter`, so
+verbosity is controlled once for both:
+
+- **stdout**, human-readable text — unchanged from before, for interactive
+  use (`RUST_LOG=info cargo run`) and for anything that captures a
+  process's stdout as its log (a terminal, `docker logs`, the systemd
+  journal).
+- **`./logs/ldap.log`**, structured JSON with event fields flattened to the
+  top level (not nested under a `"fields"` key) — the machine-parseable
+  form of the same events, meant to be tailed by a log shipper (Filebeat,
+  Fluentd, Promtail) or rotated by `logrotate`, without needing to scrape
+  process output. Written through a `tracing-appender` non-blocking
+  writer so a slow or stalled disk write can't back up the async runtime;
+  the directory is created on startup if it doesn't exist. The path is
+  fixed rather than configurable — a stable, well-known location is more
+  useful to point log-shipping config at than one more setting to plumb
+  through `Config`.
+
+Both layers see exactly the same events (they're two views of one
+subscriber, not two separate logging paths), so nothing is unique to one
+side — anything in `logs/ldap.log` is also on stdout and vice versa. Neither
+one rotates the file automatically (`tracing_appender::rolling::never`, to
+keep the filename exactly `ldap.log` rather than a date-suffixed variant) —
+an unbounded deployment needs an external rotator (`logrotate` with
+`copytruncate`, or a log-shipping agent that handles rotation itself)
+watching that same path.
+
 ## Metrics
 
 [`core::metrics`](src/core/metrics.rs) records aggregate counters/gauges/
@@ -617,6 +648,12 @@ Adding another listener/upstream pair is likewise config-only — another
 - One `[[proxy]]` entry's fatal error aborts every other entry in the same
   process (see `run_with_config`) rather than restarting just the failed
   one — there's no per-entry supervision/backoff.
+- `./logs/ldap.log` (see [Audit logging](#audit-logging)) is a fixed path
+  relative to the process's working directory and never rotates itself —
+  it assumes that directory is writable and that something external
+  (`logrotate`, a log-shipping agent) bounds the file's size. Neither holds
+  automatically in every deployment shape (a read-only container root
+  filesystem, an orchestrator that doesn't run `logrotate`).
 
 These aren't oversights to work around silently; they're the next pieces of
 this architecture, and changes that touch those areas should extend the
