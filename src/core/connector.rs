@@ -47,18 +47,37 @@ pub trait Connector: Send + Sync {
         Ok(None)
     }
 
-    /// If `frame` establishes the connection's identity for policy purposes
-    /// (LDAP's simple `BindRequest` is the only example today), returns that
-    /// identity's string form so the proxy can replace its current
-    /// `Identity` with it. This exists because two agents sharing a
-    /// NAT/egress address otherwise share one blast-radius budget under
-    /// address-based identity alone — a bind DN distinguishes them. `Ok(None)`
-    /// means "not an identity-establishing request" (including anonymous or
-    /// SASL binds, whose named DN isn't password-verified the way a simple
-    /// bind's is), and the proxy leaves the connection's current identity
-    /// unchanged. Defaults to "this protocol has no such mechanism," so
-    /// connectors that don't support it need no changes.
-    fn bind_identity(&self, frame: &[u8]) -> anyhow::Result<Option<String>> {
+    /// If `frame` is a request that claims an identity for policy purposes
+    /// (LDAP's simple `BindRequest` is the only example today), returns its
+    /// message ID and the claimed identity's string form so the proxy can
+    /// stage it as *pending* — not yet trusted — until the correlated
+    /// response is seen (see `bind_response`). This exists because two
+    /// agents sharing a NAT/egress address otherwise share one blast-radius
+    /// budget under address-based identity alone — a bind DN distinguishes
+    /// them, but only once it's known to be real. `Ok(None)` means "not an
+    /// identity-claiming request" (including anonymous or SASL binds, whose
+    /// named DN isn't password-verified the way a simple bind's is), and the
+    /// proxy leaves any pending claim alone. Defaults to "this protocol has
+    /// no such mechanism," so connectors that don't support it need no
+    /// changes.
+    fn bind_request(&self, frame: &[u8]) -> anyhow::Result<Option<(u32, String)>> {
+        let _ = frame;
+        Ok(None)
+    }
+
+    /// If `frame` is the response correlating to a request staged via
+    /// `bind_request` (matched by message ID, LDAP being request/response),
+    /// returns that message ID and whether the claim succeeded, so the proxy
+    /// can promote its pending identity claim to the connection's actual
+    /// `Identity` — or discard it — accordingly. Trusting the identity named
+    /// in a bind *request* before this fires is exactly the policy-bypass
+    /// gap this hook closes: a claimed DN that's never actually
+    /// password-verified upstream must not get a fresh, empty blast-radius
+    /// budget. `Ok(None)` means "not a response to a staged claim," and the
+    /// proxy leaves the pending state untouched. Defaults to "this protocol
+    /// has no such mechanism," so connectors that don't support
+    /// `bind_request` need no changes here either.
+    fn bind_response(&self, frame: &[u8]) -> anyhow::Result<Option<(u32, bool)>> {
         let _ = frame;
         Ok(None)
     }

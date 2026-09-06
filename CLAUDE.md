@@ -74,12 +74,13 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
   into the normal per-frame loop.
 - **`src/core/connector.rs`** — the `Connector` trait
   (`connect_upstream`/`read_frame`/`decode`/`build_rejection`/
-  `upgrade_request`/`bind_identity`) that `src/proxy.rs` is written against
-  as `Arc<dyn Connector>`, with zero compile-time knowledge of LDAP or any
-  specific backend. `upgrade_request` and `bind_identity` each have a
-  default no-op impl (`Ok(None)`), so only a connector that supports an
-  in-session TLS upgrade (LDAP's StartTLS) or an identity-establishing
-  request (LDAP's bind) needs to override the respective one.
+  `upgrade_request`/`bind_request`/`bind_response`) that `src/proxy.rs` is
+  written against as `Arc<dyn Connector>`, with zero compile-time knowledge
+  of LDAP or any specific backend. `upgrade_request`, `bind_request`, and
+  `bind_response` each have a default no-op impl (`Ok(None)`), so only a
+  connector that supports an in-session TLS upgrade (LDAP's StartTLS) or an
+  identity-claiming request/response pair (LDAP's bind) needs to override
+  the respective ones.
 - **`src/connector/ldap.rs`** — the only `Connector` impl. Owns BER frame
   parsing (RFC 4511 §5.1, not delegated to a higher-level LDAP library,
   since raw frame boundaries are needed to forward unmodified bytes),
@@ -98,8 +99,10 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
   StartTLS extended requests (`upgrade_request`) and, via `with_starttls`,
   can negotiate StartTLS itself when dialing the upstream instead of using
   implicit TLS; and recognizes a simple `BindRequest` naming a non-empty DN
-  (`bind_identity`) so the proxy can key policy/audit identity off that DN
-  instead of the peer address.
+  (`bind_request`) plus the `BindResponse` answering it (`bind_response`,
+  correlated by LDAP message ID) so the proxy can key policy/audit identity
+  off that DN, but only once the bind is confirmed to have actually
+  succeeded, instead of the peer address or an unverified claim.
 - **`src/core/action.rs`** — `Action`/`OperationKind`, the backend-agnostic
   seam: what's attempted, what it targets, and its `blast_radius` (always
   `1` today; exists so a future bulk-op connector can report >1 without any
@@ -110,17 +113,24 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
   `evaluate_all` (stops at first `Block`, so ordering matters for
   stateful/side-effecting policies). `ThresholdPolicy` is the only impl:
   blocks a single request over `max_per_request`, and separately tracks a
-  per-`Identity` sliding window (`max_per_window` over `window_secs`) — a
-  process-local `Mutex<HashMap<Identity, VecDeque<Instant>>>` that only
-  advances on `Allow` (blocked actions don't pollute history). State does
-  not survive a restart or span multiple instances.
+  sliding window (`max_per_window` over `window_secs`) — a process-local
+  `Mutex<HashMap<Identity, VecDeque<Instant>>>` that only advances on
+  `Allow` (blocked actions don't pollute history). `scope` selects the
+  bucket: `PerIdentity` (default, one bucket per `Identity`) or `Global`
+  (one shared bucket across every identity, for a second `[[policy]]` entry
+  run as an identity-independent backstop that identity churn can't reset).
+  State does not survive a restart or span multiple instances unless
+  `state_db` is set.
 - **`src/core/identity.rs`** — `Identity`, an opaque string wrapper. Starts
-  as the peer's source IP (port dropped, stable across reconnects);
-  `proxy::handle_client_frame` replaces it with the DN from a simple LDAP
-  bind once one is seen (`Connector::bind_identity`), so two clients behind
-  the same NAT are distinguished as long as they bind under different DNs.
-  The bind isn't correlated against its `BindResponse`, so this is
-  optimistic — see the caveat in [ARCHITECTURE.md](ARCHITECTURE.md#identity).
+  as the peer's source IP (port dropped, stable across reconnects).
+  `src/proxy.rs`'s connection-scoped `BindState` replaces it with the DN
+  from a simple LDAP bind, but only once that bind's correlated
+  `BindResponse` (matched by message ID) reports success
+  (`Connector::bind_request`/`bind_response`) — a claimed DN alone never
+  moves it, closing a policy-bypass gap where identity could previously be
+  churned via unverified bind claims. Two clients behind the same NAT are
+  distinguished as long as they bind under different, successfully-verified
+  DNs — see [ARCHITECTURE.md](ARCHITECTURE.md#identity).
 - **`src/core/audit.rs`** — structured `tracing` logging of every policy
   decision (`info` allow / `warn` block), decoupled from policy logic —
   the forensic trail since there's no other persistent state.

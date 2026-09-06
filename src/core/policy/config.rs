@@ -145,6 +145,53 @@ mod tests {
     }
 
     #[test]
+    fn global_scope_threshold_catches_identity_churn_a_per_identity_budget_misses() {
+        // The documented pattern: a per-identity budget plus a global
+        // backstop. A caller that claims a fresh identity before each batch
+        // gets a brand-new, untouched per-identity budget every time — but
+        // can't escape the global one, since it isn't keyed by identity at
+        // all.
+        let policies = parse(
+            r#"
+            [[policy]]
+            type = "threshold"
+            max_per_request = 10
+            max_per_window = 4
+            window_secs = 60
+
+            [[policy]]
+            type = "threshold"
+            scope = "global"
+            max_per_request = 10
+            max_per_window = 6
+            window_secs = 60
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(policies.len(), 2);
+        let alice = PolicyContext {
+            identity: Identity("cn=alice,dc=example,dc=com".into()),
+        };
+        let bob = PolicyContext {
+            identity: Identity("cn=bob,dc=example,dc=com".into()),
+        };
+
+        assert!(matches!(
+            evaluate_all(&policies, &action(4), &alice),
+            Decision::Allow
+        ));
+        // bob is a brand-new identity with its own empty per-identity
+        // budget, so the first policy alone would allow this — but the
+        // global policy has already seen alice's 4 and blocks bob's 4 from
+        // pushing the shared total to 8, over its window limit of 6.
+        match evaluate_all(&policies, &action(4), &bob) {
+            Decision::Block { reason } => assert!(reason.contains("all identities")),
+            Decision::Allow => panic!("expected the global backstop to block identity churn"),
+        }
+    }
+
+    #[test]
     fn preserves_declared_order_across_multiple_entries() {
         let policies = parse(
             r#"

@@ -155,7 +155,7 @@ mod tests {
     use crate::connector::ldap::LdapConnector;
     use crate::connector::ldap::read_frame;
     use crate::connector::ldap::test_support::{encode_message, modify_request_frame};
-    use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy};
+    use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy, ThresholdScope};
 
     /// Reserves a free `127.0.0.1` port by binding and immediately dropping
     /// a listener on it. `ProxyBuilder::serve` binds its own listener
@@ -207,6 +207,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::PerIdentity,
         }));
 
         tokio::spawn(

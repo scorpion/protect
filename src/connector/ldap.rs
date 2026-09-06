@@ -248,16 +248,18 @@ impl LdapConnector {
     }
 
     /// Decode a BindRequest and, if it's a simple (DN + password) bind naming
-    /// a non-empty DN, return that DN so the proxy can start tracking policy
-    /// history under it instead of the client's source address — necessary
-    /// because two agents behind the same NAT/egress otherwise share one
-    /// blast-radius budget, and a source address alone proves nothing about
-    /// which principal is acting. Anonymous binds (empty DN) and SASL binds
-    /// (the `name` field there isn't password-verified the way it is for a
-    /// simple bind — the real identity comes from the SASL mechanism) return
-    /// `None`, leaving the connection's current identity unchanged, as does
-    /// every non-bind frame.
-    pub fn bind_identity(&self, frame: &[u8]) -> Result<Option<String>> {
+    /// a non-empty DN, return its message ID and that DN so the proxy can
+    /// stage it as a pending identity claim instead of trusting it
+    /// immediately — necessary because two agents behind the same NAT/egress
+    /// otherwise share one blast-radius budget, and a source address alone
+    /// proves nothing about which principal is acting, but a *claimed* DN
+    /// proves nothing either until the directory actually verifies the
+    /// password (see `bind_response`, which correlates by this same message
+    /// ID). Anonymous binds (empty DN) and SASL binds (the `name` field
+    /// there isn't password-verified the way it is for a simple bind — the
+    /// real identity comes from the SASL mechanism) return `None`, leaving
+    /// any pending claim alone, as does every non-bind frame.
+    pub fn bind_request(&self, frame: &[u8]) -> Result<Option<(u32, String)>> {
         let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
         let ProtocolOp::BindRequest(bind) = &message.protocol_op else {
             return Ok(None);
@@ -266,7 +268,24 @@ impl LdapConnector {
         {
             return Ok(None);
         }
-        Ok(Some(bind.name.0.clone()))
+        Ok(Some((message.message_id, bind.name.0.clone())))
+    }
+
+    /// Decode a response frame and, if it's a `BindResponse`, return its
+    /// message ID and whether the bind it answers succeeded, so the proxy
+    /// can resolve the matching pending claim staged by `bind_request` —
+    /// promoting the connection's `Identity` on success, discarding the
+    /// claim otherwise. Every other response returns `None`, so the proxy
+    /// leaves pending state untouched.
+    pub fn bind_response(&self, frame: &[u8]) -> Result<Option<(u32, bool)>> {
+        let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
+        let ProtocolOp::BindResponse(bind_response) = &message.protocol_op else {
+            return Ok(None);
+        };
+        Ok(Some((
+            message.message_id,
+            bind_response.result_code == ResultCode::Success,
+        )))
     }
 
     /// Build a well-formed LDAP response rejecting the request whose raw
@@ -329,8 +348,12 @@ impl Connector for LdapConnector {
         self.upgrade_request(frame)
     }
 
-    fn bind_identity(&self, frame: &[u8]) -> Result<Option<String>> {
-        self.bind_identity(frame)
+    fn bind_request(&self, frame: &[u8]) -> Result<Option<(u32, String)>> {
+        self.bind_request(frame)
+    }
+
+    fn bind_response(&self, frame: &[u8]) -> Result<Option<(u32, bool)>> {
+        self.bind_response(frame)
     }
 }
 
@@ -700,34 +723,34 @@ mod tests {
     }
 
     #[test]
-    fn bind_identity_extracts_dn_from_simple_bind() {
-        let frame = bind_request_frame(1, "cn=alice,dc=example,dc=com");
+    fn bind_request_extracts_message_id_and_dn_from_simple_bind() {
+        let frame = bind_request_frame(7, "cn=alice,dc=example,dc=com");
 
-        let identity = connector().bind_identity(&frame).unwrap();
+        let claim = connector().bind_request(&frame).unwrap();
 
-        assert_eq!(identity.as_deref(), Some("cn=alice,dc=example,dc=com"));
+        assert_eq!(claim, Some((7, "cn=alice,dc=example,dc=com".to_string())));
     }
 
     #[test]
-    fn bind_identity_ignores_anonymous_bind() {
+    fn bind_request_ignores_anonymous_bind() {
         let frame = bind_request_frame(1, "");
 
-        let identity = connector().bind_identity(&frame).unwrap();
+        let claim = connector().bind_request(&frame).unwrap();
 
-        assert!(identity.is_none());
+        assert!(claim.is_none());
     }
 
     #[test]
-    fn bind_identity_ignores_sasl_bind() {
+    fn bind_request_ignores_sasl_bind() {
         let frame = sasl_bind_request_frame(1, "cn=alice,dc=example,dc=com");
 
-        let identity = connector().bind_identity(&frame).unwrap();
+        let claim = connector().bind_request(&frame).unwrap();
 
-        assert!(identity.is_none());
+        assert!(claim.is_none());
     }
 
     #[test]
-    fn bind_identity_ignores_non_bind_operations() {
+    fn bind_request_ignores_non_bind_operations() {
         let frame = modify_request_frame(
             1,
             "cn=alice,dc=example,dc=com",
@@ -735,9 +758,59 @@ mod tests {
             b"514",
         );
 
-        let identity = connector().bind_identity(&frame).unwrap();
+        let claim = connector().bind_request(&frame).unwrap();
 
-        assert!(identity.is_none());
+        assert!(claim.is_none());
+    }
+
+    #[test]
+    fn bind_response_reports_success_and_message_id() {
+        let frame = test_support::encode_message(
+            7,
+            ProtocolOp::BindResponse(rasn_ldap::BindResponse::new(
+                ResultCode::Success,
+                "".into(),
+                "".into(),
+                None,
+                None,
+            )),
+        );
+
+        let outcome = connector().bind_response(&frame).unwrap();
+
+        assert_eq!(outcome, Some((7, true)));
+    }
+
+    #[test]
+    fn bind_response_reports_failure() {
+        let frame = test_support::encode_message(
+            7,
+            ProtocolOp::BindResponse(rasn_ldap::BindResponse::new(
+                ResultCode::InvalidCredentials,
+                "".into(),
+                "".into(),
+                None,
+                None,
+            )),
+        );
+
+        let outcome = connector().bind_response(&frame).unwrap();
+
+        assert_eq!(outcome, Some((7, false)));
+    }
+
+    #[test]
+    fn bind_response_ignores_non_bind_responses() {
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
+
+        let outcome = connector().bind_response(&frame).unwrap();
+
+        assert!(outcome.is_none());
     }
 
     #[test]

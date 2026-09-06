@@ -39,13 +39,48 @@ fn default_valkey_key_prefix() -> String {
     "ai_protect:threshold".to_string()
 }
 
+/// Whether a `ThresholdPolicy` instance tracks its sliding-window budget
+/// separately per `Identity` (the default — "4 accounts is fine for this
+/// caller, 4,000 is not") or as one shared, identity-independent ceiling
+/// across every caller regardless of how identity is derived. `Global` is
+/// meant to run as a second, stricter-in-aggregate `[[policy]]` entry
+/// alongside a `PerIdentity` one: identity churn (a fresh, unverified bind
+/// DN claimed before each batch) resets a `PerIdentity` budget, but can't
+/// reset a `Global` one, since it isn't keyed by identity at all — closing
+/// the "compromised credential enumerates fresh identities" bypass a
+/// per-identity-only budget is otherwise exposed to.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdScope {
+    #[default]
+    PerIdentity,
+    Global,
+}
+
+/// The `history`/`state_db` key every action is bucketed under when a
+/// `ThresholdPolicy` is configured with `ThresholdScope::Global`, instead of
+/// `ctx.identity`. Reuses the same `Identity`-keyed map and persistence path
+/// as per-identity scope (rather than a parallel set of fields) purely to
+/// avoid duplicating that machinery; NUL-delimited so an ordinary bind DN or
+/// peer IP address can't spell it by accident. A caller that deliberately
+/// crafts an identity string equal to this sentinel only pools its own
+/// budget into the shared global one — a variant of the identity-namespace-
+/// collision gap already tracked in TODO.md, not a new one.
+const GLOBAL_HISTORY_KEY: &str = "\0ai-protect:global\0";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThresholdConfig {
     /// Blast radius of a single request that immediately trips a block,
     /// regardless of history (e.g. one request that itself claims 4,000 accounts).
     pub max_per_request: usize,
-    /// Total blast radius allowed per identity within `window`.
+    /// Total blast radius allowed per identity within `window` — or, when
+    /// `scope` is `Global`, total blast radius allowed across every identity
+    /// combined within `window`.
     pub max_per_window: usize,
+    /// See [`ThresholdScope`]. Defaults to `PerIdentity`, preserving today's
+    /// behavior for any config that doesn't set it.
+    #[serde(default)]
+    pub scope: ThresholdScope,
     #[serde(rename = "window_secs", deserialize_with = "deserialize_secs")]
     pub window: Duration,
     /// Optional backing store this policy's history survives a restart in
@@ -267,6 +302,19 @@ fn rows_into_history(
         .collect()
 }
 
+impl ThresholdPolicy {
+    /// The `history`/`state_db` key this action is bucketed under: the
+    /// caller's own `Identity` for `PerIdentity` scope, or the fixed
+    /// `GLOBAL_HISTORY_KEY` sentinel for `Global` scope, so every caller
+    /// shares one bucket regardless of identity.
+    fn history_key(&self, ctx: &PolicyContext) -> Identity {
+        match self.config.scope {
+            ThresholdScope::PerIdentity => ctx.identity.clone(),
+            ThresholdScope::Global => Identity(GLOBAL_HISTORY_KEY.to_string()),
+        }
+    }
+}
+
 impl Policy for ThresholdPolicy {
     fn evaluate(&self, action: &Action, ctx: &PolicyContext) -> Decision {
         if action.blast_radius > self.config.max_per_request {
@@ -278,8 +326,9 @@ impl Policy for ThresholdPolicy {
             };
         }
 
+        let key = self.history_key(ctx);
         let mut history = self.history.lock().unwrap();
-        let entry = history.entry(ctx.identity.clone()).or_default();
+        let entry = history.entry(key.clone()).or_default();
 
         let now = Instant::now();
         while let Some(&oldest) = entry.front() {
@@ -291,9 +340,13 @@ impl Policy for ThresholdPolicy {
         }
 
         if entry.len() + action.blast_radius > self.config.max_per_window {
+            let scope_label = match self.config.scope {
+                ThresholdScope::PerIdentity => "matching actions",
+                ThresholdScope::Global => "matching actions across all identities",
+            };
             return Decision::Block {
                 reason: format!(
-                    "{} matching actions in the last {:?} would exceed window limit {}",
+                    "{} {scope_label} in the last {:?} would exceed window limit {}",
                     entry.len(),
                     self.config.window,
                     self.config.max_per_window
@@ -309,7 +362,7 @@ impl Policy for ThresholdPolicy {
         if let Some(state) = &self.state {
             let mut pending = state.pending.lock().unwrap();
             for _ in 0..action.blast_radius {
-                pending.push((ctx.identity.clone(), now));
+                pending.push((key.clone(), now));
             }
         }
 
@@ -421,6 +474,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
 
@@ -437,6 +491,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
 
@@ -453,6 +508,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
 
@@ -474,6 +530,7 @@ mod tests {
             window: Duration::from_secs(60),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::PerIdentity,
         });
         let alice = Identity("alice".into());
         let bob = Identity("bob".into());
@@ -493,6 +550,56 @@ mod tests {
     }
 
     #[test]
+    fn global_scope_shares_one_budget_across_every_identity() {
+        // The whole point of a `Global` instance: unlike `PerIdentity`,
+        // switching identities can't buy a fresh budget, since every
+        // identity is bucketed under the same key.
+        let policy = ThresholdPolicy::new(ThresholdConfig {
+            max_per_request: 10,
+            max_per_window: 1,
+            window: Duration::from_secs(60),
+            state_db: None,
+            flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::Global,
+        });
+        let alice = Identity("alice".into());
+        let bob = Identity("bob".into());
+
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&alice)),
+            Decision::Allow
+        ));
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&bob)),
+            Decision::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_scope_from_toml_and_defaults_to_per_identity() {
+        let default_config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            "#,
+        )
+        .unwrap();
+        assert_eq!(default_config.scope, ThresholdScope::PerIdentity);
+
+        let global_config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            scope = "global"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(global_config.scope, ThresholdScope::Global);
+    }
+
+    #[test]
     fn falls_back_to_in_memory_when_valkey_url_is_invalid() {
         // `ValkeyStore::open` only parses the URL — it never connects — so
         // this is a pure unit test: a malformed URL is the one failure mode
@@ -507,6 +614,7 @@ mod tests {
                 key_prefix: "ai_protect_test".into(),
             })),
             flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
 
@@ -523,6 +631,7 @@ mod tests {
             window: Duration::from_millis(20),
             state_db: None,
             flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::PerIdentity,
         });
         let identity = Identity("agent-1".into());
 
@@ -550,6 +659,7 @@ mod tests {
             window,
             state_db: Some(StateDbConfig::Sqlite(path.to_path_buf())),
             flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::PerIdentity,
         }
     }
 
@@ -629,6 +739,7 @@ mod tests {
                 key_prefix: key_prefix.clone(),
             })),
             flush_interval: Duration::from_secs(2),
+            scope: ThresholdScope::PerIdentity,
         };
         let identity = Identity("agent-1".into());
 

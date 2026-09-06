@@ -182,7 +182,7 @@ over the wire, with every decision landing in the audit log. Requires
 project targeting the two places
 [`LdapConnector`](src/connector/ldap.rs) touches fully untrusted bytes off
 the wire: `read_frame`'s BER tag/length framing, and the
-`decode`/`upgrade_request`/`bind_identity`/`build_rejection` methods that
+`decode`/`upgrade_request`/`bind_request`/`bind_response`/`build_rejection` methods that
 `rasn::ber::decode` a length-delimited frame into an LDAP message. Requires
 a nightly toolchain (`rustup toolchain install nightly`) and `cargo install
 cargo-fuzz`.

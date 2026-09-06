@@ -329,13 +329,25 @@ encodes "4 accounts is fine, 4,000 is not" with two independent checks:
 1. **Per-request cap** (`max_per_request`): a single action whose own
    `blast_radius` exceeds the limit is blocked immediately, no history
    needed.
-2. **Per-identity sliding window** (`max_per_window` over `window`): each
-   identity accumulates a `VecDeque<Instant>` of past allowed actions
-   (one entry per unit of blast radius). Entries older than `window` are
-   evicted lazily on each evaluation. An action is blocked if admitting it
-   would push the identity's windowed total over the limit; state is only
-   advanced when the action is ultimately allowed (blocked actions don't
-   pollute history).
+2. **Sliding window** (`max_per_window` over `window`): the bucket the
+   window is tracked under accumulates a `VecDeque<Instant>` of past
+   allowed actions (one entry per unit of blast radius). Entries older than
+   `window` are evicted lazily on each evaluation. An action is blocked if
+   admitting it would push the bucket's windowed total over the limit;
+   state is only advanced when the action is ultimately allowed (blocked
+   actions don't pollute history).
+
+`scope` selects what that bucket *is*:
+
+- `PerIdentity` (the default): one bucket per `Identity`, exactly as
+  described above — "4 accounts is fine for this caller, 4,000 is not."
+- `Global`: one shared bucket across every identity, ignoring
+  `ctx.identity` entirely (bucketed under a fixed internal sentinel key
+  instead). Meant to run as a *second* `[[policy]]` entry alongside a
+  `PerIdentity` one: since it isn't keyed by identity at all, a caller that
+  claims a fresh, unverified bind DN before each batch — resetting a
+  `PerIdentity` budget every time (see [Identity](#identity)) — can't reset
+  this one too. See `policies/ldap.example.toml` for the two-entry pattern.
 
 State lives in an in-memory `Mutex<HashMap<Identity, VecDeque<Instant>>>`,
 always — `evaluate` never does I/O, so admitting or blocking a request
@@ -424,30 +436,58 @@ warning and falls back to pure in-memory behavior.
 audit logging depend on an abstraction, not a transport detail. A
 connection's `Identity` starts as the client's source IP address,
 stringified (the ephemeral port is dropped, so it survives reconnects), and
-`proxy::handle_client_frame` replaces it the moment
-[`Connector::bind_identity`](src/core/connector.rs) recognizes a
-frame that establishes a more specific one —
-[`LdapConnector::bind_identity`](src/connector/ldap.rs) does this for a
-simple (DN + password) `BindRequest` naming a non-empty DN, since a
-password-verified DN is a real principal rather than just an address two
-unrelated agents might share.
+is replaced with a more specific one — a bind DN — only once that DN is
+confirmed, not merely claimed.
 
-This closes the main gap with pure address-based identity: two agents
-behind the same NAT/egress no longer share one blast-radius budget as long
-as they bind under different DNs (see the `bind_dn_becomes_identity_*` test
-in [src/proxy.rs](src/proxy.rs)). It does **not** verify the bind actually
-succeeds — the proxy relays requests and responses independently and
-doesn't correlate a `BindResponse` back to the request that produced it,
-so `Identity` moves as soon as the `BindRequest` frame is seen, optimistically,
-before upstream has any chance to reject it. In practice this is low-risk:
-a bind that fails upstream leaves the session unauthenticated there, so
-follow-on writes under the claimed DN still get rejected by the real
-directory (assuming anonymous writes are disabled) — the false identity
-just doesn't get to *do* anything. Anonymous binds (empty DN) and SASL
-binds (the `name` field isn't password-verified the way it is for a simple
-bind) leave the current identity unchanged. A connection that never binds
-keeps its address-based identity for its whole lifetime, so anonymous/
-unauthenticated traffic behaves exactly as before.
+This confirmation is what [`BindState`](src/proxy.rs) exists for. Two
+relay directions run concurrently per connection (`tokio::select!` in
+`handle_connection`), and neither alone has enough information to decide
+identity safely: the client-facing direction sees the `BindRequest` but not
+whether it succeeds; the upstream-facing direction sees the `BindResponse`
+but not which DN it answers. `BindState`, shared between them, closes that
+gap by correlating the two on LDAP message ID:
+
+1. **Client direction** (`handle_client_frame`): when
+   [`Connector::bind_request`](src/core/connector.rs) recognizes a frame as
+   a simple (DN + password) `BindRequest` naming a non-empty DN —
+   [`LdapConnector::bind_request`](src/connector/ldap.rs) is the one
+   implementation — its message ID and claimed DN are staged in
+   `BindState.pending`. This is a *claim*, not yet trusted for policy
+   purposes; `Identity` doesn't change here.
+2. **Upstream direction** (`relay_upstream_responses` →
+   `resolve_pending_bind`): every response frame is checked via
+   [`Connector::bind_response`](src/core/connector.rs)
+   (`LdapConnector::bind_response`). If its message ID matches a pending
+   claim, that claim is resolved — removed from `pending` either way, and
+   promoted to `BindState.identity` (the connection's actual `Identity`)
+   only if the response reports success. A failed or never-answered bind
+   leaves identity untouched.
+
+Because promotion only happens on a confirmed success, a caller can't buy a
+fresh, empty blast-radius budget by claiming a made-up DN that never
+actually authenticates — see the
+`unverified_bind_does_not_change_identity_or_reset_budget` test in
+[src/proxy.rs](src/proxy.rs). This closes the main gap with pure
+address-based identity from the other direction too: two agents behind the
+same NAT/egress no longer share one blast-radius budget as long as they
+bind under different, real DNs (see the
+`bind_dn_becomes_identity_so_same_peer_gets_separate_budgets` test in the
+same file). Anonymous binds (empty DN) and SASL binds (the `name` field
+isn't password-verified the way it is for a simple bind) are never staged
+as claims, leaving the current identity unchanged. A connection that never
+binds keeps its address-based identity for its whole lifetime, so
+anonymous/unauthenticated traffic behaves exactly as before.
+
+This closes bind-claim verification specifically; it doesn't by itself cap
+how many *distinct* identities one attacker can churn through (an
+unauthenticated caller can still claim an unbounded number of fresh DNs,
+each getting its own empty `PerIdentity` budget once — if ever — it binds
+successfully). A `ThresholdScope::Global` policy entry (see
+[Policy: blast-radius thresholding](#policy-blast-radius-thresholding))
+is the backstop for that: a shared ceiling identity churn can't reset,
+regardless of how many identities are involved. Unbounded growth of the
+`Identity`-keyed history map itself, and namespace collisions between
+IP-derived and DN-derived identity strings, remain open — see TODO.md.
 
 ## Audit logging
 
@@ -673,9 +713,15 @@ Adding another listener/upstream pair is likewise config-only — another
 - Persistent/shared threshold history is opt-in and best-effort, not the
   default — set `state_db` per policy (see "SQLite-backed policy state"
   above) or a restart or a second instance still resets/double-budgets it.
-- `Identity` is derived from an unverified bind DN (falling back to source
-  address) — see the caveats in [Identity](#identity) — not from an
-  authenticated principal such as a validated mTLS client certificate.
+- `Identity` is derived from a bind DN confirmed only by its `BindResponse`
+  result code (falling back to source address) — see [Identity](#identity)
+  — not from an authenticated principal such as a validated mTLS client
+  certificate. A caller can still churn through an unbounded number of
+  distinct DNs (each gets its own fresh `PerIdentity` budget); a
+  `ThresholdScope::Global` backstop bounds the aggregate regardless, but
+  nothing yet bounds the `Identity`-keyed history map's cardinality or
+  namespaces IP-derived identities apart from DN-derived ones — see
+  TODO.md.
 - Every `[[proxy]]` entry hardcodes `LdapConnector` as its connector; the
   config-driven path (as opposed to `ProxyBuilder`, used directly) can front
   several LDAP upstreams but not a mix of protocols in one process without a

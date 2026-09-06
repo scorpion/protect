@@ -9,7 +9,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## Critical — policy bypass & resource exhaustion
 
-- [ ] **The blast-radius policy can be bypassed by identity churn.**
+- [x] **The blast-radius policy can be bypassed by identity churn.**
       [`LdapConnector::bind_identity`](src/connector/ldap.rs) accepts any DN
       named in a simple `BindRequest` at face value and
       [`proxy::handle_client_frame`](src/proxy.rs) swaps the connection's
@@ -35,6 +35,29 @@ priority; within a group, roughly in the order you'd want to tackle them.
       correlating request/response by message ID, which the proxy
       currently doesn't do at all); add a global, identity-independent
       aggregate cap as a backstop regardless of how identity is derived.
+      Fixed: `bind_identity` is split into `Connector::bind_request`
+      (stages a claimed DN, keyed by LDAP message ID, without touching
+      identity) and `Connector::bind_response` (reports whether the
+      correlated response succeeded); a new connection-scoped `BindState`
+      in `src/proxy.rs`, shared between the client- and upstream-facing
+      relay directions, resolves a pending claim — promoting `Identity`
+      only on confirmed success — the moment the matching `BindResponse` is
+      seen. A claimed-but-unverified DN can no longer buy a fresh budget
+      (see the `unverified_bind_does_not_change_identity_or_reset_budget`
+      test in `src/proxy.rs`). Separately, `ThresholdPolicy` gained a
+      `scope` option (`PerIdentity`, the default, or `Global`, one shared
+      bucket ignoring identity entirely) so a second `[[policy]]` entry can
+      run as the identity-independent aggregate backstop, undefeatable by
+      identity churn since it isn't keyed by identity at all — see the
+      commented-out example in `policies/ldap.example.toml`. Known
+      limitation: this closes *verification* of one claimed identity, not
+      the number of distinct identities a caller can churn through — an
+      unauthenticated caller can still bind under an unbounded number of
+      real, distinct DNs (if it has credentials for them) or unverified
+      claims (which now just never promote), each only bounded by the
+      `Global` backstop's aggregate ceiling, not a per-caller one. Unbounded
+      history-map cardinality and the IP/DN identity-namespace collision
+      remain open — see the following two items.
 - [ ] **Identity namespace collision between peer-IP and bind-DN
       derivation.** [`Identity`](src/core/identity.rs) is one flat,
       un-namespaced string used both for `Identity::from_peer_addr`

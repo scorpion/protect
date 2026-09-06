@@ -98,13 +98,14 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   never has to understand a wire protocol.
 - [src/core/connector.rs](src/core/connector.rs) — the `Connector` trait
   (`connect_upstream`/`read_frame`/`decode`/`build_rejection`/
-  `upgrade_request`/`bind_identity`) that `src/proxy.rs` is written against,
-  plus `DuplexStream`, the boxable `AsyncRead + AsyncWrite` object every
-  connector's upstream connection is returned as. This is what makes "a
-  new backend is a new connector, not a proxy.rs change" literally true
-  rather than aspirational. `upgrade_request` and `bind_identity` each
-  default to `Ok(None)` ("this protocol has no in-session TLS upgrade" /
-  "no identity-establishing request"), so both are opt-in per connector.
+  `upgrade_request`/`bind_request`/`bind_response`) that `src/proxy.rs` is
+  written against, plus `DuplexStream`, the boxable `AsyncRead + AsyncWrite`
+  object every connector's upstream connection is returned as. This is what
+  makes "a new backend is a new connector, not a proxy.rs change" literally
+  true rather than aspirational. `upgrade_request`, `bind_request`, and
+  `bind_response` each default to `Ok(None)` ("this protocol has no
+  in-session TLS upgrade" / "no identity-claiming request" / "no response
+  correlating to one"), so all three are opt-in per connector.
 - [src/connector/ldap.rs](src/connector/ldap.rs) — the only connector today.
   Reads BER-framed LDAP messages off the wire (`read_frame`), decodes
   `ModifyRequest`s via `rasn`/`rasn-ldap` and flags ones touching a known
@@ -122,19 +123,27 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   `AddResponse`/`ExtendedResp`), recognizes RFC 4511 StartTLS extended
   requests (`upgrade_request`, a separate code path from `decode`) so a
   client can upgrade a plaintext connection to TLS mid-session, and
-  recognizes a simple `BindRequest` naming a non-empty DN (`bind_identity`)
-  so the proxy can key policy/audit identity off that DN instead of the
-  peer address. Exposes this as both inherent methods (used directly by its
-  own tests) and an `impl Connector`.
+  recognizes a simple `BindRequest` naming a non-empty DN (`bind_request`,
+  keyed by message ID) so the proxy can stage that DN as a pending identity
+  claim, plus `BindResponse`s (`bind_response`) so the proxy can correlate a
+  claim to its outcome by message ID and only key policy/audit identity off
+  the DN once the bind is confirmed to have actually succeeded — never on
+  the claim alone. Exposes this as both inherent methods (used directly by
+  its own tests) and an `impl Connector`.
 - [src/core/policy.rs](src/core/policy.rs) — the `Policy` trait
   (`evaluate(&Action, &PolicyContext) -> Decision`) and `evaluate_all`, which
   runs every configured policy and stops at the first `Block`.
 - [src/core/policy/threshold.rs](src/core/policy/threshold.rs) — `ThresholdPolicy`, the
   only policy implemented so far. Blocks a single request whose
   `blast_radius` exceeds `max_per_request`, and separately tracks a sliding
-  window of blast radius per `Identity` to block bursts that exceed
-  `max_per_window` within `window`. Its history is an in-memory
-  `Mutex<HashMap<..>>` on the hot path, always — an optional `state_db`
+  window of blast radius to block bursts that exceed `max_per_window` within
+  `window`. `scope` (`PerIdentity`, the default, or `Global`) selects what
+  that window is bucketed by: per-`Identity` (today's original behavior), or
+  one shared bucket across every identity, for a second `[[policy]]` entry
+  run as an identity-independent backstop that a fresh, claimed-but-
+  unverified bind DN per batch can't reset the way a `PerIdentity` budget
+  can. Its history is an in-memory `Mutex<HashMap<..>>` on the hot path,
+  always — an optional `state_db`
   (a [`HistoryStore`](src/core/policy/store) backend) is loaded once at
   startup and, if set, kept in sync by a background task (`flush_interval`,
   default 2s) that writes newly-admitted actions and reloads the whole
@@ -164,9 +173,11 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   changing the file format.
 - [src/core/identity.rs](src/core/identity.rs) — `Identity`, an opaque
   wrapper around a string. Starts as the peer's source IP (port dropped so
-  it's stable across reconnects); `proxy::handle_client_frame` replaces it
-  mid-connection with the DN from a simple LDAP bind, once one is seen
-  (`Connector::bind_identity`).
+  it's stable across reconnects); `proxy.rs` replaces it mid-connection with
+  the DN from a simple LDAP bind, but only once that bind's correlated
+  `BindResponse` reports success (`Connector::bind_request`/`bind_response`,
+  resolved via the connection-scoped `BindState` in `src/proxy.rs`) — a
+  claimed DN alone never moves it.
 - [src/core/audit.rs](src/core/audit.rs) — structured `tracing` logging of every policy
   decision (allow or block), independent of the policy logic itself.
 - [src/core/metrics.rs](src/core/metrics.rs) — Prometheus metrics, recorded
@@ -227,11 +238,14 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   framing, since the proxy needs raw frame boundaries to forward bytes
   unmodified when a message isn't inspected.
 - `Identity` starts peer-address-based and is upgraded to a bind DN once a
-  simple LDAP bind is seen on the connection (see `bind_identity`), but
-  that DN is never verified against the actual `BindResponse` — the proxy
-  doesn't correlate responses per connection. Don't assume it maps to a
-  stable, verified principal; a failed bind still moves `Identity` before
-  upstream has a chance to reject it.
+  simple LDAP bind is seen *and confirmed* — `handle_client_frame` stages
+  the claimed DN in `BindState.pending` keyed by message ID
+  (`bind_request`), and `relay_upstream_responses` promotes it to
+  `BindState.identity` only when the correlated `BindResponse` reports
+  success (`bind_response`); a failed or never-answered bind leaves identity
+  untouched. Don't reintroduce the earlier "trust the request" shortcut —
+  see the `unverified_bind_does_not_change_identity_or_reset_budget` test in
+  `src/proxy.rs` for the exact bypass this closes.
 
 ## Using ai-protect as a library
 
@@ -311,8 +325,8 @@ database on every push/PR.
 [fuzz/](fuzz/) is a `cargo-fuzz` project (needs a nightly toolchain) with two
 targets covering the only code that touches fully untrusted bytes off the
 wire: `read_frame`'s BER tag/length framing (`fuzz/fuzz_targets/read_frame.rs`)
-and `LdapConnector`'s `decode`/`upgrade_request`/`bind_identity`/
-`build_rejection` (`fuzz/fuzz_targets/decode.rs`), which each run
+and `LdapConnector`'s `decode`/`upgrade_request`/`bind_request`/
+`bind_response`/`build_rejection` (`fuzz/fuzz_targets/decode.rs`), which each run
 `rasn::ber::decode` on a frame `read_frame` already delimited. Run with
 `cargo +nightly fuzz run decode` / `cargo +nightly fuzz run read_frame`; not
 part of `cargo test` or CI (fuzzing runs indefinitely by design), so run it
