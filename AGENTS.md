@@ -188,6 +188,17 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   recorder `run_with_config` installs, serving Prometheus text format over
   plain HTTP on `[metrics].listen_addr` when that table is present in
   `config.toml`.
+- [src/core/health.rs](src/core/health.rs) — a small hand-rolled HTTP
+  server (no framework dependency) serving `/healthz` (liveness, always
+  `200`) and `/readyz` (readiness, `200` until graceful shutdown is
+  requested, then `503`) for orchestrator probes. `bind` is split from
+  `serve` so a bad `[health].listen_addr` fails at startup rather than
+  silently; `serve` never stops accepting on its own — `/healthz` must stay
+  reachable through the whole `shutdown_timeout` drain window, or a
+  liveness probe going quiet mid-drain would get the process killed
+  outright, defeating the point of draining. `run_with_config` spawns it
+  when the config's top-level `[health]` table is present and lets process
+  exit take it down, same as the installed Prometheus exporter above.
 
 ## Architecture notes worth knowing before changing things
 
@@ -239,7 +250,9 @@ in `src/lib.rs` cover different amounts of "load this from a file":
   see [ARCHITECTURE.md "Config hot-reload"](ARCHITECTURE.md#config-hot-reload).
   Also installs the Prometheus exporter (`core::metrics::install_prometheus_exporter`)
   when the config's top-level `[metrics]` table is present — one endpoint for
-  the whole process, covering every `[[proxy]]` entry.
+  the whole process, covering every `[[proxy]]` entry — and the
+  `/healthz`/`/readyz` endpoint (`core::health`) when `[health]` is present,
+  same one-per-process scope.
 - `builder::ProxyBuilder` — fully programmatic: give it an `Arc<dyn
   Connector>` and a `Vec<Arc<dyn Policy>>` you built yourself (e.g.
   `LdapConnector::new(...)` and `ThresholdPolicy::new(...)`), no file I/O

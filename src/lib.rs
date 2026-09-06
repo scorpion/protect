@@ -219,6 +219,18 @@ pub async fn run_with_config(config: &config::Config) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Bound (so a bad address fails startup immediately) but deliberately
+    // not tracked in `tasks` below — `core::health::serve` never returns on
+    // its own (see its doc comment on why /healthz must outlive every other
+    // task's shutdown), so awaiting it in the "wait for everything to
+    // finish" loop would hang the process forever instead of exiting once
+    // every `[[proxy]]` entry has drained.
+    if let Some(health) = &config.health {
+        let listener = core::health::bind(health.listen_addr).await?;
+        tokio::spawn(core::health::serve(listener, shutdown_rx.clone()));
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
     let mut builders = Vec::with_capacity(config.proxy.len());
     let mut reload_targets = Vec::with_capacity(config.proxy.len());
     for proxy in &config.proxy {
@@ -227,7 +239,6 @@ pub async fn run_with_config(config: &config::Config) -> Result<()> {
         reload_targets.push((proxy.policy.file.clone(), policies_tx));
     }
 
-    let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(async move {
         wait_for_shutdown_signal().await;
         tracing::info!("shutdown signal received; draining connections on every listener");

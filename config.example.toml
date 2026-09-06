@@ -96,3 +96,13 @@ file = "policies/ldap.toml"
 # nothing here authenticates scrape requests.
 # [metrics]
 # listen_addr = "127.0.0.1:9090"
+
+# Uncomment to serve /healthz (liveness) and /readyz (readiness) for
+# orchestrator probes (k8s livenessProbe/readinessProbe, or equivalent) —
+# one endpoint for the whole process, like [metrics]. /healthz always
+# answers 200; /readyz answers 200 until graceful shutdown is requested,
+# then 503, so a load balancer stops routing new connections here before
+# the drain itself finishes. Bind it to localhost or a private network:
+# nothing here authenticates probe requests.
+# [health]
+# listen_addr = "127.0.0.1:9091"

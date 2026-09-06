@@ -6,6 +6,7 @@
 pub mod action;
 pub mod audit;
 pub mod connector;
+pub mod health;
 pub mod identity;
 pub mod metrics;
 pub mod net;

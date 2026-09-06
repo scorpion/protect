@@ -274,8 +274,22 @@ priority; within a group, roughly in the order you'd want to tackle them.
       deployment needs an external rotator, and a non-writable/relative
       cwd (e.g. some container setups) needs attention. See "Audit
       logging" in [ARCHITECTURE.md](ARCHITECTURE.md#audit-logging).
-- [ ] **No health/readiness endpoint** for orchestrator liveness/readiness
-      probes (k8s, etc.).
+- [x] **No health/readiness endpoint** for orchestrator liveness/readiness
+      probes (k8s, etc.). Fixed: [`core::health`](src/core/health.rs) is a
+      small hand-rolled HTTP server (no framework dependency needed for two
+      fixed-response routes) serving `/healthz` and `/readyz`, wired up by
+      `run_with_config` when the new top-level `[health]` table
+      (`listen_addr`) is present in `config.toml` — one endpoint for the
+      whole process, the same opt-in pattern as `[metrics]`. `/healthz`
+      always answers `200`; `/readyz` answers `200` until graceful shutdown
+      is requested, then `503`, so a load balancer stops routing new
+      connections here before the drain itself finishes. `/healthz`
+      deliberately keeps answering `200` throughout that drain window
+      (`serve` never stops accepting on its own — process exit takes it
+      down, same as the installed Prometheus exporter) since a liveness
+      probe going quiet mid-drain would get the process killed outright,
+      defeating the point of draining. See "Health" in
+      [ARCHITECTURE.md](ARCHITECTURE.md#health).
 - [ ] **No deployment packaging** — no Dockerfile, systemd unit, or Helm
       chart yet; needed for a repeatable rollout.
 - [ ] **No CI pipeline** — no GitHub Actions (or equivalent) running

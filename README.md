@@ -16,8 +16,8 @@ can independently run plaintext LDAP or LDAPS.
 > **Status:** early. TOML-based config and policy files, TLS on both hops
 > (including optional mutual TLS and RFC 4511 StartTLS), bounded concurrent
 > connections with per-I/O timeouts, graceful shutdown on SIGTERM/SIGINT,
-> policy-file hot-reload on SIGHUP, Prometheus metrics, a unit + end-to-end
-> test suite, and CI all exist. See
+> policy-file hot-reload on SIGHUP, Prometheus metrics, a liveness/readiness
+> endpoint, a unit + end-to-end test suite, and CI all exist. See
 > [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and
 > [TODO.md](TODO.md) for the gap list to a production-ready deployment.
 
@@ -100,6 +100,15 @@ out in the example) to serve Prometheus metrics — connection counts,
 policy allow/block rates, upstream connect latency, and TLS handshake
 failures — over plain HTTP at `/metrics` on `listen_addr`. One endpoint
 covers every `[[proxy]]` entry; absent by default.
+
+Optionally, add a top-level `[health]` table (also commented out in the
+example) to serve `/healthz` (liveness) and `/readyz` (readiness) on
+`listen_addr`, for orchestrator probes (k8s `livenessProbe`/`readinessProbe`,
+or equivalent). `/readyz` flips to `503` as soon as graceful shutdown is
+requested, ahead of the drain itself finishing; `/healthz` stays `200`
+throughout the drain so a liveness probe doesn't get the process killed
+mid-shutdown. One endpoint covers every `[[proxy]]` entry; absent by
+default.
 
 ## Running
 

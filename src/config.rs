@@ -42,6 +42,14 @@ pub struct Config {
     /// pay for a listening socket it never uses.
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    /// Present to serve `/healthz` (liveness) and `/readyz` (readiness) for
+    /// orchestrator probes (k8s, etc.) — one endpoint for the whole process,
+    /// like `metrics`, since readiness is process-wide (graceful shutdown
+    /// stops every `[[proxy]]` entry together). Absent by default: a
+    /// deployment with no orchestrator probing it shouldn't pay for a
+    /// listening socket it never uses.
+    #[serde(default)]
+    pub health: Option<HealthConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +58,15 @@ pub struct MetricsConfig {
     /// Typically bound to localhost or a private network, not the same
     /// address directory traffic arrives on — nothing here authenticates
     /// scrape requests.
+    pub listen_addr: SocketAddr,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HealthConfig {
+    /// Address the `/healthz`/`/readyz` endpoint listens on. Typically
+    /// bound to localhost or a private network, not the same address
+    /// directory traffic arrives on — nothing here authenticates probe
+    /// requests.
     pub listen_addr: SocketAddr,
 }
 
@@ -426,6 +443,46 @@ mod tests {
         assert_eq!(
             config.metrics.unwrap().listen_addr.to_string(),
             "127.0.0.1:9090"
+        );
+    }
+
+    #[test]
+    fn health_endpoint_is_absent_by_default() {
+        let config: Config = toml::from_str(
+            r#"
+            [[proxy]]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addr = "127.0.0.1:389"
+
+            [proxy.policy]
+            file = "policies/ldap.toml"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.health.is_none());
+    }
+
+    #[test]
+    fn parses_health_endpoint() {
+        let config: Config = toml::from_str(
+            r#"
+            [[proxy]]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addr = "127.0.0.1:389"
+
+            [proxy.policy]
+            file = "policies/ldap.toml"
+
+            [health]
+            listen_addr = "127.0.0.1:9091"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.health.unwrap().listen_addr.to_string(),
+            "127.0.0.1:9091"
         );
     }
 

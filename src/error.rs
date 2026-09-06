@@ -20,6 +20,8 @@ pub enum Error {
     Proxy(#[from] crate::proxy::ProxyError),
     #[error(transparent)]
     Metrics(#[from] metrics_exporter_prometheus::BuildError),
+    #[error(transparent)]
+    Health(#[from] crate::core::health::HealthError),
     #[error("proxy builder requires a connector before serving")]
     MissingConnector,
 }

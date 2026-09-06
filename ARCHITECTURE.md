@@ -545,6 +545,37 @@ Four things are tracked:
   three points a handshake can happen on either hop (see
   [Transport](#transport-plaintext-or-tls)).
 
+## Health
+
+[`core::health`](src/core/health.rs) is a small hand-rolled HTTP server
+(no framework dependency — the only surface is two fixed-response routes
+read off the request line) serving `/healthz` (liveness) and `/readyz`
+(readiness) for orchestrator probes (k8s `livenessProbe`/`readinessProbe`,
+or equivalent). Wired up by `ai_protect::run_with_config` when the config's
+top-level `[health]` table is present (see
+[Configuration](#configuration)), the same opt-in pattern as `[metrics]`:
+one endpoint for the whole process, not per `[[proxy]]` entry, since
+readiness is process-wide — graceful shutdown (see
+[Graceful shutdown](#graceful-shutdown)) stops every entry together off the
+same `watch::channel(bool)`.
+
+`/healthz` always answers `200` for as long as the process is up. `/readyz`
+answers `200` until graceful shutdown is requested, then flips to `503`
+immediately — before the drain itself finishes — so a load balancer or
+service mesh stops routing new connections here without waiting out
+`shutdown_timeout`. Critically, `/healthz` must *not* also go quiet during
+that drain window: a `SIGTERM`/`SIGINT` can leave in-flight connections
+draining for up to `shutdown_timeout` (30s by default), and if the liveness
+probe stopped answering for that whole window, the orchestrator would
+conclude the process is wedged and kill it outright — the exact outcome
+graceful shutdown exists to avoid. So `core::health::serve` never stops
+accepting connections on its own; `run_with_config` spawns it and lets
+process exit take it down, the same way the installed Prometheus exporter
+above is never explicitly stopped either. (`core::health::bind` is a
+separate step from `serve` specifically so a bad `[health].listen_addr` —
+already in use, unparseable — surfaces as an immediate startup error rather
+than only once the first probe hits a dead port.)
+
 ## Configuration
 
 Two kinds of TOML file, deliberately kept separate, plus one optional
@@ -580,6 +611,10 @@ top-level table:
   Prometheus `/metrics` endpoint listens on. Absent by default; a
   deployment that doesn't scrape Prometheus doesn't get a listening socket
   it never uses.
+- Optional top-level `[health]` table in `config.toml` (not per `[[proxy]]`
+  entry — see [Health](#health)): just `listen_addr`, the address
+  `/healthz`/`/readyz` listen on. Absent by default; a deployment with no
+  orchestrator probing it doesn't get a listening socket it never uses.
 
 This split exists because policy files are one-per-connector/backend and may
 encode deployment-specific thresholds or naming that shouldn't live in the
