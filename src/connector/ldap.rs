@@ -60,6 +60,8 @@ impl LdapConnector {
             return Ok(None);
         };
 
+        // Add/Replace can set a lock value; Delete of these attributes just
+        // clears them back to the schema default, which isn't a lock action.
         let touches_lock_attribute = modify.changes.iter().any(|change| {
             matches!(
                 change.operation,
@@ -99,6 +101,10 @@ impl LdapConnector {
     }
 }
 
+// These just forward to the inherent methods above, boxing the upstream
+// stream where needed. The inherent methods stay concretely typed (no `dyn`)
+// so tests and other LDAP-specific code can call them without going through
+// the trait object.
 #[async_trait]
 impl Connector for LdapConnector {
     async fn connect_upstream(&self) -> Result<Box<dyn DuplexStream>> {
@@ -140,12 +146,18 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(stream: &mut R) -> Result
     let mut frame = vec![tag[0], first_length_byte[0]];
 
     let content_len = if first_length_byte[0] & 0x80 == 0 {
+        // High bit clear: short form. The byte itself is the length (0-127).
         first_length_byte[0] as usize
     } else {
+        // High bit set: long form. The low 7 bits say how many following
+        // bytes hold the big-endian length. Definite-length BER (RFC 4511
+        // 5.1) never needs more than 4, since LDAP frames fit in a u32.
         let num_bytes = (first_length_byte[0] & 0x7f) as usize;
         if num_bytes == 0 || num_bytes > 4 {
             bail!("unsupported LDAP message length encoding ({num_bytes} length bytes)");
         }
+        // Right-align the bytes we read into a 4-byte buffer so short
+        // encodings (e.g. num_bytes == 2) still parse as the correct u32.
         let mut len_bytes = [0u8; 4];
         stream.read_exact(&mut len_bytes[4 - num_bytes..]).await?;
         frame.extend_from_slice(&len_bytes[4 - num_bytes..]);
