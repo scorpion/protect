@@ -131,11 +131,30 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## High — reliability & scale
 
-- [ ] **Policy state is process-local and in-memory.** [`ThresholdPolicy`](src/core/policy/threshold.rs)
+- [x] **Policy state is process-local and in-memory.** [`ThresholdPolicy`](src/core/policy/threshold.rs)
       keeps history in a `Mutex<HashMap<...>>` — a restart resets all
       counters, and running more than one instance for HA silently
       double-budgets every identity. Needs a shared backing store (e.g.
-      Redis) before this can run as more than a single process.
+      Redis) before this can run as more than a single process. Fixed: the
+      in-memory map stays the hot path unconditionally (`evaluate` never
+      does I/O), and an optional `state_db` (SQLite, via the new
+      [`HistoryStore`](src/core/policy/store.rs)) layers durability and
+      approximate cross-instance sharing on top of it — chosen over Redis
+      so this doesn't add an external service dependency for a
+      single-binary proxy. `ThresholdPolicy::new` loads existing history
+      from `state_db` once at startup (restart durability), and a
+      background task per policy wakes every `flush_interval` (default 2s)
+      to write newly-admitted actions and reload the whole table, always
+      via `spawn_blocking` so a slow disk never stalls a live connection's
+      tokio worker. Two instances pointed at the same file converge on a
+      shared budget within one `flush_interval` of each other — see
+      "SQLite-backed policy state" in [ARCHITECTURE.md](ARCHITECTURE.md#sqlite-backed-policy-state).
+      Opt-in (`state_db` unset keeps today's pure in-memory behavior) and
+      best-effort (a failure to open it logs a warning and falls back to
+      in-memory rather than stopping the proxy from starting). Known
+      limitation: this needs a shared filesystem (e.g. a shared volume),
+      not a network service — a genuinely distributed deployment across
+      hosts with no shared disk still needs something like Redis.
 - [ ] **Single connector/listener only.** `ai_protect::run` wires up exactly
       one `LdapConnector` behind one listener; there's no way to front more
       than one directory or protocol from a single deployment (see

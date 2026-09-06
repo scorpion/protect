@@ -15,3 +15,15 @@ max_per_request = 10
 # Total blast radius allowed per identity within window_secs.
 max_per_window = 50
 window_secs = 60
+
+# Uncomment to persist this policy's history to SQLite: it survives a
+# restart (loaded back in at startup) and, if multiple ai-protect instances
+# point at the same file, is approximately shared between them (each sees
+# the others' admitted actions within one flush_interval_secs). Off the
+# request hot path either way — evaluate() only ever touches the in-memory
+# history; this is a background sync. See ARCHITECTURE.md#sqlite-backed-policy-state.
+# Never point two [[policy]] entries at the same state_db file — nothing
+# keys a row to which policy wrote it, so their windows would prune and
+# observe each other's rows.
+# state_db = "db.sqlite"
+# flush_interval_secs = 2

@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 async-trait = "0.1.92"
 rasn = "0.28.14"
 rasn-ldap = "0.28.14"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 # `tls12` kept deliberately: Active Directory (a target directory) only
 # gained TLS 1.3 for LDAPS in Windows Server 2022, so many real deployments
 # are TLS-1.2-only. See ARCHITECTURE.md "TLS version floor" before removing.

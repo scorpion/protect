@@ -159,6 +159,8 @@ mod tests {
             max_per_request: 10,
             max_per_window: 10,
             window: Duration::from_secs(60),
+            state_db: None,
+            flush_interval: Duration::from_secs(2),
         }));
 
         tokio::spawn(

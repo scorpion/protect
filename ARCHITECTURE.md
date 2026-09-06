@@ -255,11 +255,47 @@ encodes "4 accounts is fine, 4,000 is not" with two independent checks:
    advanced when the action is ultimately allowed (blocked actions don't
    pollute history).
 
-State is process-local (`Mutex<HashMap<Identity, VecDeque<Instant>>>`) — it
-does not survive a restart and is not shared across multiple `ai-protect`
-instances. That's acceptable for a single-instance deployment in front of
-one directory; a multi-instance deployment would need shared state (e.g.
-Redis) for the window to be enforced correctly across instances.
+State lives in an in-memory `Mutex<HashMap<Identity, VecDeque<Instant>>>`,
+always — `evaluate` never does I/O, so admitting or blocking a request
+never waits on anything slower than a mutex, regardless of how many
+requests per second the process is handling. By default that map is also
+the *only* copy: a restart resets it, and it isn't shared across multiple
+`ai-protect` instances.
+
+### SQLite-backed policy state
+
+Setting `state_db` on a `[[policy]]` threshold entry (see
+`policies/ldap.example.toml`) layers durability and approximate
+cross-instance sharing on top, without touching the hot path:
+
+- **Startup**: [`ThresholdPolicy::new`](src/core/policy/threshold.rs) opens
+  `state_db` (via [`HistoryStore`](src/core/policy/store.rs)), prunes rows
+  older than `window`, and loads what's left into the in-memory map — so a
+  restart resumes mid-window instead of resetting everyone's budget to
+  zero.
+- **Steady state**: a background task, one per `ThresholdPolicy`, wakes
+  every `flush_interval` (default 2s) and, entirely off the tokio runtime
+  (`spawn_blocking`): writes whatever this instance admitted since the
+  last tick, deletes rows the window has aged out (safe regardless of
+  which instance wrote them), and reads back every remaining row,
+  replacing (not merging into) this instance's in-memory entry for each
+  identity found. Replacing rather than merging is what keeps a healthy
+  instance's own repeatedly-round-tripped events from double-counting
+  themselves cycle over cycle.
+- **Multi-instance**: two `ai-protect` processes pointed at the same
+  `state_db` file each see the other's admitted actions within one
+  `flush_interval` of each other — a real, if eventually-consistent,
+  shared budget, replacing what an in-memory-only deployment would need
+  Redis for. This only works when both processes can reach the same file
+  (shared disk/volume, not a network service), and two *different*
+  threshold policies must never point at the same file — nothing keys a
+  row to which policy wrote it, so their windows would prune and observe
+  each other's rows.
+- **Failure mode**: if `state_db` can't be opened (bad path, permissions,
+  disk full), `ThresholdPolicy::new` logs a warning and falls back to pure
+  in-memory behavior rather than stopping the proxy from starting — this
+  feature is a best-effort enhancement to availability-critical code, not
+  a hard dependency.
 
 ## Identity
 
@@ -373,8 +409,9 @@ an existing type is a config-only change (another `[[policy]]` table).
 
 ## Known gaps (by design, at this stage)
 
-- No persistent/shared state — a restart or a second instance resets
-  threshold history.
+- Persistent/shared threshold history is opt-in and best-effort, not the
+  default — set `state_db` per policy (see "SQLite-backed policy state"
+  above) or a restart or a second instance still resets/double-budgets it.
 - `Identity` is derived from an unverified bind DN (falling back to source
   address) — see the caveats in [Identity](#identity) — not from an
   authenticated principal such as a validated mTLS client certificate.

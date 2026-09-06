@@ -37,7 +37,14 @@ enum PolicyEntry {
 impl PolicyEntry {
     fn build(self) -> Arc<dyn Policy> {
         match self {
-            PolicyEntry::Threshold(config) => Arc::new(ThresholdPolicy::new(config)),
+            PolicyEntry::Threshold(config) => {
+                let policy = Arc::new(ThresholdPolicy::new(config));
+                // A no-op unless this entry set `state_db`. Needs an active
+                // tokio runtime, which holds here: `load`/`parse` are only
+                // ever reached from `run`/`run_with_config`, both async.
+                policy.clone().spawn_background_sync();
+                policy
+            }
         }
     }
 }

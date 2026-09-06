@@ -109,7 +109,20 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   only policy implemented so far. Blocks a single request whose
   `blast_radius` exceeds `max_per_request`, and separately tracks a sliding
   window of blast radius per `Identity` to block bursts that exceed
-  `max_per_window` within `window`.
+  `max_per_window` within `window`. Its history is an in-memory
+  `Mutex<HashMap<..>>` on the hot path, always — an optional `state_db`
+  (SQLite, via [src/core/policy/store.rs](src/core/policy/store.rs)) is
+  loaded once at startup and, if set, kept in sync by a background task
+  (`flush_interval`, default 2s) that writes newly-admitted actions and
+  reloads the whole table, off the hot path via `spawn_blocking`. This is
+  how history survives a restart and is approximately shared by multiple
+  `ai-protect` instances pointed at the same file — see "SQLite-backed
+  policy state" below.
+- [src/core/policy/store.rs](src/core/policy/store.rs) — `HistoryStore`,
+  the SQLite persistence `ThresholdPolicy` optionally layers on top of its
+  in-memory history, plus `Anchor`, which round-trips `Instant` (monotonic,
+  meaningless across a restart) through epoch milliseconds (portable) and
+  back.
 - [src/core/policy/config.rs](src/core/policy/config.rs) — TOML schema for policy files
   (`policies/ldap.toml`, one file per connector/backend). An ordered
   `[[policy]]` array, each table tagged by `type` (only `"threshold"` today),

@@ -1,6 +1,7 @@
 # Application
 policies/*
 !policies/*.example.toml
+db.sqlite*
 
 # Rust
 /target

@@ -78,7 +78,10 @@ cp policies/ldap.example.toml policies/ldap.toml
 - `policies/ldap.toml` (schema in
   [policies/ldap.example.toml](policies/ldap.example.toml)) — an ordered
   list of `[[policy]]` tables. The only type today is `"threshold"`
-  (`max_per_request`, `max_per_window`, `window_secs`).
+  (`max_per_request`, `max_per_window`, `window_secs`), plus an optional
+  `state_db` (SQLite file) and `flush_interval_secs` if you want its
+  history to survive a restart or be approximately shared across multiple
+  `ai-protect` instances — see [ARCHITECTURE.md](ARCHITECTURE.md#sqlite-backed-policy-state).
 
 Both files are gitignored (see [.gitignore](.gitignore)); `ai-protect`
 fails fast with a message pointing at the matching example file if either
