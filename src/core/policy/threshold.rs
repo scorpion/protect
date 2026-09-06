@@ -174,16 +174,25 @@ impl ThresholdPolicy {
     /// `state_db` is configured. Requires an active tokio runtime (called
     /// from `core::policy::config::load`, itself only ever reached from
     /// `run`/`run_with_config`, both async).
+    ///
+    /// Holds only a `Weak` reference, so a policy superseded by a config
+    /// reload (`ai_protect::run_with_config`'s `SIGHUP` handling) doesn't
+    /// pin its own background task alive forever once every connection that
+    /// was using it has closed — the task exits the tick after `upgrade`
+    /// first fails instead of syncing on behalf of nothing.
     pub fn spawn_background_sync(self: Arc<Self>) {
         if self.state.is_none() {
             return;
         }
         let flush_interval = self.config.flush_interval;
+        let weak = Arc::downgrade(&self);
+        drop(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(flush_interval);
             loop {
                 interval.tick().await;
-                self.sync_once().await;
+                let Some(policy) = weak.upgrade() else { break };
+                policy.sync_once().await;
             }
         });
     }

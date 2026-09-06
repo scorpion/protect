@@ -274,6 +274,53 @@ without it, `serve` runs forever like before, since the builder's default
 receiver is paired with a `Sender` the builder itself holds onto and never
 sends on.
 
+## Config hot-reload
+
+`ai_protect::run_with_config` installs a second signal handler alongside the
+`SIGTERM`/`SIGINT` one above: `SIGHUP` (Unix only — `tokio::signal` has no
+equivalent on Windows, so this is simply unavailable there) re-reads every
+`[[proxy]]` entry's policy file and swaps it in without dropping any
+connection or restarting the process:
+
+1. `build_proxy` wires each entry's `proxy::serve` up to a
+   `tokio::sync::watch::channel(Vec<Arc<dyn Policy>>)` instead of a fixed
+   `Vec`, via `ProxyBuilder::policies_reloadable`; `run_with_config` keeps
+   the `Sender` half paired with that entry's policy file path.
+2. `proxy::serve`'s accept loop reads the receiver fresh
+   (`watch::Receiver::borrow().clone()`) for every connection it accepts, the
+   same place it already clones `listen_tls`/`connector` once per connection
+   — so a reload is visible to new connections without a restart, and (like
+   those other per-connection settings) a connection already in flight keeps
+   running under whichever policy list was in effect when it was accepted,
+   rather than switching mid-session.
+3. `reload_policies_on_signal` (spawned by `run_with_config` alongside the
+   shutdown-signal task) waits on `SIGHUP`, then calls
+   `core::policy::config::load` again for every entry and pushes the result
+   through that entry's `Sender`. A read/parse failure for one entry is
+   logged and leaves that entry's policies unchanged — it neither stops the
+   process nor blocks reloading the others. The task exits once `shutdown`
+   is requested, so it doesn't keep `run_with_config`'s `JoinSet` waiting
+   forever after every listener has finished draining.
+4. `ThresholdPolicy::spawn_background_sync` (used when a `[[policy]]` entry
+   sets `state_db`) holds only a `Weak` reference to the policy in its
+   background sync task, not an `Arc` — otherwise every reload would leak
+   one sync task per superseded `ThresholdPolicy` instance, looping forever
+   after nothing else referenced it. The task's next tick fails to `upgrade`
+   the `Weak` once the last connection using that instance has closed, and
+   exits then instead.
+
+This deliberately covers only what a `[[policy]]` file describes —
+thresholds and which policies run, in what order. `listen_addr`,
+`upstream_addr`, TLS settings, and connection limits are still read once at
+process start and require a restart to change: reloading those in place
+would mean rebinding a live listener socket or migrating already-open
+connections onto new upstream/TLS settings mid-session, not just swapping
+out an in-memory value the way a policy list can be. `ProxyBuilder` exposes
+the same mechanism to embedders directly: `ProxyBuilder::policies_reloadable`
+takes a `watch::Receiver<Vec<Arc<dyn Policy>>>` the caller drives themselves
+(no OS signal handling of its own, matching `ProxyBuilder::shutdown`);
+without it, `policy`/`policies` build a fixed list exactly as before.
+
 ## Policy: blast-radius thresholding
 
 The only policy implemented, [`ThresholdPolicy`](src/core/policy/threshold.rs),

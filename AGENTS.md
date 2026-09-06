@@ -28,7 +28,10 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   (`run`, `run_with_config`, `builder::ProxyBuilder`) covering different
   amounts of "load this from a file" — see its module doc comment and
   [Using ai-protect as a library](#using-ai-protect-as-a-library) below.
-  Start here to see how pieces fit together.
+  Start here to see how pieces fit together. `run_with_config` also installs
+  the `SIGHUP` handler (`reload_policies_on_signal`) that re-reads every
+  `[[proxy]]` entry's policy file in place — see
+  [ARCHITECTURE.md "Config hot-reload"](ARCHITECTURE.md#config-hot-reload).
 - [src/builder.rs](src/builder.rs) — `ProxyBuilder`, the fully-programmatic
   entry point for embedding ai-protect: set a connector and policies you
   already have in memory, no config file required.
@@ -65,6 +68,10 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   wait on them) up to `ConnectionLimits::shutdown_timeout` to finish before
   aborting whatever's left — see
   [ARCHITECTURE.md "Graceful shutdown"](ARCHITECTURE.md#graceful-shutdown).
+  `serve` also takes policies as a `watch::Receiver<Vec<Arc<dyn Policy>>>`
+  rather than a fixed `Vec`, re-reading it (`borrow().clone()`) for every
+  newly-accepted connection so a reload is visible without a restart — see
+  [ARCHITECTURE.md "Config hot-reload"](ARCHITECTURE.md#config-hot-reload).
 - [src/core/net.rs](src/core/net.rs) — `MaybeTlsStream`, a thin enum
   (`Plain(TcpStream)` / `Tls(T)`) implementing `AsyncRead`/`AsyncWrite` by
   delegating to whichever variant is active, so `read_frame`, the relay
@@ -126,7 +133,11 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   store, off the hot path. This is how history survives a restart and is
   approximately shared by multiple `ai-protect` instances pointed at the
   same backend — see "SQLite-backed policy state" and "Valkey-backed
-  policy state" below.
+  policy state" below. `spawn_background_sync` holds only a `Weak<Self>` in
+  that task, not an `Arc`, so a `ThresholdPolicy` superseded by a config
+  reload (see "Config hot-reload" below) stops syncing on its own, one tick
+  after the last connection using it closes, rather than syncing forever on
+  behalf of an instance nothing references anymore.
 - [src/core/policy/store/](src/core/policy/store/) — the `HistoryStore`
   trait `ThresholdPolicy` persists/shares its in-memory history through,
   plus `Anchor` (in `mod.rs`), which round-trips `Instant` (monotonic,
@@ -193,16 +204,20 @@ in `src/lib.rs` cover different amounts of "load this from a file":
 - `run(config_path)` — fully file-driven, what the binary calls.
 - `run_with_config(&Config)` — skip the config file (`Config`'s fields are
   all `pub`) but still load each `[[proxy]]` entry's policies from the file
-  its `proxy.policy.file` points at. Runs every entry concurrently, and
-  installs a `SIGTERM`/`SIGINT` handler that tells all of them to drain
-  in-flight connections and stop gracefully — see
-  [ARCHITECTURE.md "Graceful shutdown"](ARCHITECTURE.md#graceful-shutdown).
+  its `proxy.policy.file` points at. Runs every entry concurrently, installs
+  a `SIGTERM`/`SIGINT` handler that tells all of them to drain in-flight
+  connections and stop gracefully (see
+  [ARCHITECTURE.md "Graceful shutdown"](ARCHITECTURE.md#graceful-shutdown)),
+  and a `SIGHUP` handler that re-reads every entry's policy file in place —
+  see [ARCHITECTURE.md "Config hot-reload"](ARCHITECTURE.md#config-hot-reload).
 - `builder::ProxyBuilder` — fully programmatic: give it an `Arc<dyn
   Connector>` and a `Vec<Arc<dyn Policy>>` you built yourself (e.g.
   `LdapConnector::new(...)` and `ThresholdPolicy::new(...)`), no file I/O
   anywhere. Graceful shutdown is opt-in here via `ProxyBuilder::shutdown`
   (a `watch::Receiver<bool>` you drive yourself) rather than wired to OS
-  signals automatically.
+  signals automatically, and so is policy hot-reload, via
+  `ProxyBuilder::policies_reloadable` (a `watch::Receiver<Vec<Arc<dyn
+  Policy>>>` you push new values into yourself).
 
 All three return `ai_protect::Error` (`src/error.rs`), a `thiserror` enum
 aggregating the module-local error types (`ConfigError`, `PolicyConfigError`,

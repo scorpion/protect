@@ -179,10 +179,33 @@ priority; within a group, roughly in the order you'd want to tackle them.
       protocol this proxy already speaks, not yet a mix of protocols in one
       process — see the note in
       [ARCHITECTURE.md "Known gaps"](ARCHITECTURE.md#known-gaps-by-design-at-this-stage).
-- [ ] **No config hot-reload.** Changing thresholds, addresses, or TLS
+- [x] **No config hot-reload.** Changing thresholds, addresses, or TLS
       settings requires a process restart. Graceful shutdown (below) means
       that restart no longer hard-drops in-flight connections, but it's
-      still a full process stop/start rather than reloading in place.
+      still a full process stop/start rather than reloading in place. Fixed
+      for policy files (thresholds and which policies run, in what order) —
+      the highest-churn piece, per this file's own note in `[proxy.policy]`
+      about a different change cadence than network config:
+      `ai_protect::run_with_config` now installs a `SIGHUP` handler
+      (`reload_policies_on_signal`) that re-reads every `[[proxy]]` entry's
+      policy file and pushes it through a `watch::channel` `proxy::serve`
+      reads fresh for each newly-accepted connection
+      (`ProxyBuilder::policies_reloadable`). A connection already in flight
+      keeps running under whichever policy list was current when it was
+      accepted, the same as `listen_tls`/the connector are captured once per
+      connection rather than re-read per frame; a read/parse failure for one
+      entry is logged and leaves that entry unchanged rather than stopping
+      the process. `ThresholdPolicy`'s background `state_db` sync task was
+      changed to hold a `Weak` reference so a policy instance superseded by
+      a reload stops syncing (instead of leaking a sync task per reload)
+      once nothing references it anymore. See "Config hot-reload" in
+      [ARCHITECTURE.md](ARCHITECTURE.md#config-hot-reload). Known
+      limitation, by design: `listen_addr`/`upstream_addr`/TLS
+      settings/connection limits are still read once at process start and
+      need a restart — reloading those in place means rebinding a live
+      listener socket or migrating open connections onto new upstream/TLS
+      settings mid-session, not just swapping an in-memory value, and was
+      judged out of scope for this pass.
 - [x] **No graceful shutdown.** There's no `SIGTERM`/`SIGINT` handling in
       [`main.rs`](src/main.rs)/[`lib.rs`](src/lib.rs) (tokio's `signal` feature isn't even enabled
       in [`Cargo.toml`](Cargo.toml)) and no draining of in-flight connections

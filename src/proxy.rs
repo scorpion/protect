@@ -87,7 +87,7 @@ pub async fn run(
     listen_tls: Option<ListenTls>,
     listen_starttls: Option<ListenTls>,
     connector: Arc<dyn Connector>,
-    policies: Vec<Arc<dyn Policy>>,
+    policies: watch::Receiver<Vec<Arc<dyn Policy>>>,
     limits: ConnectionLimits,
     shutdown: watch::Receiver<bool>,
 ) -> std::result::Result<(), ProxyError> {
@@ -120,12 +120,19 @@ pub async fn run(
 /// closing the socket, an `io_timeout`, or the request/response it's
 /// mid-handling completing) before forcibly aborting whatever's left — a
 /// rolling restart or deploy drains sessions instead of hard-cutting them.
+///
+/// `policies` is read fresh (`watch::Receiver::borrow`) for every accepted
+/// connection, so a config reload (see `ai_protect::run_with_config`) is
+/// visible to new connections without a restart; a connection already in
+/// flight keeps running under whichever policy list was current when it was
+/// accepted; that snapshot is captured once, same as `listen_tls`/
+/// `connector` are cloned once per connection rather than re-read per frame.
 pub async fn serve(
     listener: TcpListener,
     listen_tls: Option<ListenTls>,
     listen_starttls: Option<ListenTls>,
     connector: Arc<dyn Connector>,
-    policies: Vec<Arc<dyn Policy>>,
+    policies: watch::Receiver<Vec<Arc<dyn Policy>>>,
     limits: ConnectionLimits,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::result::Result<(), ProxyError> {
@@ -153,7 +160,7 @@ pub async fn serve(
         let listen_tls = listen_tls.clone();
         let listen_starttls = listen_starttls.clone();
         let connector = connector.clone();
-        let policies = policies.clone();
+        let policies = policies.borrow().clone();
         let io_timeout = limits.io_timeout;
 
         connections.spawn(async move {
@@ -456,6 +463,16 @@ mod tests {
         rx
     }
 
+    /// Wraps a fixed policy list as the `watch::Receiver` `serve` now
+    /// expects, for tests that don't exercise hot-reload itself. Dropping
+    /// the paired `Sender` is fine here (unlike `no_shutdown`'s deliberate
+    /// leak): this receiver is only ever `borrow()`-ed, never awaited via
+    /// `changed`/`wait_for`, so a closed channel doesn't change what it
+    /// reports.
+    fn policies_rx(policies: Vec<Arc<dyn Policy>>) -> watch::Receiver<Vec<Arc<dyn Policy>>> {
+        watch::channel(policies).1
+    }
+
     #[tokio::test]
     async fn allowed_request_forwards_to_upstream_and_response_relays_back() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -493,7 +510,7 @@ mod tests {
             None,
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -525,7 +542,7 @@ mod tests {
             None,
             None,
             connector,
-            block_all_policies(),
+            policies_rx(block_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -576,7 +593,7 @@ mod tests {
             None,
             None,
             connector,
-            block_all_policies(),
+            policies_rx(block_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -622,7 +639,7 @@ mod tests {
             None,
             None,
             connector,
-            block_all_policies(),
+            policies_rx(block_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -718,7 +735,7 @@ mod tests {
             None,
             None,
             connector,
-            policies,
+            policies_rx(policies),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -813,7 +830,7 @@ mod tests {
             Some(listen_tls),
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -874,7 +891,7 @@ mod tests {
             None,
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -932,7 +949,7 @@ mod tests {
             Some(listen_tls),
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -1000,7 +1017,7 @@ mod tests {
             Some(listen_tls),
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -1093,7 +1110,7 @@ mod tests {
             None,
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -1150,7 +1167,7 @@ mod tests {
             None,
             Some(listen_starttls),
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -1233,7 +1250,7 @@ mod tests {
             None,
             Some(listen_starttls),
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -1313,7 +1330,7 @@ mod tests {
             None,
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             no_shutdown(),
         ));
@@ -1340,7 +1357,7 @@ mod tests {
             None,
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits {
                 max_connections: 10,
                 io_timeout: Duration::from_millis(100),
@@ -1382,7 +1399,7 @@ mod tests {
             None,
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits {
                 max_connections: 1,
                 io_timeout: Duration::from_secs(10),
@@ -1407,6 +1424,110 @@ mod tests {
             0,
             "expected the over-limit connection to be closed rather than served"
         );
+    }
+
+    #[tokio::test]
+    async fn policy_reload_applies_to_new_connections_only() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let modify_response = |message_id: u32| {
+            encode_message(
+                message_id,
+                ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                    ResultCode::Success,
+                    "".into(),
+                    "".into(),
+                ))),
+            )
+        };
+        // Only the pre-reload connection's requests ever reach upstream (both
+        // of them, over the one connection it keeps using) — a post-reload
+        // request is blocked locally by the stricter policy and must never
+        // reach upstream as an LDAP frame. But `connect_upstream` runs
+        // unconditionally as soon as a client connects (before any per-frame
+        // policy check), so the post-reload client's own TCP-level dial to
+        // upstream still needs somewhere to land — accept it too and just
+        // hold it open, unread.
+        tokio::spawn(async move {
+            let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
+            for _ in 0..2 {
+                let frame = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+                let message_id = decode_message(&frame).message_id;
+                upstream_stream
+                    .write_all(&modify_response(message_id))
+                    .await
+                    .unwrap();
+            }
+            let _second_upstream_stream = upstream_listener.accept().await.unwrap();
+            std::future::pending::<()>().await
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        let (policies_tx, policies_rx) = watch::channel(allow_all_policies());
+        tokio::spawn(serve(
+            proxy_listener,
+            None,
+            None,
+            connector,
+            policies_rx,
+            ConnectionLimits::default(),
+            no_shutdown(),
+        ));
+
+        let request_frame = |message_id: u32| {
+            modify_request_frame(
+                message_id,
+                "cn=alice,dc=example,dc=com",
+                "userAccountControl",
+                b"514",
+            )
+        };
+        let assert_reached_upstream = |reply: &[u8]| match decode_message(reply).protocol_op {
+            ProtocolOp::ModifyResponse(ModifyResponse(result)) => {
+                assert_eq!(result.result_code, ResultCode::Success);
+            }
+            other => panic!("expected ModifyResponse, got {other:?}"),
+        };
+        let assert_blocked_locally = |reply: &[u8]| match decode_message(reply).protocol_op {
+            ProtocolOp::ModifyResponse(ModifyResponse(result)) => {
+                assert_eq!(result.result_code, ResultCode::UnwillingToPerform);
+            }
+            other => panic!("expected ModifyResponse, got {other:?}"),
+        };
+
+        // A full request/response round trip proves `serve` already accepted
+        // this connection and captured the (allow-everything) policy list in
+        // effect at the time, before the reload below happens — otherwise a
+        // connection that's merely TCP-connected but not yet `accept()`-ed by
+        // the server could race the reload and pick up the new list anyway.
+        let mut pre_reload_client = TcpStream::connect(proxy_addr).await.unwrap();
+        pre_reload_client
+            .write_all(&request_frame(1))
+            .await
+            .unwrap();
+        assert_reached_upstream(&read_frame(&mut pre_reload_client).await.unwrap().unwrap());
+
+        policies_tx.send(block_all_policies()).unwrap();
+
+        // Same, already-open connection: must keep running under the policy
+        // snapshot it was accepted with, not the reloaded one.
+        pre_reload_client
+            .write_all(&request_frame(2))
+            .await
+            .unwrap();
+        assert_reached_upstream(&read_frame(&mut pre_reload_client).await.unwrap().unwrap());
+
+        // A newly-accepted connection must be evaluated under the reloaded,
+        // blocking policy list.
+        let mut post_reload_client = TcpStream::connect(proxy_addr).await.unwrap();
+        post_reload_client
+            .write_all(&request_frame(3))
+            .await
+            .unwrap();
+        assert_blocked_locally(&read_frame(&mut post_reload_client).await.unwrap().unwrap());
     }
 
     #[tokio::test]
@@ -1452,7 +1573,7 @@ mod tests {
             None,
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits::default(),
             shutdown_rx,
         ));
@@ -1517,7 +1638,7 @@ mod tests {
             None,
             None,
             connector,
-            allow_all_policies(),
+            policies_rx(allow_all_policies()),
             ConnectionLimits {
                 // Long enough that this test's own timeout below would fail
                 // first if shutdown were (wrongly) waiting on it instead of

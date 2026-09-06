@@ -36,6 +36,11 @@ use std::sync::Arc;
 
 pub use error::{Error, Result};
 
+/// The live-updatable half of a `[[proxy]]` entry's policy list — pushing a
+/// new `Vec` through it is how `reload_policies_on_signal` gets a freshly
+/// reloaded policy file to that entry's `proxy::serve` without a restart.
+type PoliciesSender = tokio::sync::watch::Sender<Vec<Arc<dyn core::policy::Policy>>>;
+
 /// Loads configuration from `config_path`, wires up the connector and
 /// policies each `[[proxy]]` entry describes, and runs every entry's accept
 /// loop concurrently (which only returns on the first entry to error, since
@@ -47,11 +52,14 @@ pub async fn run(config_path: impl AsRef<Path>) -> Result<()> {
 
 /// Builds one `ProxyBuilder` from a single `[[proxy]]` entry of an in-memory
 /// `Config` (policies are still loaded from the file `proxy.policy.file`
-/// points at), wired up to stop and drain on `shutdown`.
+/// points at), wired up to stop and drain on `shutdown`. Also returns the
+/// `Sender` half of the policy list `serve` reads from, so
+/// `run_with_config`'s `SIGHUP` handling can push a freshly-reloaded list to
+/// this entry without restarting it.
 fn build_proxy(
     proxy: &config::ProxyConfig,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Result<builder::ProxyBuilder> {
+) -> Result<(builder::ProxyBuilder, PoliciesSender)> {
     let upstream_tls = proxy
         .upstream_tls
         .as_ref()
@@ -93,6 +101,7 @@ fn build_proxy(
         .transpose()?;
 
     let policies = core::policy::config::load(&proxy.policy.file)?;
+    let (policies_tx, policies_rx) = tokio::sync::watch::channel(policies);
 
     let limits = proxy::ConnectionLimits {
         max_connections: proxy.max_connections,
@@ -102,7 +111,7 @@ fn build_proxy(
 
     let mut builder = builder::ProxyBuilder::new(proxy.listen_addr)
         .connector(connector)
-        .policies(policies)
+        .policies_reloadable(policies_rx)
         .limits(limits)
         .shutdown(shutdown);
     if let Some(listen_tls) = listen_tls {
@@ -111,7 +120,7 @@ fn build_proxy(
     if let Some(listen_starttls) = listen_starttls {
         builder = builder.listen_starttls(listen_starttls);
     }
-    Ok(builder)
+    Ok((builder, policies_tx))
 }
 
 /// Resolves on `SIGINT` (`Ctrl-C`) or, on Unix, `SIGTERM` — the signals a
@@ -135,21 +144,83 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+/// Reloads every `[[proxy]]` entry's policy file each time `SIGHUP` arrives
+/// (Unix only — `tokio::signal` has no equivalent on Windows, so this just
+/// waits out `shutdown` and never reloads there) and pushes the
+/// freshly-parsed list through that entry's `watch::Sender` (see
+/// `build_proxy`), which `proxy::serve` picks up for newly-accepted
+/// connections without a restart — see "Config hot-reload" in
+/// ARCHITECTURE.md. Listener/upstream/TLS/connection-limit settings are
+/// unaffected by this: those are only read once, at process start, since
+/// changing them in place would mean rebinding a live listener socket or
+/// mid-flight-migrating open connections, not just swapping out an
+/// in-memory value. A read/parse failure for one entry is logged and leaves
+/// that entry's policies unchanged; it neither stops the process nor blocks
+/// reloading the other entries. The signal handle is installed once, before
+/// the loop, rather than re-installed on every iteration, so there's no
+/// window where a `SIGHUP` landing between iterations could be missed.
+/// Exits once `shutdown` is requested, so it doesn't keep
+/// `run_with_config`'s `JoinSet` waiting forever after every other task has
+/// finished draining.
+async fn reload_policies_on_signal(
+    targets: Vec<(std::path::PathBuf, PoliciesSender)>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("installing a SIGHUP handler (via tokio::signal::unix::signal)");
+
+    loop {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = shutdown.wait_for(|&requested| requested) => return,
+                _ = sighup.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = shutdown.wait_for(|&requested| requested).await;
+            return;
+        }
+
+        tracing::info!("SIGHUP received; reloading policy files");
+        for (path, tx) in &targets {
+            match core::policy::config::load(path) {
+                Ok(policies) => {
+                    let _ = tx.send(policies);
+                    tracing::info!(path = %path.display(), "reloaded policy file");
+                }
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to reload policy file; keeping previous policies"
+                ),
+            }
+        }
+    }
+}
+
 /// Wires up every `[[proxy]]` entry described by an in-memory `Config` (each
 /// with its own connector, TLS settings, and policy file) and runs all of
 /// their accept loops concurrently as sibling tasks in a `JoinSet`, along
 /// with a task that waits for `SIGTERM`/`SIGINT` and tells every entry to
 /// drain and stop once one arrives (see `proxy::serve` for what draining
-/// does). Returns once every entry has stopped this way, or as soon as any
-/// one of them exits with an error — dropping the `JoinSet` on the way out
-/// aborts every still-running sibling, so one entry's fatal error brings
-/// down the whole process rather than leaving the others silently orphaned.
+/// does), and a task that reloads every entry's policy file on `SIGHUP`
+/// (see `reload_policies_on_signal`). Returns once every entry has stopped
+/// this way, or as soon as any one of them exits with an error — dropping
+/// the `JoinSet` on the way out aborts every still-running sibling, so one
+/// entry's fatal error brings down the whole process rather than leaving the
+/// others silently orphaned.
 pub async fn run_with_config(config: &config::Config) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let mut builders = Vec::with_capacity(config.proxy.len());
+    let mut reload_targets = Vec::with_capacity(config.proxy.len());
     for proxy in &config.proxy {
-        builders.push(build_proxy(proxy, shutdown_rx.clone())?);
+        let (builder, policies_tx) = build_proxy(proxy, shutdown_rx.clone())?;
+        builders.push(builder);
+        reload_targets.push((proxy.policy.file.clone(), policies_tx));
     }
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -159,6 +230,10 @@ pub async fn run_with_config(config: &config::Config) -> Result<()> {
         // Only fails if every receiver was already dropped, i.e. every
         // listener already stopped on its own — nothing left to signal.
         let _ = shutdown_tx.send(true);
+        Ok(())
+    });
+    tasks.spawn(async move {
+        reload_policies_on_signal(reload_targets, shutdown_rx).await;
         Ok(())
     });
     for builder in builders {
@@ -185,7 +260,9 @@ mod tests {
 
     use super::*;
     use crate::connector::ldap::read_frame;
-    use crate::connector::ldap::test_support::{encode_message, modify_request_frame};
+    use crate::connector::ldap::test_support::{
+        decode_message, encode_message, modify_request_frame,
+    };
 
     /// Reserves a free `127.0.0.1` port by binding and immediately dropping a
     /// listener on it, for embedding in a `Config` built ahead of time (this
@@ -273,6 +350,134 @@ mod tests {
             client.write_all(&request_frame(message_id)).await.unwrap();
             let received = read_frame(&mut client).await.unwrap().unwrap();
             assert_eq!(received, response_frame(message_id));
+        }
+    }
+
+    /// End-to-end proof that `SIGHUP` reloads a `[[proxy]]` entry's policy
+    /// file in place, without restarting the process: a permissive policy is
+    /// swapped for a blocking one on disk, `SIGHUP` is sent to this very
+    /// test process, and only a connection accepted *after* that reload sees
+    /// the stricter policy (matching `proxy::tests::
+    /// policy_reload_applies_to_new_connections_only`, exercised here
+    /// through the real `run_with_config`/`SIGHUP` path instead of driving
+    /// `proxy::serve` and a `watch::Sender` directly). Unix-only: `SIGHUP`
+    /// has no Windows equivalent, and `reload_policies_on_signal` doesn't
+    /// reload anything there either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_with_config_reloads_policy_file_on_sighup() {
+        let policy_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            policy_file.path(),
+            "[[policy]]\ntype = \"threshold\"\nmax_per_request = 10\nmax_per_window = 10\nwindow_secs = 60\n",
+        )
+        .unwrap();
+
+        let response_frame = |message_id: u32| {
+            encode_message(
+                message_id,
+                ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                    ResultCode::Success,
+                    "".into(),
+                    "".into(),
+                ))),
+            )
+        };
+
+        // Every client connection dials upstream as soon as it's accepted,
+        // independent of whether its LDAP request ends up policy-blocked, so
+        // this needs to accept connections indefinitely rather than a fixed
+        // count — a post-reload connection still needs somewhere to land
+        // even though its request never actually reaches this far.
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = upstream_listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    while let Ok(Some(frame)) = read_frame(&mut stream).await {
+                        let message_id = decode_message(&frame).message_id;
+                        if stream.write_all(&response_frame(message_id)).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let proxy_addr = reserve_free_addr().await;
+        let toml = format!(
+            r#"
+            [[proxy]]
+            listen_addr = "{proxy_addr}"
+            upstream_addr = "{upstream_addr}"
+
+            [proxy.policy]
+            file = "{policy_path}"
+            "#,
+            policy_path = policy_file.path().display(),
+        );
+        let config: config::Config = toml::from_str(&toml).unwrap();
+
+        tokio::spawn(async move { run_with_config(&config).await });
+        // Give the accept loop and the SIGHUP handler a moment to actually
+        // start before either is exercised below.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let request_frame = |message_id: u32| {
+            modify_request_frame(
+                message_id,
+                "cn=alice,dc=example,dc=com",
+                "userAccountControl",
+                b"514",
+            )
+        };
+
+        let mut pre_reload_client = TcpStream::connect(proxy_addr).await.unwrap();
+        pre_reload_client
+            .write_all(&request_frame(1))
+            .await
+            .unwrap();
+        let reply = read_frame(&mut pre_reload_client).await.unwrap().unwrap();
+        match decode_message(&reply).protocol_op {
+            ProtocolOp::ModifyResponse(ModifyResponse(result)) => {
+                assert_eq!(result.result_code, ResultCode::Success);
+            }
+            other => panic!("expected ModifyResponse, got {other:?}"),
+        }
+
+        std::fs::write(
+            policy_file.path(),
+            "[[policy]]\ntype = \"threshold\"\nmax_per_request = 0\nmax_per_window = 10\nwindow_secs = 60\n",
+        )
+        .unwrap();
+        let pid = std::process::id().to_string();
+        let status = std::process::Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .expect("running `kill -HUP` on this test process");
+        assert!(status.success(), "sending SIGHUP to self failed");
+        // Give `reload_policies_on_signal` a moment to observe the signal,
+        // re-read the policy file, and push it through the watch channel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut post_reload_client = TcpStream::connect(proxy_addr).await.unwrap();
+        post_reload_client
+            .write_all(&request_frame(2))
+            .await
+            .unwrap();
+        let reply = read_frame(&mut post_reload_client).await.unwrap().unwrap();
+        match decode_message(&reply).protocol_op {
+            ProtocolOp::ModifyResponse(ModifyResponse(result)) => {
+                assert_eq!(
+                    result.result_code,
+                    ResultCode::UnwillingToPerform,
+                    "connection accepted after SIGHUP should see the reloaded, blocking policy"
+                );
+            }
+            other => panic!("expected ModifyResponse, got {other:?}"),
         }
     }
 }

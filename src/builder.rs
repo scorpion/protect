@@ -22,6 +22,9 @@ pub struct ProxyBuilder {
     listen_starttls: Option<ListenTls>,
     connector: Option<Arc<dyn Connector>>,
     policies: Vec<Arc<dyn Policy>>,
+    // Set by `policies_reloadable` to override `policies` above with a
+    // caller-driven, live-updatable source — see that method.
+    policies_rx: Option<watch::Receiver<Vec<Arc<dyn Policy>>>>,
     limits: ConnectionLimits,
     shutdown: watch::Receiver<bool>,
     // Keeps the default shutdown channel's `Sender` alive for as long as this
@@ -43,6 +46,7 @@ impl ProxyBuilder {
             listen_starttls: None,
             connector: None,
             policies: Vec::new(),
+            policies_rx: None,
             limits: ConnectionLimits::default(),
             shutdown: shutdown_rx,
             _default_shutdown_tx: Some(shutdown_tx),
@@ -98,6 +102,19 @@ impl ProxyBuilder {
         self
     }
 
+    /// Wires up a live-updatable policy source, overriding whatever was
+    /// added via `policy`/`policies`: `serve` re-reads it
+    /// (`watch::Receiver::borrow`) for every newly-accepted connection, so
+    /// pushing a new `Vec` through the paired `Sender` (typically from a
+    /// config-reload signal such as `SIGHUP`) changes policy without a
+    /// restart. A connection already in flight keeps running under whichever
+    /// list was current when it was accepted — see "Config hot-reload" in
+    /// ARCHITECTURE.md.
+    pub fn policies_reloadable(mut self, policies: watch::Receiver<Vec<Arc<dyn Policy>>>) -> Self {
+        self.policies_rx = Some(policies);
+        self
+    }
+
     /// Overrides the default concurrent-connection cap and I/O timeout
     /// (1024 connections / 60s — see `ConnectionLimits::default`).
     pub fn limits(mut self, limits: ConnectionLimits) -> Self {
@@ -109,12 +126,15 @@ impl ProxyBuilder {
     /// (the accept loop otherwise runs forever).
     pub async fn serve(self) -> Result<()> {
         let connector = self.connector.ok_or(Error::MissingConnector)?;
+        let policies = self
+            .policies_rx
+            .unwrap_or_else(|| watch::channel(self.policies).1);
         proxy::run(
             self.listen_addr,
             self.listen_tls,
             self.listen_starttls,
             connector,
-            self.policies,
+            policies,
             self.limits,
             self.shutdown,
         )
