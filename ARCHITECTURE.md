@@ -540,6 +540,17 @@ is the system's forensic trail: everything a policy blocked, and why, is
 recoverable from logs even though the process holds no persistent state
 beyond the in-memory threshold window.
 
+`identity`/`target` are truncated to `MAX_LOGGED_FIELD_LEN` (512 bytes,
+`truncate_for_log`) before being written, independent of (and in addition
+to) any capping a `Connector` does before constructing the `Identity`/
+`Action` in the first place (e.g. `connector::ldap::cap_dn`, see
+[Identity](#identity)) — `audit` is deliberately decoupled from any
+specific `Connector`, so it can't assume every implementation caps these
+upstream. Without it, an attacker-controlled DN would inflate every log
+line it appears in, compounding the "logs never rotate" limitation below
+into a disk-fill lever independent of `ThresholdPolicy`'s own cardinality
+cap.
+
 `audit::log_decision` itself doesn't know or care where those events end up
 — that's [`src/main.rs`](src/main.rs)'s job, as the one place that installs
 a `tracing` subscriber (the library entry points never do — see
@@ -775,6 +786,11 @@ Adding another listener/upstream pair is likewise config-only — another
   (`logrotate`, a log-shipping agent) bounds the file's size. Neither holds
   automatically in every deployment shape (a read-only container root
   filesystem, an orchestrator that doesn't run `logrotate`).
+  `audit::log_decision`'s per-field truncation (see
+  [Audit logging](#audit-logging)) bounds how much any single event can
+  inflate the file, but doesn't reduce event *volume* — the number of log
+  lines an unbounded request rate produces is still an external rotation
+  policy's job.
 
 These aren't oversights to work around silently; they're the next pieces of
 this architecture, and changes that touch those areas should extend the

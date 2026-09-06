@@ -161,7 +161,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## Medium
 
-- [ ] **Unbounded DN/identity string length turns the "logs never rotate"
+- [x] **Unbounded DN/identity string length turns the "logs never rotate"
       limitation into an attacker-controlled disk-fill lever.**
       [`audit::log_decision`](src/core/audit.rs) writes the raw
       `identity`/`target` strings into every log line with no truncation.
@@ -174,6 +174,16 @@ priority; within a group, roughly in the order you'd want to tackle them.
       identity/target strings actually written to log output, independent
       of (and in addition to) fixing the underlying cardinality issue
       above.
+      Fixed: `audit::log_decision` now passes `identity`/`target` through a
+      new `truncate_for_log` helper (cap `MAX_LOGGED_FIELD_LEN`, 512 bytes)
+      before writing the log line, truncating on a UTF-8 char boundary and
+      appending the original byte length. Deliberately independent of
+      `connector::ldap::cap_dn`'s 256-byte DN cap — `audit` stays decoupled
+      from any specific `Connector`, so it can't assume every
+      implementation caps these upstream; this is the last line of defense
+      regardless. See `logs_an_oversized_identity_and_target_truncated` and
+      `truncate_for_log_does_not_split_a_multi_byte_char` in
+      `src/core/audit.rs`.
 - [ ] **`/metrics` and `/health` unauthenticated exposure needs to be a
       hard deployment requirement, not just documentation.** Both are
       correctly documented as unauthenticated by design
