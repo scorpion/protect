@@ -350,7 +350,8 @@ mod tests {
     use std::time::Duration;
 
     use rasn_ldap::{
-        ExtendedRequest, ExtendedResponse, LdapResult, ModifyResponse, ProtocolOp, ResultCode,
+        DelResponse, ExtendedRequest, ExtendedResponse, LdapResult, ModifyResponse, ProtocolOp,
+        ResultCode,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -358,8 +359,8 @@ mod tests {
 
     use super::*;
     use crate::connector::ldap::test_support::{
-        bind_request_frame, decode_message, encode_message, extended_request_frame,
-        modify_request_frame,
+        bind_request_frame, decode_message, del_request_frame, encode_message,
+        extended_request_frame, modify_request_frame,
     };
     use crate::connector::ldap::{LdapConnector, START_TLS_OID, read_frame};
     use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy};
@@ -471,6 +472,51 @@ mod tests {
                 assert_eq!(result.result_code, ResultCode::UnwillingToPerform);
             }
             other => panic!("expected ModifyResponse, got {other:?}"),
+        }
+
+        // Give the upstream task a moment to finish asserting it never received the frame.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    #[tokio::test]
+    async fn blocked_delete_never_reaches_upstream_and_client_gets_del_response() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
+            let result =
+                timeout(Duration::from_millis(200), read_frame(&mut upstream_stream)).await;
+            assert!(
+                result.is_err(),
+                "blocked bulk delete must never reach upstream"
+            );
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        tokio::spawn(serve(
+            proxy_listener,
+            None,
+            None,
+            connector,
+            block_all_policies(),
+            ConnectionLimits::default(),
+        ));
+
+        let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let request_frame = del_request_frame(7, "cn=alice,dc=example,dc=com");
+        client_stream.write_all(&request_frame).await.unwrap();
+
+        let rejection = read_frame(&mut client_stream).await.unwrap().unwrap();
+        let message = decode_message(&rejection);
+        assert_eq!(message.message_id, 7);
+        match message.protocol_op {
+            ProtocolOp::DelResponse(DelResponse(result)) => {
+                assert_eq!(result.result_code, ResultCode::UnwillingToPerform);
+            }
+            other => panic!("expected DelResponse, got {other:?}"),
         }
 
         // Give the upstream task a moment to finish asserting it never received the frame.

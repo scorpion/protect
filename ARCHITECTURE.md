@@ -28,7 +28,7 @@ about, and forwards everything else as opaque bytes.
    |                            |   v                               |
    |                            | connector.decode(frame)          |
    |                            |   |                               |
-   |                            |   +-- None (not a lock op) -------+--> forward verbatim
+   |                            |   +-- None (not actionable) -------+--> forward verbatim
    |                            |   |                               |
    |                            |   +-- Some(Action) ---> evaluate_all(policies)
    |                            |                              |
@@ -87,19 +87,26 @@ protocol is this" from "should this be allowed."
   decoding (`rasn`/`rasn-ldap`), recognizing which attributes represent an
   account-lock across different directory schemas (`LOCK_ATTRIBUTES` covers
   AD's `userAccountControl`, OpenLDAP's `pwdAccountLockedTime`, 389 DS's
-  `nsAccountLock`, and `shadowExpire`), and building a well-formed rejection
-  response (`build_rejection`) in that same protocol. Nothing outside the
+  `nsAccountLock`, and `shadowExpire`), recognizing every `DelRequest`/
+  `AddRequest` unconditionally (removing or creating an entry outright is
+  already high-blast-radius, and — unlike `Modify` — there's no cheap
+  attribute-level filter to narrow it further without querying the
+  directory, which this proxy deliberately never does), and building a
+  well-formed rejection response (`build_rejection`) whose variant matches
+  the request it's rejecting (`ModifyResponse`/`DelResponse`/
+  `AddResponse`) in that same protocol. Nothing outside the
   `connector/ldap` module needs to know LDAP exists. `connect_upstream`
   returns a boxed `DuplexStream` (any `AsyncRead + AsyncWrite + Send +
   Unpin`) so the proxy loop's `tokio::io::split`/relay code is written once
   regardless of which connector or transport is underneath.
 - **Action** is the seam. It says *what* is being attempted
-  (`OperationKind`), *what* it targets (`target`), and *how big* it is
-  (`blast_radius`) — nothing about how it was expressed on the wire. Today
-  `blast_radius` is always `1` (one object per modify), but the field exists
-  so a future connector recognizing a bulk operation (e.g. an LDAP
-  extended-op batch, or a REST API's array payload) can report a number
-  greater than one without changing anything downstream.
+  (`OperationKind`: `AccountLock`, `Delete`, or `Create`), *what* it targets
+  (`target`), and *how big* it is (`blast_radius`) — nothing about how it
+  was expressed on the wire. Today `blast_radius` is always `1` (one object
+  per modify/delete/add), but the field exists so a future connector
+  recognizing a bulk operation (e.g. an LDAP extended-op batch, or a REST
+  API's array payload) can report a number greater than one without
+  changing anything downstream.
 - **Policy** ([src/core/policy.rs](src/core/policy.rs)) is pure decision
   logic: `fn evaluate(&self, action: &Action, ctx: &PolicyContext) ->
   Decision`. Policies don't know about sockets, frames, or LDAP result

@@ -7,11 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `ai-protect` is an inline TCP proxy for directory-service protocols (LDAP
 today). It sits between a client and the real directory server (AD,
 OpenLDAP, 389 DS), decodes only the requests that modify account-lock
-attributes, and blocks bulk/high-blast-radius operations — the kind an
-over-eager automated caller (an AI agent, a misconfigured script) issues —
-via a configurable policy chain before they reach the real directory. Every
-other request is forwarded byte-for-byte, untouched; every decision is
-logged.
+attributes or delete/create an entry outright, and blocks bulk/high-blast-
+radius operations — the kind an over-eager automated caller (an AI agent, a
+misconfigured script) issues — via a configurable policy chain before they
+reach the real directory. Every other request is forwarded byte-for-byte,
+untouched; every decision is logged.
 
 For full design detail beyond what's summarized below, read:
 - [AGENTS.md](AGENTS.md) — module map and conventions
@@ -65,24 +65,32 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
   into the normal per-frame loop.
 - **`src/core/connector.rs`** — the `Connector` trait
   (`connect_upstream`/`read_frame`/`decode`/`build_rejection`/
-  `upgrade_request`) that `src/proxy.rs` is written against as `Arc<dyn
-  Connector>`, with zero compile-time knowledge of LDAP or any specific
-  backend. `upgrade_request` has a default no-op impl (`Ok(None)`), so
-  only a connector that supports an in-session TLS upgrade (LDAP's
-  StartTLS) needs to override it.
+  `upgrade_request`/`bind_identity`) that `src/proxy.rs` is written against
+  as `Arc<dyn Connector>`, with zero compile-time knowledge of LDAP or any
+  specific backend. `upgrade_request` and `bind_identity` each have a
+  default no-op impl (`Ok(None)`), so only a connector that supports an
+  in-session TLS upgrade (LDAP's StartTLS) or an identity-establishing
+  request (LDAP's bind) needs to override the respective one.
 - **`src/connector/ldap.rs`** — the only `Connector` impl. Owns BER frame
   parsing (RFC 4511 §5.1, not delegated to a higher-level LDAP library,
   since raw frame boundaries are needed to forward unmodified bytes),
-  `rasn`/`rasn-ldap` decoding of `ModifyRequest`s, recognizing
-  `LOCK_ATTRIBUTES` across AD/OpenLDAP/389 DS schemas, and building the
-  `UnwillingToPerform` rejection sent to a blocked client. Also recognizes
-  RFC 4511 StartTLS extended requests (`upgrade_request`) and, via
-  `with_starttls`, can negotiate StartTLS itself when dialing the upstream
-  instead of using implicit TLS.
+  `rasn`/`rasn-ldap` decoding of `ModifyRequest`s (recognizing
+  `LOCK_ATTRIBUTES` across AD/OpenLDAP/389 DS schemas), `DelRequest`s, and
+  `AddRequest`s (the latter two unconditionally, since removing/creating an
+  entry outright is already high-blast-radius with no cheap way to narrow
+  it further without querying the directory), and building the matching
+  `UnwillingToPerform` rejection (`ModifyResponse`/`DelResponse`/
+  `AddResponse`) sent to a blocked client. Also recognizes RFC 4511 StartTLS
+  extended requests (`upgrade_request`) and, via `with_starttls`, can
+  negotiate StartTLS itself when dialing the upstream instead of using
+  implicit TLS; and recognizes a simple `BindRequest` naming a non-empty DN
+  (`bind_identity`) so the proxy can key policy/audit identity off that DN
+  instead of the peer address.
 - **`src/core/action.rs`** — `Action`/`OperationKind`, the backend-agnostic
   seam: what's attempted, what it targets, and its `blast_radius` (always
   `1` today; exists so a future bulk-op connector can report >1 without any
-  downstream change).
+  downstream change). `OperationKind` covers `AccountLock`, `Delete`, and
+  `Create`.
 - **`src/core/policy.rs`** + **`src/core/policy/threshold.rs`** — the
   `Policy` trait (`evaluate(&Action, &PolicyContext) -> Decision`) and
   `evaluate_all` (stops at first `Block`, so ordering matters for
@@ -92,9 +100,13 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
   process-local `Mutex<HashMap<Identity, VecDeque<Instant>>>` that only
   advances on `Allow` (blocked actions don't pollute history). State does
   not survive a restart or span multiple instances.
-- **`src/core/identity.rs`** — `Identity` is just the peer's source IP
-  (port dropped, stable across reconnects); no auth/bind-derived identity
-  yet, so it doesn't distinguish two clients behind the same NAT.
+- **`src/core/identity.rs`** — `Identity`, an opaque string wrapper. Starts
+  as the peer's source IP (port dropped, stable across reconnects);
+  `proxy::handle_client_frame` replaces it with the DN from a simple LDAP
+  bind once one is seen (`Connector::bind_identity`), so two clients behind
+  the same NAT are distinguished as long as they bind under different DNs.
+  The bind isn't correlated against its `BindResponse`, so this is
+  optimistic — see the caveat in [ARCHITECTURE.md](ARCHITECTURE.md#identity).
 - **`src/core/audit.rs`** — structured `tracing` logging of every policy
   decision (`info` allow / `warn` block), decoupled from policy logic —
   the forensic trail since there's no other persistent state.

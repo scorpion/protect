@@ -92,13 +92,24 @@ priority; within a group, roughly in the order you'd want to tackle them.
       caveat in [ARCHITECTURE.md](ARCHITECTURE.md#identity). mTLS-cert-CN-
       derived identity remains unimplemented if bind DN coverage isn't
       enough (e.g. SASL-only deployments).
-- [ ] **Policy only watches `ModifyRequest`.** [`LdapConnector::decode`](src/connector/ldap.rs)
+- [x] **Policy only watches `ModifyRequest`.** [`LdapConnector::decode`](src/connector/ldap.rs)
       only turns lock-attribute `Modify` operations into `Action`s. A bulk
       `DelRequest` (mass account deletion) or bulk `AddRequest` (mass account
       creation) is at least as high-blast-radius as a lock and currently
       passes through unpoliced. Decide if "account lock" is the intentional
       v1 scope or if delete/add need equivalent coverage before calling this
-      blast-radius protection in general.
+      blast-radius protection in general. Fixed: decided delete/add need
+      equivalent coverage — `decode` now flags every `DelRequest`/
+      `AddRequest` as an `Action` (`OperationKind::Delete`/`Create`)
+      unconditionally, since (unlike `Modify`, where most requests are
+      mundane attribute edits) removing or creating an entry outright is
+      already high-blast-radius, and there's no cheap attribute-level filter
+      to narrow it further without querying the directory. `build_rejection`
+      now returns the matching response variant (`DelResponse`/
+      `AddResponse`) so a blocked client gets a well-formed rejection instead
+      of a mismatched `ModifyResponse`. `ThresholdPolicy` needed no changes —
+      it's already operation-agnostic, keying only on `blast_radius` and
+      `Identity`.
 - [ ] **`ExtendedRequest` isn't policed.** [`LdapConnector::upgrade_request`](src/connector/ldap.rs)
       now inspects `ExtendedRequest`s, but only to recognize the StartTLS
       OID for the TLS-upgrade handshake — it's not part of the

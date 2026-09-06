@@ -1,6 +1,12 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationKind {
     AccountLock,
+    /// A directory entry being removed entirely (LDAP `DelRequest`) —
+    /// at least as high-blast-radius as locking one, and not distinguished
+    /// by target object type (see `LdapConnector::decode`).
+    Delete,
+    /// A directory entry being created (LDAP `AddRequest`).
+    Create,
 }
 
 /// A normalized, backend-agnostic representation of an operation a client is

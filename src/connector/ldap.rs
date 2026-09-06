@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rasn_ldap::{
-    AuthenticationChoice, ChangeOperation, ExtendedRequest, ExtendedResponse, LdapMessage,
-    LdapResult, ModifyResponse, ProtocolOp, ResultCode,
+    AddResponse, AuthenticationChoice, ChangeOperation, DelResponse, ExtendedRequest,
+    ExtendedResponse, LdapMessage, LdapResult, ModifyResponse, ProtocolOp, ResultCode,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -126,35 +126,55 @@ impl LdapConnector {
     }
 
     /// Decode a full LDAP message frame and, if it represents an operation the
-    /// policy engine cares about, return a normalized `Action`. Returns `None`
-    /// for everything else (binds, searches, unrelated modifies, ...), which
-    /// the proxy passes straight through.
+    /// policy engine cares about, return a normalized `Action`. A `Modify` is
+    /// only actionable if it touches a lock attribute (most modifies are
+    /// mundane attribute edits); a `Del`/`Add` is actionable unconditionally —
+    /// removing or creating an entry outright is at least as high-blast-radius
+    /// as a lock, and unlike `Modify` there's no cheap way to further narrow
+    /// it to "account-like" objects without querying the directory, which
+    /// this proxy deliberately never does. Returns `None` for everything else
+    /// (binds, searches, ...), which the proxy passes straight through.
     pub fn decode(&self, frame: &[u8]) -> Result<Option<Action>> {
         let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
 
-        let ProtocolOp::ModifyRequest(modify) = &message.protocol_op else {
-            return Ok(None);
-        };
+        match &message.protocol_op {
+            ProtocolOp::ModifyRequest(modify) => {
+                // Add/Replace can set a lock value; Delete of these attributes
+                // just clears them back to the schema default, which isn't a
+                // lock action.
+                let touches_lock_attribute = modify.changes.iter().any(|change| {
+                    matches!(
+                        change.operation,
+                        ChangeOperation::Add | ChangeOperation::Replace
+                    ) && LOCK_ATTRIBUTES
+                        .contains(&change.modification.r#type.0.to_lowercase().as_str())
+                });
 
-        // Add/Replace can set a lock value; Delete of these attributes just
-        // clears them back to the schema default, which isn't a lock action.
-        let touches_lock_attribute = modify.changes.iter().any(|change| {
-            matches!(
-                change.operation,
-                ChangeOperation::Add | ChangeOperation::Replace
-            ) && LOCK_ATTRIBUTES.contains(&change.modification.r#type.0.to_lowercase().as_str())
-        });
+                if !touches_lock_attribute {
+                    return Ok(None);
+                }
 
-        if !touches_lock_attribute {
-            return Ok(None);
+                Ok(Some(Action {
+                    backend: "ldap",
+                    operation: OperationKind::AccountLock,
+                    target: modify.object.0.clone(),
+                    blast_radius: 1,
+                }))
+            }
+            ProtocolOp::DelRequest(del) => Ok(Some(Action {
+                backend: "ldap",
+                operation: OperationKind::Delete,
+                target: del.0.0.clone(),
+                blast_radius: 1,
+            })),
+            ProtocolOp::AddRequest(add) => Ok(Some(Action {
+                backend: "ldap",
+                operation: OperationKind::Create,
+                target: add.entry.0.clone(),
+                blast_radius: 1,
+            })),
+            _ => Ok(None),
         }
-
-        Ok(Some(Action {
-            backend: "ldap",
-            operation: OperationKind::AccountLock,
-            target: modify.object.0.clone(),
-            blast_radius: 1,
-        }))
     }
 
     /// Decode a BindRequest and, if it's a simple (DN + password) bind naming
@@ -179,22 +199,25 @@ impl LdapConnector {
         Ok(Some(bind.name.0.clone()))
     }
 
-    /// Build a well-formed LDAP ModifyResponse rejecting the request whose raw
+    /// Build a well-formed LDAP response rejecting the request whose raw
     /// bytes are `frame`, so the caller learns why without the request ever
-    /// reaching the real directory.
+    /// reaching the real directory. The response variant matches the
+    /// request's own operation (`ModifyResponse` for a `Modify`, and so on)
+    /// since LDAP clients validate that a response's tag matches the request
+    /// it answers.
     pub fn build_rejection(&self, frame: &[u8], reason: &str) -> Result<Vec<u8>> {
         let message: LdapMessage =
             rasn::ber::decode(frame).context("decoding LDAP message for rejection")?;
+        let result = LdapResult::new(ResultCode::UnwillingToPerform, "".into(), reason.into());
 
-        let response = LdapMessage::new(
-            message.message_id,
-            ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
-                ResultCode::UnwillingToPerform,
-                "".into(),
-                reason.into(),
-            ))),
-        );
+        let response_op = match message.protocol_op {
+            ProtocolOp::ModifyRequest(_) => ProtocolOp::ModifyResponse(ModifyResponse(result)),
+            ProtocolOp::DelRequest(_) => ProtocolOp::DelResponse(DelResponse(result)),
+            ProtocolOp::AddRequest(_) => ProtocolOp::AddResponse(AddResponse(result)),
+            other => bail!("cannot build a rejection for protocol op {other:?}"),
+        };
 
+        let response = LdapMessage::new(message.message_id, response_op);
         rasn::ber::encode(&response).context("encoding rejection response")
     }
 }
@@ -322,8 +345,8 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(stream: &mut R) -> Result
 pub(crate) mod test_support {
     use rasn::types::{OctetString, SetOf};
     use rasn_ldap::{
-        AuthenticationChoice, BindRequest, ChangeOperation, LdapMessage, ModifyRequest,
-        ModifyRequestChanges, PartialAttribute, ProtocolOp,
+        AddRequest, AuthenticationChoice, BindRequest, ChangeOperation, DelRequest, LdapMessage,
+        ModifyRequest, ModifyRequestChanges, PartialAttribute, ProtocolOp,
     };
 
     pub fn encode_message(message_id: u32, protocol_op: ProtocolOp) -> Vec<u8> {
@@ -353,6 +376,20 @@ pub(crate) mod test_support {
             ProtocolOp::ModifyRequest(ModifyRequest {
                 object: dn.into(),
                 changes: vec![change],
+            }),
+        )
+    }
+
+    pub fn del_request_frame(message_id: u32, dn: &str) -> Vec<u8> {
+        encode_message(message_id, ProtocolOp::DelRequest(DelRequest(dn.into())))
+    }
+
+    pub fn add_request_frame(message_id: u32, dn: &str) -> Vec<u8> {
+        encode_message(
+            message_id,
+            ProtocolOp::AddRequest(AddRequest {
+                entry: dn.into(),
+                attributes: vec![],
             }),
         )
     }
@@ -393,8 +430,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        bind_request_frame, decode_message, extended_request_frame, modify_request_frame,
-        sasl_bind_request_frame,
+        add_request_frame, bind_request_frame, decode_message, del_request_frame,
+        extended_request_frame, modify_request_frame, sasl_bind_request_frame,
     };
     use super::*;
 
@@ -497,6 +534,36 @@ mod tests {
     }
 
     #[test]
+    fn decodes_del_request_as_delete_action_unconditionally() {
+        let frame = del_request_frame(1, "cn=alice,dc=example,dc=com");
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.backend, "ldap");
+        assert_eq!(action.operation, OperationKind::Delete);
+        assert_eq!(action.target, "cn=alice,dc=example,dc=com");
+        assert_eq!(action.blast_radius, 1);
+    }
+
+    #[test]
+    fn decodes_add_request_as_create_action_unconditionally() {
+        let frame = add_request_frame(1, "cn=alice,dc=example,dc=com");
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.backend, "ldap");
+        assert_eq!(action.operation, OperationKind::Create);
+        assert_eq!(action.target, "cn=alice,dc=example,dc=com");
+        assert_eq!(action.blast_radius, 1);
+    }
+
+    #[test]
     fn bind_identity_extracts_dn_from_simple_bind() {
         let frame = bind_request_frame(1, "cn=alice,dc=example,dc=com");
 
@@ -558,6 +625,44 @@ mod tests {
                 assert_eq!(result.diagnostic_message.0, "too many locks");
             }
             other => panic!("expected ModifyResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejection_for_del_request_returns_del_response() {
+        let frame = del_request_frame(7, "cn=alice,dc=example,dc=com");
+
+        let rejection = connector()
+            .build_rejection(&frame, "too many deletes")
+            .unwrap();
+        let message = decode_message(&rejection);
+
+        assert_eq!(message.message_id, 7);
+        match message.protocol_op {
+            ProtocolOp::DelResponse(DelResponse(result)) => {
+                assert_eq!(result.result_code, ResultCode::UnwillingToPerform);
+                assert_eq!(result.diagnostic_message.0, "too many deletes");
+            }
+            other => panic!("expected DelResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejection_for_add_request_returns_add_response() {
+        let frame = add_request_frame(7, "cn=alice,dc=example,dc=com");
+
+        let rejection = connector()
+            .build_rejection(&frame, "too many creates")
+            .unwrap();
+        let message = decode_message(&rejection);
+
+        assert_eq!(message.message_id, 7);
+        match message.protocol_op {
+            ProtocolOp::AddResponse(AddResponse(result)) => {
+                assert_eq!(result.result_code, ResultCode::UnwillingToPerform);
+                assert_eq!(result.diagnostic_message.0, "too many creates");
+            }
+            other => panic!("expected AddResponse, got {other:?}"),
         }
     }
 

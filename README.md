@@ -7,10 +7,11 @@ directory.
 
 It sits inline between clients and the upstream directory server. Requests
 it doesn't need to act on are forwarded byte-for-byte, untouched. Requests
-that modify account-lock attributes are checked against configurable
-blast-radius policies and either forwarded or rejected with a proper LDAP
-error, with every decision logged. Each hop (client-facing and upstream)
-can independently run plaintext LDAP or LDAPS.
+that modify account-lock attributes, or that delete or create an entry
+outright, are checked against configurable blast-radius policies and
+either forwarded or rejected with a proper LDAP error, with every decision
+logged. Each hop (client-facing and upstream) can independently run
+plaintext LDAP or LDAPS.
 
 > **Status:** early. TOML-based config and policy files, TLS on both hops
 > (including optional mutual TLS and RFC 4511 StartTLS), bounded concurrent
@@ -25,15 +26,17 @@ can independently run plaintext LDAP or LDAPS.
 client  ---->  ai-protect  ---->  upstream LDAP directory
                    |
                    +-- decode request
-                   +-- not a lock operation?  forward as-is
-                   +-- lock operation -> evaluate policy
+                   +-- not actionable?        forward as-is
+                   +-- actionable -> evaluate policy
                          +-- within limits -> forward
                          +-- over limit    -> reject, log, never reaches directory
 ```
 
 Every modify request is inspected for attributes that represent an
 account lock across common directory schemas (Active Directory,
-OpenLDAP, 389 DS). Matching requests are checked against the configured
+OpenLDAP, 389 DS); every delete or add request is treated as actionable
+unconditionally, since removing or creating an entry outright is already
+high-blast-radius. Matching requests are checked against the configured
 policy chain — currently a threshold policy that blocks:
 
 - any single request whose blast radius exceeds a per-request cap, and
