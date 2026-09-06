@@ -60,10 +60,16 @@ priority; within a group, roughly in the order you'd want to tackle them.
       instead of being logged. Fixed: each entry in `.errors` is now logged
       via `tracing::warn!` before the successfully-loaded certs are added to
       the trust store.
-- [ ] **Confirm the TLS version floor.** `rustls`/`tokio-rustls` are built
+- [x] **Confirm the TLS version floor.** `rustls`/`tokio-rustls` are built
       with the `tls12` feature enabled alongside 1.3 ([`Cargo.toml`](Cargo.toml)).
       Decide whether TLS 1.2 needs to stay for compatibility with older
       directory servers or should be dropped, and document the decision.
+      Decided: keep TLS 1.2. Active Directory (a target directory) only
+      supports TLS 1.3 for LDAPS from Windows Server 2022 onward, so most
+      real deployments (2016/2019 AD, older 389 DS/OpenLDAP) are TLS-1.2-only
+      — dropping it would lock them out. Documented in `Cargo.toml` (comment
+      on the `tls12` feature) and [ARCHITECTURE.md](ARCHITECTURE.md#transport-plaintext-or-tls)
+      ("TLS version floor").
 
 ## High — identity & policy coverage
 

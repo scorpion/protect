@@ -190,6 +190,19 @@ Either mechanism ends by handing off to the exact same `ListenTls`/
 stores, and SNI validation all work identically regardless of how the
 handshake was triggered.
 
+**TLS version floor**: both hops are built via `rustls` with its `tls12`
+feature enabled ([`Cargo.toml`](Cargo.toml)), so the negotiated range is
+TLS 1.2–1.3 (rustls never supports anything older, so 1.2 is already the
+practical floor regardless of this feature flag). This is a deliberate
+compatibility decision, not an oversight: Active Directory — one of the
+three directories this proxy targets — only gained TLS 1.3 support for
+LDAPS in Windows Server 2022, so a large share of real deployments (2016,
+2019, older 389 DS/OpenLDAP builds) speak TLS 1.2 only. Dropping the
+`tls12` feature would silently lock those out. Revisit this once TLS 1.3
+is ubiquitous across supported directory versions; either hop can be
+tightened independently by removing `tls12` from the `rustls`/
+`tokio-rustls` feature lists.
+
 ## Policy: blast-radius thresholding
 
 The only policy implemented, [`ThresholdPolicy`](src/core/policy/threshold.rs),
