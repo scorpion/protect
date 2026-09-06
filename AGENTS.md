@@ -80,7 +80,8 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   `Policy` impl means adding a variant to the `PolicyEntry` enum here, not
   changing the file format.
 - [src/core/identity.rs](src/core/identity.rs) — `Identity`, currently just the peer's
-  socket address as a string. No auth/bind-based identity yet.
+  source IP as a string (port dropped so it's stable across reconnects). No
+  auth/bind-based identity yet.
 - [src/core/audit.rs](src/core/audit.rs) — structured `tracing` logging of every policy
   decision (allow or block), independent of the policy logic itself.
 

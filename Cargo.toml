@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
-ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls", "tls-rustls-ring"] }
 rasn = "0.28.14"
 rasn-ldap = "0.28.14"
 rustls = { version = "0.23.43", default-features = false, features = ["std", "tls12", "ring"] }
@@ -23,3 +22,10 @@ tracing-subscriber = "0.3.23"
 [dev-dependencies]
 rcgen = "0.14.10"
 tempfile = "3.27.0"
+
+# Enterprise deployments care about steady-state throughput/latency more than
+# build time; LTO + a single codegen unit lets the optimizer inline and
+# specialize across crate boundaries (BER decode, TLS, the relay loop).
+[profile.release]
+lto = true
+codegen-units = 1

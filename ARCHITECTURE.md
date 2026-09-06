@@ -172,14 +172,15 @@ Redis) for the window to be enforced correctly across instances.
 
 ## Identity
 
-[`Identity`](src/core/identity.rs) is currently just the client's TCP peer
-address, stringified. It exists as its own type (rather than passing
-`SocketAddr` around directly) so that policies and audit logging depend on
-an abstraction, not a transport detail — the intent is for this to become
+[`Identity`](src/core/identity.rs) is currently just the client's source IP
+address, stringified (the ephemeral port is dropped, so it survives
+reconnects). It exists as its own type (rather than passing `SocketAddr`
+around directly) so that policies and audit logging depend on an
+abstraction, not a transport detail — the intent is for this to become
 LDAP-bind-derived (or otherwise credential-derived) identity later without
 changing `Policy`, `ThresholdPolicy`, or `audit::log_decision` signatures.
-Today it does **not** correlate to a stable principal across reconnects or
-distinguish two clients behind the same NAT/address.
+Today it still does **not** distinguish two clients behind the same
+NAT/egress address, and isn't tied to any authenticated principal.
 
 ## Audit logging
 

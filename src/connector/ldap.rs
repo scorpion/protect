@@ -50,6 +50,8 @@ impl LdapConnector {
         let tcp = TcpStream::connect(self.upstream_addr)
             .await
             .with_context(|| format!("connecting to upstream LDAP at {}", self.upstream_addr))?;
+        tcp.set_nodelay(true)
+            .context("setting TCP_NODELAY on upstream connection")?;
 
         match &self.upstream_tls {
             None => Ok(MaybeTlsStream::Plain(tcp)),
@@ -178,9 +180,12 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(stream: &mut R) -> Result
         );
     }
 
-    let mut content = vec![0u8; content_len];
-    stream.read_exact(&mut content).await?;
-    frame.extend_from_slice(&content);
+    // Read the content directly into `frame`'s tail instead of filling a
+    // separate buffer and copying it over, avoiding a second allocation and
+    // memcpy of up to MAX_FRAME_CONTENT_LEN bytes per message.
+    let header_len = frame.len();
+    frame.resize(header_len + content_len, 0);
+    stream.read_exact(&mut frame[header_len..]).await?;
 
     Ok(Some(frame))
 }

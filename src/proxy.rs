@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, WriteHalf};
+use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 
@@ -115,6 +115,12 @@ pub async fn serve(
         tokio::spawn(async move {
             let _permit = permit;
             let result = async {
+                // LDAP is request/response with lots of small frames; without
+                // this, Nagle's algorithm plus delayed ACKs can add tens of
+                // milliseconds of latency to every round trip.
+                client_stream
+                    .set_nodelay(true)
+                    .context("setting TCP_NODELAY on client connection")?;
                 let client_stream = match &listen_tls {
                     None => MaybeTlsStream::Plain(client_stream),
                     Some(tls) => MaybeTlsStream::Tls(
@@ -143,8 +149,13 @@ async fn handle_connection(
     let upstream_stream = with_timeout(io_timeout, connector.connect_upstream()).await?;
     let identity = Identity::from_peer_addr(peer_addr);
 
-    let (mut client_read, client_write) = tokio::io::split(client_stream);
-    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream_stream);
+    let (client_read, client_write) = tokio::io::split(client_stream);
+    let (upstream_read, mut upstream_write) = tokio::io::split(upstream_stream);
+    // `read_frame` pulls a message apart in several small `read_exact` calls
+    // (tag, length byte(s), content); buffering coalesces those into far
+    // fewer syscalls per frame on the plaintext path.
+    let mut client_read = BufReader::new(client_read);
+    let mut upstream_read = BufReader::new(upstream_read);
     let client_write = Arc::new(Mutex::new(client_write));
 
     let upstream_to_client = {
