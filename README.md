@@ -15,8 +15,9 @@ can independently run plaintext LDAP or LDAPS.
 
 > **Status:** early. TOML-based config and policy files, TLS on both hops
 > (including optional mutual TLS and RFC 4511 StartTLS), bounded concurrent
-> connections with per-I/O timeouts, a unit + end-to-end test suite, and CI
-> all exist; there's still no persistent/shared policy state. See
+> connections with per-I/O timeouts, graceful shutdown on SIGTERM/SIGINT, a
+> unit + end-to-end test suite, and CI all exist; there's still no config
+> hot-reload. See
 > [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and
 > [TODO.md](TODO.md) for the gap list to a production-ready deployment.
 

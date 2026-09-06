@@ -65,6 +65,10 @@ upstream_addr = "127.0.0.1:389"
 # connection (TLS handshakes included) before it's dropped as stalled —
 # also acts as an idle-connection timeout. Defaults to 60.
 # io_timeout_secs = 60
+# Seconds a graceful shutdown (SIGTERM/SIGINT) waits for this entry's
+# in-flight connections to finish on their own before aborting whatever's
+# left. Defaults to 30.
+# shutdown_timeout_secs = 30
 
 [proxy.policy]
 # Path (relative to the working directory ai-protect is run from) to the

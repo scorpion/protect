@@ -5,6 +5,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::sync::watch;
+
 use crate::core::connector::Connector;
 use crate::core::policy::Policy;
 use crate::core::tls::ListenTls;
@@ -21,11 +23,20 @@ pub struct ProxyBuilder {
     connector: Option<Arc<dyn Connector>>,
     policies: Vec<Arc<dyn Policy>>,
     limits: ConnectionLimits,
+    shutdown: watch::Receiver<bool>,
+    // Keeps the default shutdown channel's `Sender` alive for as long as this
+    // builder exists, so `shutdown` never fires on its own — see
+    // `ProxyBuilder::shutdown` for how a caller replaces both halves with
+    // their own.
+    _default_shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 impl ProxyBuilder {
-    /// Starts a builder for a proxy that will listen on `listen_addr`.
+    /// Starts a builder for a proxy that will listen on `listen_addr`. Runs
+    /// forever (until error) unless `shutdown` is called to wire up a signal
+    /// this builder should drain and stop on.
     pub fn new(listen_addr: SocketAddr) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             listen_addr,
             listen_tls: None,
@@ -33,7 +44,21 @@ impl ProxyBuilder {
             connector: None,
             policies: Vec::new(),
             limits: ConnectionLimits::default(),
+            shutdown: shutdown_rx,
+            _default_shutdown_tx: Some(shutdown_tx),
         }
+    }
+
+    /// Wires up a shutdown signal: once `shutdown` carries `true`, `serve`
+    /// stops accepting new connections, waits up to `limits`'s
+    /// `shutdown_timeout` for in-flight ones to finish on their own, then
+    /// aborts whatever's left. The caller keeps the paired `Sender` (e.g.
+    /// `tokio::sync::watch::channel(false)`) to trigger it — typically from
+    /// a `SIGTERM`/`SIGINT` handler.
+    pub fn shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.shutdown = shutdown;
+        self._default_shutdown_tx = None;
+        self
     }
 
     /// Terminate TLS on `listen_addr` for incoming client connections.
@@ -91,6 +116,7 @@ impl ProxyBuilder {
             connector,
             self.policies,
             self.limits,
+            self.shutdown,
         )
         .await
         .map_err(Error::from)
@@ -187,5 +213,36 @@ mod tests {
         let err = ProxyBuilder::new(proxy_addr).serve().await.unwrap_err();
 
         assert!(matches!(err, Error::MissingConnector));
+    }
+
+    #[tokio::test]
+    async fn shutdown_receiver_stops_serve_once_signaled() {
+        // Bound but never connected to — `serve` should return on its own
+        // once told to shut down, with no connection needing to drain.
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let proxy_addr = reserve_free_addr().await;
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let serve_task = tokio::spawn(
+            ProxyBuilder::new(proxy_addr)
+                .connector(connector)
+                .shutdown(shutdown_rx)
+                .serve(),
+        );
+
+        // Give the accept loop a moment to actually start before shutting it
+        // down, so this proves a running `serve` stops rather than one that
+        // never got that far.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), serve_task)
+            .await
+            .expect("serve should return promptly once shutdown is signaled")
+            .unwrap()
+            .unwrap();
     }
 }

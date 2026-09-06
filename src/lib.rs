@@ -14,8 +14,10 @@
 //! - [`run_with_config`] — takes a [`config::Config`] you already have in
 //!   memory (its fields are all `pub`, so it's constructible without TOML),
 //!   but still loads each entry's policies from the file it references.
-//!   Every `[[proxy]]` entry runs concurrently; if one exits (normally only
-//!   on error), the rest are stopped and the error is returned.
+//!   Every `[[proxy]]` entry runs concurrently; a `SIGTERM`/`SIGINT` tells
+//!   all of them to drain in-flight connections and stop gracefully, while
+//!   any entry exiting with an error stops the rest immediately and returns
+//!   that error.
 //! - [`builder::ProxyBuilder`] — fully programmatic: construct a
 //!   [`core::connector::Connector`] (e.g.
 //!   [`connector::ldap::LdapConnector`], or your own backend) and a list of
@@ -45,8 +47,11 @@ pub async fn run(config_path: impl AsRef<Path>) -> Result<()> {
 
 /// Builds one `ProxyBuilder` from a single `[[proxy]]` entry of an in-memory
 /// `Config` (policies are still loaded from the file `proxy.policy.file`
-/// points at).
-fn build_proxy(proxy: &config::ProxyConfig) -> Result<builder::ProxyBuilder> {
+/// points at), wired up to stop and drain on `shutdown`.
+fn build_proxy(
+    proxy: &config::ProxyConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<builder::ProxyBuilder> {
     let upstream_tls = proxy
         .upstream_tls
         .as_ref()
@@ -92,12 +97,14 @@ fn build_proxy(proxy: &config::ProxyConfig) -> Result<builder::ProxyBuilder> {
     let limits = proxy::ConnectionLimits {
         max_connections: proxy.max_connections,
         io_timeout: std::time::Duration::from_secs(proxy.io_timeout_secs),
+        shutdown_timeout: std::time::Duration::from_secs(proxy.shutdown_timeout_secs),
     };
 
     let mut builder = builder::ProxyBuilder::new(proxy.listen_addr)
         .connector(connector)
         .policies(policies)
-        .limits(limits);
+        .limits(limits)
+        .shutdown(shutdown);
     if let Some(listen_tls) = listen_tls {
         builder = builder.listen_tls(listen_tls);
     }
@@ -107,30 +114,65 @@ fn build_proxy(proxy: &config::ProxyConfig) -> Result<builder::ProxyBuilder> {
     Ok(builder)
 }
 
+/// Resolves on `SIGINT` (`Ctrl-C`) or, on Unix, `SIGTERM` — the signals a
+/// rolling restart, container orchestrator, or terminal sends to ask a
+/// process to stop. Windows only gets `Ctrl-C`; there's no `SIGTERM`
+/// equivalent `tokio::signal` exposes there.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("installing a SIGTERM handler (via tokio::signal::unix::signal)");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Wires up every `[[proxy]]` entry described by an in-memory `Config` (each
 /// with its own connector, TLS settings, and policy file) and runs all of
-/// their accept loops concurrently as sibling tasks in a `JoinSet`. Returns
-/// as soon as any one of them exits — normally that only happens on error,
-/// so this mirrors a single proxy's "runs forever until something goes
-/// wrong" behavior. Dropping the `JoinSet` on the way out aborts every
-/// still-running sibling, so one entry's fatal error brings down the whole
-/// process rather than leaving the others silently orphaned.
+/// their accept loops concurrently as sibling tasks in a `JoinSet`, along
+/// with a task that waits for `SIGTERM`/`SIGINT` and tells every entry to
+/// drain and stop once one arrives (see `proxy::serve` for what draining
+/// does). Returns once every entry has stopped this way, or as soon as any
+/// one of them exits with an error — dropping the `JoinSet` on the way out
+/// aborts every still-running sibling, so one entry's fatal error brings
+/// down the whole process rather than leaving the others silently orphaned.
 pub async fn run_with_config(config: &config::Config) -> Result<()> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     let mut builders = Vec::with_capacity(config.proxy.len());
     for proxy in &config.proxy {
-        builders.push(build_proxy(proxy)?);
+        builders.push(build_proxy(proxy, shutdown_rx.clone())?);
     }
 
     let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        wait_for_shutdown_signal().await;
+        tracing::info!("shutdown signal received; draining connections on every listener");
+        // Only fails if every receiver was already dropped, i.e. every
+        // listener already stopped on its own — nothing left to signal.
+        let _ = shutdown_tx.send(true);
+        Ok(())
+    });
     for builder in builders {
         tasks.spawn(builder.serve());
     }
 
-    match tasks.join_next().await {
-        Some(Ok(result)) => result,
-        Some(Err(join_err)) => std::panic::resume_unwind(join_err.into_panic()),
-        None => Ok(()),
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => continue,
+            Ok(Err(err)) => return Err(err),
+            Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]

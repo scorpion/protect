@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, watch};
 
 use crate::core::connector::Connector;
 use crate::core::identity::Identity;
@@ -46,6 +46,10 @@ pub struct ConnectionLimits {
     /// a side that goes quiet (or trickles data) for longer than this gets
     /// disconnected.
     pub io_timeout: Duration,
+    /// How long `serve` waits for in-flight connections to finish on their
+    /// own once shutdown is requested before it gives up and aborts
+    /// whatever's left. See "graceful shutdown" below.
+    pub shutdown_timeout: Duration,
 }
 
 impl Default for ConnectionLimits {
@@ -53,8 +57,19 @@ impl Default for ConnectionLimits {
         Self {
             max_connections: 1024,
             io_timeout: Duration::from_secs(60),
+            shutdown_timeout: Duration::from_secs(30),
         }
     }
+}
+
+/// Resolves once shutdown has been requested on `shutdown`, including if it
+/// was already requested before this call — `wait_for` checks the current
+/// value first, so (unlike a bare `changed().await`) a late subscriber can't
+/// miss a request that landed before it started watching. A closed channel
+/// (every `Sender` dropped without ever sending `true`) is treated as a
+/// shutdown request too, fail-safe rather than waiting on it forever.
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|&requested| requested).await;
 }
 
 /// Races `fut` against `io_timeout`, turning an expired deadline into an
@@ -74,6 +89,7 @@ pub async fn run(
     connector: Arc<dyn Connector>,
     policies: Vec<Arc<dyn Policy>>,
     limits: ConnectionLimits,
+    shutdown: watch::Receiver<bool>,
 ) -> std::result::Result<(), ProxyError> {
     let listener = TcpListener::bind(listen_addr)
         .await
@@ -90,12 +106,20 @@ pub async fn run(
         connector,
         policies,
         limits,
+        shutdown,
     )
     .await
 }
 
 /// Accepts connections from an already-bound listener. Split out from `run`
 /// so tests can bind an ephemeral port and drive the accept loop directly.
+///
+/// `shutdown` turning `true` stops the accept loop from taking any *new*
+/// connection, then gives every connection already in flight up to
+/// `limits.shutdown_timeout` to finish on its own (a client or upstream
+/// closing the socket, an `io_timeout`, or the request/response it's
+/// mid-handling completing) before forcibly aborting whatever's left — a
+/// rolling restart or deploy drains sessions instead of hard-cutting them.
 pub async fn serve(
     listener: TcpListener,
     listen_tls: Option<ListenTls>,
@@ -103,11 +127,20 @@ pub async fn serve(
     connector: Arc<dyn Connector>,
     policies: Vec<Arc<dyn Policy>>,
     limits: ConnectionLimits,
+    mut shutdown: watch::Receiver<bool>,
 ) -> std::result::Result<(), ProxyError> {
     let semaphore = Arc::new(Semaphore::new(limits.max_connections));
+    // Tracks every spawned connection task (rather than firing them via a
+    // bare `tokio::spawn`) so shutdown can wait for them to finish, and abort
+    // whatever's still running past the grace period.
+    let mut connections = tokio::task::JoinSet::new();
 
     loop {
-        let (client_stream, peer_addr) = listener.accept().await.map_err(ProxyError::Accept)?;
+        let accept_result = tokio::select! {
+            () = wait_for_shutdown(&mut shutdown) => break,
+            result = listener.accept() => result,
+        };
+        let (client_stream, peer_addr) = accept_result.map_err(ProxyError::Accept)?;
 
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
             tracing::warn!(
@@ -123,7 +156,7 @@ pub async fn serve(
         let policies = policies.clone();
         let io_timeout = limits.io_timeout;
 
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _permit = permit;
             let result = async {
                 // LDAP is request/response with lots of small frames; without
@@ -156,6 +189,29 @@ pub async fn serve(
             }
         });
     }
+
+    let in_flight = connections.len();
+    if in_flight == 0 {
+        return Ok(());
+    }
+    tracing::info!(
+        in_flight,
+        shutdown_timeout = ?limits.shutdown_timeout,
+        "shutting down: draining in-flight connections"
+    );
+    let drained = tokio::time::timeout(limits.shutdown_timeout, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    if !drained {
+        tracing::warn!(
+            remaining = connections.len(),
+            "shutdown grace period elapsed; aborting remaining connections"
+        );
+        connections.shutdown().await;
+    }
+    Ok(())
 }
 
 /// If `client_stream` is still plaintext and `listen_starttls` is
@@ -387,6 +443,19 @@ mod tests {
         }))]
     }
 
+    /// A shutdown receiver that never fires, for tests not exercising
+    /// shutdown itself. Leaks the paired `Sender` deliberately — a `serve`
+    /// under test must outlive the local variables of the function that
+    /// spawned it, so there's no scope to hold a `Sender` in that would keep
+    /// it alive for exactly as long as needed; closing it early would
+    /// otherwise read as an immediate shutdown request (see
+    /// `wait_for_shutdown`).
+    fn no_shutdown() -> watch::Receiver<bool> {
+        let (tx, rx) = watch::channel(false);
+        std::mem::forget(tx);
+        rx
+    }
+
     #[tokio::test]
     async fn allowed_request_forwards_to_upstream_and_response_relays_back() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -426,6 +495,7 @@ mod tests {
             connector,
             allow_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -457,6 +527,7 @@ mod tests {
             connector,
             block_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -507,6 +578,7 @@ mod tests {
             connector,
             block_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -552,6 +624,7 @@ mod tests {
             connector,
             block_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -647,6 +720,7 @@ mod tests {
             connector,
             policies,
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let assert_modify_reached_upstream =
@@ -741,6 +815,7 @@ mod tests {
             connector,
             allow_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let client_dialer =
@@ -801,6 +876,7 @@ mod tests {
             connector,
             allow_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -858,6 +934,7 @@ mod tests {
             connector,
             allow_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let client_dialer = UpstreamTls::new(
@@ -925,6 +1002,7 @@ mod tests {
             connector,
             allow_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let no_cert_dialer = UpstreamTls::new(
@@ -1017,6 +1095,7 @@ mod tests {
             connector,
             allow_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1073,6 +1152,7 @@ mod tests {
             connector,
             allow_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let mut plain_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1155,6 +1235,7 @@ mod tests {
             connector,
             allow_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1234,6 +1315,7 @@ mod tests {
             connector,
             allow_all_policies(),
             ConnectionLimits::default(),
+            no_shutdown(),
         ));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1262,7 +1344,9 @@ mod tests {
             ConnectionLimits {
                 max_connections: 10,
                 io_timeout: Duration::from_millis(100),
+                ..ConnectionLimits::default()
             },
+            no_shutdown(),
         ));
 
         let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1302,7 +1386,9 @@ mod tests {
             ConnectionLimits {
                 max_connections: 1,
                 io_timeout: Duration::from_secs(10),
+                ..ConnectionLimits::default()
             },
+            no_shutdown(),
         ));
 
         let _first_client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1321,5 +1407,151 @@ mod tests {
             0,
             "expected the over-limit connection to be closed rather than served"
         );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_stops_accepting_and_waits_for_in_flight_connection() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let request_frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
+        let response_frame = encode_message(
+            1,
+            ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                ResultCode::Success,
+                "".into(),
+                "".into(),
+            ))),
+        );
+        let expected_request = request_frame.clone();
+        let canned_response = response_frame.clone();
+        tokio::spawn(async move {
+            let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
+            let received = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+            assert_eq!(received, expected_request);
+            upstream_stream.write_all(&canned_response).await.unwrap();
+            // Keep this side of the connection open rather than letting it
+            // drop (and EOF the proxy's upstream-facing read) as soon as the
+            // response is sent — the test needs the connection to still be
+            // in flight when shutdown is requested, closed only by the
+            // client end below.
+            std::future::pending::<()>().await;
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let serve_task = tokio::spawn(serve(
+            proxy_listener,
+            None,
+            None,
+            connector,
+            allow_all_policies(),
+            ConnectionLimits::default(),
+            shutdown_rx,
+        ));
+
+        // Complete one full request/response while the connection stays
+        // open, so it's genuinely in flight (not just accepted) when
+        // shutdown is requested.
+        let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        client_stream.write_all(&request_frame).await.unwrap();
+        let received_response = read_frame(&mut client_stream).await.unwrap().unwrap();
+        assert_eq!(received_response, response_frame);
+
+        shutdown_tx.send(true).unwrap();
+
+        // A new connection attempt after shutdown must not be served: it
+        // either never completes a handshake against a socket nothing is
+        // accepting from (read times out), or the listener drops out from
+        // under it once `serve` returns (clean EOF or a reset) — either way,
+        // no response is ever readable from it, unlike the exchange above.
+        let mut late_client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        match timeout(Duration::from_millis(300), late_client.read(&mut buf)).await {
+            Err(_timed_out) => {}
+            Ok(Ok(0)) => {}
+            Ok(Err(_reset_or_similar)) => {}
+            Ok(Ok(n)) => panic!(
+                "a connection accepted after shutdown was requested must not be served, got {n} byte(s)"
+            ),
+        }
+
+        // The in-flight connection above is still open; closing it lets
+        // `serve` finish draining and return.
+        drop(client_stream);
+        timeout(Duration::from_secs(2), serve_task)
+            .await
+            .expect("serve should return promptly once the in-flight connection closes")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_aborts_connections_still_running_past_the_grace_period() {
+        // Bound but never accepted from: the request the client sends below
+        // reaches upstream and then just sits there, unanswered, so the
+        // connection never finishes on its own.
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
+            read_frame(&mut upstream_stream).await.unwrap().unwrap();
+            // No response, deliberately: the client-facing connection has
+            // nothing to relay back and never closes on its own.
+            std::future::pending::<()>().await;
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let serve_task = tokio::spawn(serve(
+            proxy_listener,
+            None,
+            None,
+            connector,
+            allow_all_policies(),
+            ConnectionLimits {
+                // Long enough that this test's own timeout below would fail
+                // first if shutdown were (wrongly) waiting on it instead of
+                // aborting after `shutdown_timeout`.
+                io_timeout: Duration::from_secs(10),
+                shutdown_timeout: Duration::from_millis(100),
+                ..ConnectionLimits::default()
+            },
+            shutdown_rx,
+        ));
+
+        let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        client_stream
+            .write_all(&modify_request_frame(
+                1,
+                "cn=alice,dc=example,dc=com",
+                "userAccountControl",
+                b"514",
+            ))
+            .await
+            .unwrap();
+        // Give the connection a moment to actually reach upstream before
+        // shutdown is requested, so it's genuinely in flight.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown_tx.send(true).unwrap();
+
+        timeout(Duration::from_secs(2), serve_task)
+            .await
+            .expect(
+                "serve should abort the stuck connection at shutdown_timeout, \
+                 not wait for io_timeout",
+            )
+            .unwrap()
+            .unwrap();
     }
 }

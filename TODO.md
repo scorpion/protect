@@ -180,13 +180,33 @@ priority; within a group, roughly in the order you'd want to tackle them.
       process — see the note in
       [ARCHITECTURE.md "Known gaps"](ARCHITECTURE.md#known-gaps-by-design-at-this-stage).
 - [ ] **No config hot-reload.** Changing thresholds, addresses, or TLS
-      settings requires a process restart, which currently also hard-drops
-      every in-flight connection (see next item).
-- [ ] **No graceful shutdown.** There's no `SIGTERM`/`SIGINT` handling in
+      settings requires a process restart. Graceful shutdown (below) means
+      that restart no longer hard-drops in-flight connections, but it's
+      still a full process stop/start rather than reloading in place.
+- [x] **No graceful shutdown.** There's no `SIGTERM`/`SIGINT` handling in
       [`main.rs`](src/main.rs)/[`lib.rs`](src/lib.rs) (tokio's `signal` feature isn't even enabled
       in [`Cargo.toml`](Cargo.toml)) and no draining of in-flight connections
       — a rolling restart or deploy hard-cuts active LDAP sessions instead of
-      finishing them.
+      finishing them. Fixed: `ai_protect::run_with_config` now installs a
+      handler for `SIGTERM`/`SIGINT` (`Ctrl-C` only on Windows — no
+      `SIGTERM` equivalent there) that flips a `watch::channel(bool)` shared
+      by every `[[proxy]]` entry. `proxy::serve`'s accept loop selects
+      between `listener.accept()` and that signal, so it stops taking *new*
+      connections the moment shutdown is requested — using
+      `watch::Receiver::wait_for` rather than a bare `changed().await` so a
+      request that landed before the loop started watching still isn't
+      missed. Every already-spawned connection is now tracked in a
+      `JoinSet` (previously a bare `tokio::spawn`) specifically so shutdown
+      can wait on it: up to a new `shutdown_timeout` (`shutdown_timeout_secs`
+      per `[[proxy]]` entry, default 30s, part of `ConnectionLimits`) to
+      finish on its own, after which whatever's left is forcibly aborted
+      instead of hanging the process. `run_with_config` waits for every
+      entry to finish draining before returning `Ok(())`; an entry that
+      instead exits with an error still stops the rest immediately, as
+      before. `ProxyBuilder::shutdown` exposes the same mechanism to
+      embedders opt-in (a caller-driven `watch::Receiver<bool>`, no OS
+      signal handling of its own) — see "Graceful shutdown" in
+      [ARCHITECTURE.md](ARCHITECTURE.md#graceful-shutdown).
 
 ## Medium — observability & operations
 

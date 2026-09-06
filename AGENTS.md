@@ -58,7 +58,13 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   slow-loris client or a hung upstream pinning a task indefinitely. Also
   peeks the first frame off a still-plaintext connection to
   opportunistically negotiate RFC 4511 StartTLS (`[proxy.listen_starttls]`)
-  before falling into the normal per-frame loop.
+  before falling into the normal per-frame loop. `serve` takes a
+  `watch::Receiver<bool>` shutdown signal: once it fires, the accept loop
+  stops taking new connections and gives every one already spawned (tracked
+  in a `JoinSet`, not a bare `tokio::spawn`, specifically so shutdown can
+  wait on them) up to `ConnectionLimits::shutdown_timeout` to finish before
+  aborting whatever's left — see
+  [ARCHITECTURE.md "Graceful shutdown"](ARCHITECTURE.md#graceful-shutdown).
 - [src/core/net.rs](src/core/net.rs) — `MaybeTlsStream`, a thin enum
   (`Plain(TcpStream)` / `Tls(T)`) implementing `AsyncRead`/`AsyncWrite` by
   delegating to whichever variant is active, so `read_frame`, the relay
@@ -187,11 +193,16 @@ in `src/lib.rs` cover different amounts of "load this from a file":
 - `run(config_path)` — fully file-driven, what the binary calls.
 - `run_with_config(&Config)` — skip the config file (`Config`'s fields are
   all `pub`) but still load each `[[proxy]]` entry's policies from the file
-  its `proxy.policy.file` points at. Runs every entry concurrently.
+  its `proxy.policy.file` points at. Runs every entry concurrently, and
+  installs a `SIGTERM`/`SIGINT` handler that tells all of them to drain
+  in-flight connections and stop gracefully — see
+  [ARCHITECTURE.md "Graceful shutdown"](ARCHITECTURE.md#graceful-shutdown).
 - `builder::ProxyBuilder` — fully programmatic: give it an `Arc<dyn
   Connector>` and a `Vec<Arc<dyn Policy>>` you built yourself (e.g.
   `LdapConnector::new(...)` and `ThresholdPolicy::new(...)`), no file I/O
-  anywhere.
+  anywhere. Graceful shutdown is opt-in here via `ProxyBuilder::shutdown`
+  (a `watch::Receiver<bool>` you drive yourself) rather than wired to OS
+  signals automatically.
 
 All three return `ai_protect::Error` (`src/error.rs`), a `thiserror` enum
 aggregating the module-local error types (`ConfigError`, `PolicyConfigError`,

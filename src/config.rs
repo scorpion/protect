@@ -63,6 +63,11 @@ pub struct ProxyConfig {
     /// — also acts as an idle-connection timeout.
     #[serde(default = "default_io_timeout_secs")]
     pub io_timeout_secs: u64,
+    /// Seconds a graceful shutdown (`SIGTERM`/`SIGINT`) waits for this
+    /// entry's in-flight connections to finish on their own before aborting
+    /// whatever's left.
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
     pub policy: PolicySource,
 }
 
@@ -72,6 +77,10 @@ fn default_max_connections() -> usize {
 
 fn default_io_timeout_secs() -> u64 {
     ConnectionLimits::default().io_timeout.as_secs()
+}
+
+fn default_shutdown_timeout_secs() -> u64 {
+    ConnectionLimits::default().shutdown_timeout.as_secs()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,6 +197,10 @@ mod tests {
             proxy.io_timeout_secs,
             ConnectionLimits::default().io_timeout.as_secs()
         );
+        assert_eq!(
+            proxy.shutdown_timeout_secs,
+            ConnectionLimits::default().shutdown_timeout.as_secs()
+        );
     }
 
     #[test]
@@ -233,6 +246,7 @@ mod tests {
             upstream_addr = "127.0.0.1:389"
             max_connections = 10
             io_timeout_secs = 5
+            shutdown_timeout_secs = 15
 
             [proxy.policy]
             file = "policies/ldap.toml"
@@ -242,6 +256,7 @@ mod tests {
 
         assert_eq!(config.proxy[0].max_connections, 10);
         assert_eq!(config.proxy[0].io_timeout_secs, 5);
+        assert_eq!(config.proxy[0].shutdown_timeout_secs, 15);
     }
 
     #[test]

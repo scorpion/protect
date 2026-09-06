@@ -239,6 +239,41 @@ Both are configurable per deployment (`max_connections`/`io_timeout_secs`
 per `[[proxy]]` entry, see `config.example.toml`) or programmatically
 (`ProxyBuilder::limits`).
 
+## Graceful shutdown
+
+`ai_protect::run`/`run_with_config` install a handler for `SIGTERM`/`SIGINT`
+(Unix; `Ctrl-C` only on Windows, since `tokio::signal` has no `SIGTERM`
+equivalent there) so a rolling restart or deploy doesn't hard-cut every
+in-flight LDAP session the moment the process is asked to stop:
+
+1. The signal fires a `tokio::sync::watch::channel(bool)` shared by every
+   `[[proxy]]` entry's `proxy::serve` accept loop.
+2. Each loop's `tokio::select!` between `listener.accept()` and the
+   shutdown watch stops accepting *new* connections as soon as it observes
+   `true` — a late subscriber (or one that's slow to reach this `select!`
+   for the first time) still sees the request correctly, since
+   `watch::Receiver::wait_for` checks the current value before waiting on
+   a change, unlike a bare `changed().await`.
+3. Every already-spawned connection task is tracked in a `JoinSet` (not
+   fired via a bare `tokio::spawn`) specifically so shutdown can wait on
+   it: `serve` gives them up to `ConnectionLimits::shutdown_timeout`
+   (`shutdown_timeout_secs` per `[[proxy]]` entry, default 30s) to finish
+   on their own — a client or upstream closing the socket, an `io_timeout`,
+   or the request/response it's mid-handling completing.
+4. Whatever's still running once that grace period elapses is forcibly
+   aborted (`JoinSet::shutdown`) rather than left to hang the process.
+
+`run_with_config` waits for every `[[proxy]]` entry to finish this way
+before returning `Ok(())`; an entry that instead exits with an error (e.g.
+`ProxyError::Accept`) still stops the rest immediately, unchanged from
+before graceful shutdown existed. Embedding via `ProxyBuilder` gets the same
+mechanism opt-in: `ProxyBuilder::shutdown` takes a `watch::Receiver<bool>`
+the caller drives themselves (`run`/`run_with_config`'s OS-signal handling
+is specific to those file-driven entry points, not `ProxyBuilder` itself);
+without it, `serve` runs forever like before, since the builder's default
+receiver is paired with a `Sender` the builder itself holds onto and never
+sends on.
+
 ## Policy: blast-radius thresholding
 
 The only policy implemented, [`ThresholdPolicy`](src/core/policy/threshold.rs),
