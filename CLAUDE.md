@@ -7,11 +7,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `ai-protect` is an inline TCP proxy for directory-service protocols (LDAP
 today). It sits between a client and the real directory server (AD,
 OpenLDAP, 389 DS), decodes only the requests that modify account-lock
-attributes or delete/create an entry outright, and blocks bulk/high-blast-
-radius operations — the kind an over-eager automated caller (an AI agent, a
-misconfigured script) issues — via a configurable policy chain before they
-reach the real directory. Every other request is forwarded byte-for-byte,
-untouched; every decision is logged.
+attributes, delete/create an entry outright, or reset a password via
+extended operation, and blocks bulk/high-blast-radius operations — the
+kind an over-eager automated caller (an AI agent, a misconfigured script)
+issues — via a configurable policy chain before they reach the real
+directory. Every other request is forwarded byte-for-byte, untouched;
+every decision is logged.
 
 For full design detail beyond what's summarized below, read:
 - [AGENTS.md](AGENTS.md) — module map and conventions
@@ -80,17 +81,22 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
   entry outright is already high-blast-radius with no cheap way to narrow
   it further without querying the directory), and building the matching
   `UnwillingToPerform` rejection (`ModifyResponse`/`DelResponse`/
-  `AddResponse`) sent to a blocked client. Also recognizes RFC 4511 StartTLS
-  extended requests (`upgrade_request`) and, via `with_starttls`, can
-  negotiate StartTLS itself when dialing the upstream instead of using
+  `AddResponse`) sent to a blocked client. Also decodes the one
+  `ExtendedRequest` this proxy polices — RFC 3062 Password Modify — into an
+  `Action` (its own hand-rolled `PasswdModifyRequestValue` type, since
+  `rasn-ldap` only models core LDAP ops, not this extended operation's
+  payload); every other extended request (including StartTLS) is left to
+  pass through `decode` unrecognized. Separately recognizes RFC 4511
+  StartTLS extended requests (`upgrade_request`) and, via `with_starttls`,
+  can negotiate StartTLS itself when dialing the upstream instead of using
   implicit TLS; and recognizes a simple `BindRequest` naming a non-empty DN
   (`bind_identity`) so the proxy can key policy/audit identity off that DN
   instead of the peer address.
 - **`src/core/action.rs`** — `Action`/`OperationKind`, the backend-agnostic
   seam: what's attempted, what it targets, and its `blast_radius` (always
   `1` today; exists so a future bulk-op connector can report >1 without any
-  downstream change). `OperationKind` covers `AccountLock`, `Delete`, and
-  `Create`.
+  downstream change). `OperationKind` covers `AccountLock`, `Delete`,
+  `Create`, and `PasswordReset`.
 - **`src/core/policy.rs`** + **`src/core/policy/threshold.rs`** — the
   `Policy` trait (`evaluate(&Action, &PolicyContext) -> Decision`) and
   `evaluate_all` (stops at first `Block`, so ordering matters for

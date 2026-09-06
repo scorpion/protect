@@ -7,6 +7,11 @@ pub enum OperationKind {
     Delete,
     /// A directory entry being created (LDAP `AddRequest`).
     Create,
+    /// A password being reset via an extended operation rather than
+    /// `Modify` (LDAP's RFC 3062 Password Modify) — a bulk reset locks
+    /// affected users out of their accounts just as a bulk `AccountLock`
+    /// would (see `LdapConnector::decode`).
+    PasswordReset,
 }
 
 /// A normalized, backend-agnostic representation of an operation a client is

@@ -360,7 +360,7 @@ mod tests {
     use super::*;
     use crate::connector::ldap::test_support::{
         bind_request_frame, decode_message, del_request_frame, encode_message,
-        extended_request_frame, modify_request_frame,
+        extended_request_frame, modify_request_frame, password_modify_request_frame,
     };
     use crate::connector::ldap::{LdapConnector, START_TLS_OID, read_frame};
     use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy};
@@ -517,6 +517,51 @@ mod tests {
                 assert_eq!(result.result_code, ResultCode::UnwillingToPerform);
             }
             other => panic!("expected DelResponse, got {other:?}"),
+        }
+
+        // Give the upstream task a moment to finish asserting it never received the frame.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    #[tokio::test]
+    async fn blocked_password_modify_never_reaches_upstream_and_client_gets_extended_response() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
+            let result =
+                timeout(Duration::from_millis(200), read_frame(&mut upstream_stream)).await;
+            assert!(
+                result.is_err(),
+                "blocked password reset must never reach upstream"
+            );
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        tokio::spawn(serve(
+            proxy_listener,
+            None,
+            None,
+            connector,
+            block_all_policies(),
+            ConnectionLimits::default(),
+        ));
+
+        let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let request_frame = password_modify_request_frame(7, Some("cn=alice,dc=example,dc=com"));
+        client_stream.write_all(&request_frame).await.unwrap();
+
+        let rejection = read_frame(&mut client_stream).await.unwrap().unwrap();
+        let message = decode_message(&rejection);
+        assert_eq!(message.message_id, 7);
+        match message.protocol_op {
+            ProtocolOp::ExtendedResp(ExtendedResponse { result_code, .. }) => {
+                assert_eq!(result_code, ResultCode::UnwillingToPerform);
+            }
+            other => panic!("expected ExtendedResp, got {other:?}"),
         }
 
         // Give the upstream task a moment to finish asserting it never received the frame.

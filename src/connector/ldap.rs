@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use rasn::types::OctetString;
+use rasn::{AsnType, Decode, Decoder, Encode};
 use rasn_ldap::{
     AddResponse, AuthenticationChoice, ChangeOperation, DelResponse, ExtendedRequest,
     ExtendedResponse, LdapMessage, LdapResult, ModifyResponse, ProtocolOp, ResultCode,
@@ -45,6 +47,32 @@ pub(crate) const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
 /// the first message on a freshly dialed connection, so there's no
 /// in-flight request it could collide with.
 const START_TLS_UPSTREAM_MESSAGE_ID: u32 = 1;
+
+/// RFC 3062 — the extended-operation OID for the Password Modify operation,
+/// which some directories expose as an alternative to a plain `Modify` for
+/// resetting a password. A bulk password reset is disruptive the same way a
+/// bulk account lock is (both leave the affected users unable to log in), so
+/// this proxy polices it identically instead of letting it pass through
+/// `decode` unrecognized like any other extended operation.
+const PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
+
+/// RFC 3062 §2's `PasswdModifyRequestValue`, the BER payload carried in an
+/// `ExtendedRequest.request_value` for the Password Modify operation:
+/// `PasswdModifyRequestValue ::= SEQUENCE { userIdentity [0] OCTET STRING
+/// OPTIONAL, oldPasswd [1] OCTET STRING OPTIONAL, newPasswd [2] OCTET STRING
+/// OPTIONAL }`. Decoded only far enough to learn which identity's password
+/// is changing; `old_passwd`/`new_passwd` are parsed (so the SEQUENCE
+/// decodes correctly at all) but never inspected or logged — this proxy
+/// checks blast radius, not credential contents.
+#[derive(AsnType, Encode, Decode, Debug, Clone, PartialEq, Eq)]
+struct PasswdModifyRequestValue {
+    #[rasn(tag(0))]
+    user_identity: Option<OctetString>,
+    #[rasn(tag(1))]
+    old_passwd: Option<OctetString>,
+    #[rasn(tag(2))]
+    new_passwd: Option<OctetString>,
+}
 
 #[derive(Clone)]
 pub struct LdapConnector {
@@ -132,8 +160,12 @@ impl LdapConnector {
     /// removing or creating an entry outright is at least as high-blast-radius
     /// as a lock, and unlike `Modify` there's no cheap way to further narrow
     /// it to "account-like" objects without querying the directory, which
-    /// this proxy deliberately never does. Returns `None` for everything else
-    /// (binds, searches, ...), which the proxy passes straight through.
+    /// this proxy deliberately never does. An `ExtendedRequest` is actionable
+    /// only for the RFC 3062 Password Modify OID — every other extended
+    /// operation (including StartTLS) is left alone here, since
+    /// `upgrade_request` already handles the one that needs a response before
+    /// `decode` would ever see it. Returns `None` for everything else (binds,
+    /// searches, ...), which the proxy passes straight through.
     pub fn decode(&self, frame: &[u8]) -> Result<Option<Action>> {
         let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
 
@@ -173,6 +205,40 @@ impl LdapConnector {
                 target: add.entry.0.clone(),
                 blast_radius: 1,
             })),
+            ProtocolOp::ExtendedReq(ExtendedRequest {
+                request_name,
+                request_value,
+            }) => {
+                if request_name.as_ref() != PASSWORD_MODIFY_OID.as_bytes() {
+                    return Ok(None);
+                }
+
+                // userIdentity is itself OPTIONAL within the value (RFC 3062
+                // allows a client to ask the server to reset its own,
+                // currently-bound password without naming a DN), and some
+                // clients omit the value entirely for the same self-service
+                // case — either way there's no DN to report.
+                let target = match request_value {
+                    Some(value) => {
+                        let parsed: PasswdModifyRequestValue = rasn::ber::decode(value)
+                            .context("decoding RFC 3062 PasswdModifyRequestValue")?;
+                        match parsed.user_identity {
+                            Some(identity) => {
+                                String::from_utf8_lossy(identity.as_ref()).into_owned()
+                            }
+                            None => "(bound identity)".to_string(),
+                        }
+                    }
+                    None => "(bound identity)".to_string(),
+                };
+
+                Ok(Some(Action {
+                    backend: "ldap",
+                    operation: OperationKind::PasswordReset,
+                    target,
+                    blast_radius: 1,
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -214,6 +280,14 @@ impl LdapConnector {
             ProtocolOp::ModifyRequest(_) => ProtocolOp::ModifyResponse(ModifyResponse(result)),
             ProtocolOp::DelRequest(_) => ProtocolOp::DelResponse(DelResponse(result)),
             ProtocolOp::AddRequest(_) => ProtocolOp::AddResponse(AddResponse(result)),
+            ProtocolOp::ExtendedReq(_) => ProtocolOp::ExtendedResp(ExtendedResponse {
+                result_code: result.result_code,
+                matched_dn: result.matched_dn,
+                diagnostic_message: result.diagnostic_message,
+                referral: result.referral,
+                response_name: None,
+                response_value: None,
+            }),
             other => bail!("cannot build a rejection for protocol op {other:?}"),
         };
 
@@ -425,13 +499,34 @@ pub(crate) mod test_support {
             }),
         )
     }
+
+    pub fn password_modify_request_frame(message_id: u32, user_identity: Option<&str>) -> Vec<u8> {
+        let value = super::PasswdModifyRequestValue {
+            user_identity: user_identity.map(|dn| OctetString::from(dn.as_bytes().to_vec())),
+            old_passwd: None,
+            new_passwd: Some(OctetString::from(b"new-password".to_vec())),
+        };
+
+        encode_message(
+            message_id,
+            ProtocolOp::ExtendedReq(rasn_ldap::ExtendedRequest {
+                request_name: super::PASSWORD_MODIFY_OID.as_bytes().into(),
+                request_value: Some(
+                    rasn::ber::encode(&value)
+                        .expect("encode PasswdModifyRequestValue")
+                        .into(),
+                ),
+            }),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::test_support::{
         add_request_frame, bind_request_frame, decode_message, del_request_frame,
-        extended_request_frame, modify_request_frame, sasl_bind_request_frame,
+        extended_request_frame, modify_request_frame, password_modify_request_frame,
+        sasl_bind_request_frame,
     };
     use super::*;
 
@@ -564,6 +659,43 @@ mod tests {
     }
 
     #[test]
+    fn decodes_password_modify_with_explicit_identity_as_password_reset_action() {
+        let frame = password_modify_request_frame(1, Some("cn=alice,dc=example,dc=com"));
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.backend, "ldap");
+        assert_eq!(action.operation, OperationKind::PasswordReset);
+        assert_eq!(action.target, "cn=alice,dc=example,dc=com");
+        assert_eq!(action.blast_radius, 1);
+    }
+
+    #[test]
+    fn decodes_password_modify_without_identity_as_password_reset_action() {
+        let frame = password_modify_request_frame(1, None);
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.operation, OperationKind::PasswordReset);
+        assert_eq!(action.target, "(bound identity)");
+    }
+
+    #[test]
+    fn ignores_extended_request_for_other_oid() {
+        let frame = extended_request_frame(1, START_TLS_OID);
+
+        let action = connector().decode(&frame).unwrap();
+
+        assert!(action.is_none());
+    }
+
+    #[test]
     fn bind_identity_extracts_dn_from_simple_bind() {
         let frame = bind_request_frame(1, "cn=alice,dc=example,dc=com");
 
@@ -663,6 +795,29 @@ mod tests {
                 assert_eq!(result.diagnostic_message.0, "too many creates");
             }
             other => panic!("expected AddResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejection_for_password_modify_returns_extended_response() {
+        let frame = password_modify_request_frame(7, Some("cn=alice,dc=example,dc=com"));
+
+        let rejection = connector()
+            .build_rejection(&frame, "too many password resets")
+            .unwrap();
+        let message = decode_message(&rejection);
+
+        assert_eq!(message.message_id, 7);
+        match message.protocol_op {
+            ProtocolOp::ExtendedResp(ExtendedResponse {
+                result_code,
+                diagnostic_message,
+                ..
+            }) => {
+                assert_eq!(result_code, ResultCode::UnwillingToPerform);
+                assert_eq!(diagnostic_message.0, "too many password resets");
+            }
+            other => panic!("expected ExtendedResp, got {other:?}"),
         }
     }
 

@@ -91,22 +91,29 @@ protocol is this" from "should this be allowed."
   `AddRequest` unconditionally (removing or creating an entry outright is
   already high-blast-radius, and — unlike `Modify` — there's no cheap
   attribute-level filter to narrow it further without querying the
-  directory, which this proxy deliberately never does), and building a
-  well-formed rejection response (`build_rejection`) whose variant matches
-  the request it's rejecting (`ModifyResponse`/`DelResponse`/
-  `AddResponse`) in that same protocol. Nothing outside the
-  `connector/ldap` module needs to know LDAP exists. `connect_upstream`
-  returns a boxed `DuplexStream` (any `AsyncRead + AsyncWrite + Send +
-  Unpin`) so the proxy loop's `tokio::io::split`/relay code is written once
-  regardless of which connector or transport is underneath.
+  directory, which this proxy deliberately never does), recognizing an
+  `ExtendedRequest` for the RFC 3062 Password Modify OID specifically (a
+  bulk password reset is disruptive the same way a bulk lock is — both
+  leave the affected users unable to log in — so it's decoded via a
+  hand-rolled `PasswdModifyRequestValue` type, since `rasn-ldap` only models
+  core LDAP operations, not this extended operation's payload; every other
+  extended request, including StartTLS, passes through unrecognized here),
+  and building a well-formed rejection response (`build_rejection`) whose
+  variant matches the request it's rejecting (`ModifyResponse`/
+  `DelResponse`/`AddResponse`/`ExtendedResp`) in that same protocol. Nothing
+  outside the `connector/ldap` module needs to know LDAP exists.
+  `connect_upstream` returns a boxed `DuplexStream` (any `AsyncRead +
+  AsyncWrite + Send + Unpin`) so the proxy loop's `tokio::io::split`/relay
+  code is written once regardless of which connector or transport is
+  underneath.
 - **Action** is the seam. It says *what* is being attempted
-  (`OperationKind`: `AccountLock`, `Delete`, or `Create`), *what* it targets
-  (`target`), and *how big* it is (`blast_radius`) — nothing about how it
-  was expressed on the wire. Today `blast_radius` is always `1` (one object
-  per modify/delete/add), but the field exists so a future connector
-  recognizing a bulk operation (e.g. an LDAP extended-op batch, or a REST
-  API's array payload) can report a number greater than one without
-  changing anything downstream.
+  (`OperationKind`: `AccountLock`, `Delete`, `Create`, or `PasswordReset`),
+  *what* it targets (`target`), and *how big* it is (`blast_radius`) —
+  nothing about how it was expressed on the wire. Today `blast_radius` is
+  always `1` (one object per modify/delete/add/password-reset), but the
+  field exists so a future connector recognizing a bulk operation (e.g. an
+  LDAP extended-op batch, or a REST API's array payload) can report a
+  number greater than one without changing anything downstream.
 - **Policy** ([src/core/policy.rs](src/core/policy.rs)) is pure decision
   logic: `fn evaluate(&self, action: &Action, ctx: &PolicyContext) ->
   Decision`. Policies don't know about sockets, frames, or LDAP result

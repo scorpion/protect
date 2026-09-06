@@ -69,9 +69,9 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   (rather than silently discarding) any error `rustls-native-certs` hits
   loading the OS trust store.
 - [src/core/action.rs](src/core/action.rs) — defines `Action` /
-  `OperationKind` (`AccountLock`, `Delete`, `Create`), the normalized
-  representation a connector produces so the policy engine never has to
-  understand a wire protocol.
+  `OperationKind` (`AccountLock`, `Delete`, `Create`, `PasswordReset`), the
+  normalized representation a connector produces so the policy engine
+  never has to understand a wire protocol.
 - [src/core/connector.rs](src/core/connector.rs) — the `Connector` trait
   (`connect_upstream`/`read_frame`/`decode`/`build_rejection`/
   `upgrade_request`/`bind_identity`) that `src/proxy.rs` is written against,
@@ -85,18 +85,23 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   Reads BER-framed LDAP messages off the wire (`read_frame`), decodes
   `ModifyRequest`s via `rasn`/`rasn-ldap` and flags ones touching a known
   account-lock attribute (`LOCK_ATTRIBUTES`, covering AD/OpenLDAP/389 DS
-  schemas) as an `Action`, and flags every `DelRequest`/`AddRequest`
+  schemas) as an `Action`, flags every `DelRequest`/`AddRequest`
   unconditionally (removing/creating an entry outright is already
   high-blast-radius, and unlike `Modify` there's no cheap attribute-level
-  filter to narrow it further without querying the directory). Also builds
-  the matching rejection response sent back to a blocked client
-  (`ModifyResponse`/`DelResponse`/`AddResponse`), recognizes RFC 4511
-  StartTLS extended requests (`upgrade_request`) so a client can upgrade a
-  plaintext connection to TLS mid-session, and recognizes a simple
-  `BindRequest` naming a non-empty DN (`bind_identity`) so the proxy can
-  key policy/audit identity off that DN instead of the peer address.
-  Exposes this as both inherent methods (used directly by its own tests)
-  and an `impl Connector`.
+  filter to narrow it further without querying the directory), and flags an
+  `ExtendedRequest` for the RFC 3062 Password Modify OID (a bulk password
+  reset is as disruptive as a bulk lock) — decoding its payload via a
+  hand-rolled `PasswdModifyRequestValue` type, since `rasn-ldap` doesn't
+  model extended-operation payloads. Every other extended request passes
+  through `decode` unrecognized. Also builds the matching rejection
+  response sent back to a blocked client (`ModifyResponse`/`DelResponse`/
+  `AddResponse`/`ExtendedResp`), recognizes RFC 4511 StartTLS extended
+  requests (`upgrade_request`, a separate code path from `decode`) so a
+  client can upgrade a plaintext connection to TLS mid-session, and
+  recognizes a simple `BindRequest` naming a non-empty DN (`bind_identity`)
+  so the proxy can key policy/audit identity off that DN instead of the
+  peer address. Exposes this as both inherent methods (used directly by its
+  own tests) and an `impl Connector`.
 - [src/core/policy.rs](src/core/policy.rs) — the `Policy` trait
   (`evaluate(&Action, &PolicyContext) -> Decision`) and `evaluate_all`, which
   runs every configured policy and stops at the first `Block`.
@@ -135,12 +140,13 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   `ThresholdPolicy`'s history tracking, which only advances state on an
   `Allow`).
 - The proxy relays raw bytes; it only decodes frames it might act on
-  (currently LDAP `ModifyRequest`s touching lock attributes, plus every
-  `DelRequest`/`AddRequest`). Anything else — binds, searches, unrelated
-  modifies — is forwarded without being parsed. Keep that
-  pass-through-by-default behavior when adding decoding logic: fail open to
-  "not my concern, forward it" rather than trying to understand every
-  operation type.
+  (currently LDAP `ModifyRequest`s touching lock attributes, every
+  `DelRequest`/`AddRequest`, and `ExtendedRequest`s for the RFC 3062
+  Password Modify OID specifically). Anything else — binds, searches,
+  unrelated modifies, other extended operations — is forwarded without
+  being parsed. Keep that pass-through-by-default behavior when adding
+  decoding logic: fail open to "not my concern, forward it" rather than
+  trying to understand every operation type.
 - `read_frame` implements BER definite-length framing itself (RFC 4511
   §5.1) rather than relying on a higher-level LDAP library for transport
   framing, since the proxy needs raw frame boundaries to forward bytes

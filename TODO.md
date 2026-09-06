@@ -110,13 +110,24 @@ priority; within a group, roughly in the order you'd want to tackle them.
       of a mismatched `ModifyResponse`. `ThresholdPolicy` needed no changes —
       it's already operation-agnostic, keying only on `blast_radius` and
       `Identity`.
-- [ ] **`ExtendedRequest` isn't policed.** [`LdapConnector::upgrade_request`](src/connector/ldap.rs)
+- [x] **`ExtendedRequest` isn't policed.** [`LdapConnector::upgrade_request`](src/connector/ldap.rs)
       now inspects `ExtendedRequest`s, but only to recognize the StartTLS
       OID for the TLS-upgrade handshake — it's not part of the
       `decode`/policy path. Some directories expose account-disable-equivalent
       operations (e.g. RFC 3062 password modify) as extended operations
       rather than `Modify`; those still pass through with no policy
-      evaluation at all.
+      evaluation at all. Fixed: `decode` now recognizes the RFC 3062
+      Password Modify OID specifically (a bulk password reset is as
+      disruptive as a bulk lock — both leave affected users unable to log
+      in) and turns it into an `Action` (`OperationKind::PasswordReset`),
+      decoding the extended operation's opaque payload via a hand-rolled
+      `PasswdModifyRequestValue` type (`rasn-ldap` only models core LDAP
+      operations, not extended-operation payloads). `build_rejection` returns
+      a matching `ExtendedResp` for a blocked one. `upgrade_request` and
+      `decode` remain separate, independent code paths — StartTLS is still
+      handled only by the former, and this doesn't change that. Every other
+      extended operation still passes through unpoliced; RFC 3062 was the
+      only one the gap explicitly called out.
 
 ## High — reliability & scale
 
