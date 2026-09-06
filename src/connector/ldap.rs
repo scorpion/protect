@@ -24,6 +24,14 @@ const LOCK_ATTRIBUTES: &[&str] = &[
     "shadowexpire",
 ];
 
+/// Hard cap on a single LDAP message's BER content length. Applied before
+/// `read_frame` allocates a buffer for that content, so a client claiming an
+/// oversized length (up to `u32::MAX` under the wire format) gets the
+/// connection closed instead of a multi-gigabyte allocation. LDAP directory
+/// operations — even bulky ones like a large `SearchResultEntry` — comfortably
+/// fit well under this.
+const MAX_FRAME_CONTENT_LEN: usize = 16 * 1024 * 1024; // 16 MiB
+
 #[derive(Clone)]
 pub struct LdapConnector {
     upstream_addr: SocketAddr,
@@ -163,6 +171,12 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(stream: &mut R) -> Result
         frame.extend_from_slice(&len_bytes[4 - num_bytes..]);
         u32::from_be_bytes(len_bytes) as usize
     };
+
+    if content_len > MAX_FRAME_CONTENT_LEN {
+        bail!(
+            "LDAP message length {content_len} exceeds max frame size ({MAX_FRAME_CONTENT_LEN} bytes)"
+        );
+    }
 
     let mut content = vec![0u8; content_len];
     stream.read_exact(&mut content).await?;
@@ -381,5 +395,21 @@ mod tests {
         let read = read_frame(&mut cursor).await.unwrap();
 
         assert!(read.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_length_over_max_frame_size_without_allocating() {
+        // Tag byte, long-form length (4 following bytes), then a claimed
+        // content length just over the cap. No content bytes are provided —
+        // if `read_frame` allocated first and tried to fill the buffer it
+        // would hang/error on the short read instead of rejecting up front.
+        let oversized_len = (MAX_FRAME_CONTENT_LEN + 1) as u32;
+        let mut header = vec![0x30u8, 0x84];
+        header.extend_from_slice(&oversized_len.to_be_bytes());
+        let mut cursor = std::io::Cursor::new(header);
+
+        let err = read_frame(&mut cursor).await.unwrap_err();
+
+        assert!(err.to_string().contains("exceeds max frame size"));
     }
 }
