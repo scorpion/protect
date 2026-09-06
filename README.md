@@ -176,6 +176,26 @@ over the wire, with every decision landing in the audit log. Requires
 ./test.sh
 ```
 
+## Fuzzing
+
+[fuzz/](fuzz/) is a [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
+project targeting the two places
+[`LdapConnector`](src/connector/ldap.rs) touches fully untrusted bytes off
+the wire: `read_frame`'s BER tag/length framing, and the
+`decode`/`upgrade_request`/`bind_identity`/`build_rejection` methods that
+`rasn::ber::decode` a length-delimited frame into an LDAP message. Requires
+a nightly toolchain (`rustup toolchain install nightly`) and `cargo install
+cargo-fuzz`.
+
+```sh
+cargo +nightly fuzz run decode       # BER message decoding
+cargo +nightly fuzz run read_frame   # frame length parsing
+```
+
+Each runs indefinitely until stopped (`Ctrl-C`) or a crash is found (saved
+under `fuzz/artifacts/`); pass `-- -max_total_time=60` to bound a run, e.g.
+for a quick local check.
+
 ## Development
 
 ```sh

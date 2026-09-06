@@ -337,10 +337,23 @@ priority; within a group, roughly in the order you'd want to tackle them.
       all hand-rolled via `rasn`/`rasn-ldap`). Remove it or document why it's
       there if it's a placeholder for planned work. Fixed: removed from
       `Cargo.toml`/`Cargo.lock`.
-- [ ] **No fuzzing of the decode path.** `read_frame` and the `rasn` BER
+- [x] **No fuzzing of the decode path.** `read_frame` and the `rasn` BER
       decode in [`LdapConnector::decode`](src/connector/ldap.rs) are the only
       code that touches fully untrusted bytes; worth a fuzz target given a
       malformed/adversarial LDAP frame is the most likely place for a panic
-      or resource-exhaustion bug (also see the frame-size cap above).
+      or resource-exhaustion bug (also see the frame-size cap above). Fixed:
+      added a `cargo-fuzz` project at [`fuzz/`](fuzz/) with two targets —
+      `read_frame` (BER tag/length framing, driven over a `Cursor` under a
+      throwaway `tokio::runtime::Runtime` since `read_frame` is async) and
+      `decode` (`LdapConnector::decode`/`upgrade_request`/`bind_identity`/
+      `build_rejection`, the four methods that call `rasn::ber::decode` on an
+      already-framed message). Both ran clean past ~800K (`decode`) and
+      ~2.6M (`read_frame`) executions locally with no crashes. Requires a
+      nightly toolchain (`rasn`/BER decoding isn't the constraint —
+      `cargo-fuzz`'s libFuzzer instrumentation is), so it's deliberately not
+      wired into `cargo test` or CI's stable/beta/nightly matrix; run
+      manually via `cargo +nightly fuzz run decode` /
+      `cargo +nightly fuzz run read_frame` after touching either target's
+      code. See "Fuzzing" in [README.md](README.md#fuzzing).
 - [ ] **No load/soak testing** to validate behavior (memory, fd count,
       latency) under many concurrent connections or sustained throughput.

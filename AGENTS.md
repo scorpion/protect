@@ -308,6 +308,17 @@ also enforced in CI (`.github/workflows/ci.yaml`'s `lint` job), along with a
 `security_audit` job running `cargo audit` against the RustSec advisory
 database on every push/PR.
 
+[fuzz/](fuzz/) is a `cargo-fuzz` project (needs a nightly toolchain) with two
+targets covering the only code that touches fully untrusted bytes off the
+wire: `read_frame`'s BER tag/length framing (`fuzz/fuzz_targets/read_frame.rs`)
+and `LdapConnector`'s `decode`/`upgrade_request`/`bind_identity`/
+`build_rejection` (`fuzz/fuzz_targets/decode.rs`), which each run
+`rasn::ber::decode` on a frame `read_frame` already delimited. Run with
+`cargo +nightly fuzz run decode` / `cargo +nightly fuzz run read_frame`; not
+part of `cargo test` or CI (fuzzing runs indefinitely by design), so run it
+manually after touching either of those two files. See "Fuzzing" in
+[README.md](README.md#fuzzing).
+
 ## Conventions
 
 - Rust 2024 edition. The public setup/config surface (config/policy file

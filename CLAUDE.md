@@ -40,6 +40,11 @@ cargo clippy                    # lint
 ./test.sh                       # real end-to-end test: brings up dockerized lldap, runs the real
                                  # binary in front of it, drives it with ldapsearch/ldapmodify/
                                  # ldapwhoami/ldappasswd; requires docker, cargo, OpenLDAP client tools
+cargo +nightly fuzz run decode       # fuzz BER message decoding (LdapConnector::decode et al.)
+cargo +nightly fuzz run read_frame   # fuzz frame length parsing (read_frame)
+                                 # both require a nightly toolchain + `cargo install cargo-fuzz`;
+                                 # not part of cargo test or CI, run manually after touching either
+                                 # target's code (see fuzz/ and "Fuzzing" in README.md)
 ```
 
 CI ([.github/workflows/ci.yaml](.github/workflows/ci.yaml)) runs `cargo build`/`cargo test` on stable, beta, and nightly, `cargo fmt --check`/`cargo clippy -D warnings` on stable, and `cargo audit` (RustSec advisory scan) — all for every push and PR. Run `cargo fmt`/`cargo clippy` locally before considering a change done anyway, so CI doesn't catch it first.
