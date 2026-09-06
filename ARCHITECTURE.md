@@ -435,9 +435,15 @@ warning and falls back to pure in-memory behavior.
 (rather than passing `SocketAddr` around directly) so that policies and
 audit logging depend on an abstraction, not a transport detail. A
 connection's `Identity` starts as the client's source IP address,
-stringified (the ephemeral port is dropped, so it survives reconnects), and
-is replaced with a more specific one — a bind DN — only once that DN is
-confirmed, not merely claimed.
+stringified (the ephemeral port is dropped, so it survives reconnects) and
+prefixed `ip:` (`Identity::from_peer_addr`), and is replaced with a more
+specific one — a bind DN, prefixed `dn:` (`Identity::from_bind_dn`) — only
+once that DN is confirmed, not merely claimed. The two prefixes are
+disjoint by construction, so a DN crafted to read identically to some
+peer's IP-address string (e.g. a bind DN of literally `127.0.0.1`) can
+never land in the same `ThresholdPolicy` history bucket as that peer —
+they produce `dn:127.0.0.1` and `ip:127.0.0.1` respectively, which are
+different `Identity` values.
 
 This confirmation is what [`BindState`](src/proxy.rs) exists for. Two
 relay directions run concurrently per connection (`tokio::select!` in
@@ -486,8 +492,7 @@ successfully). A `ThresholdScope::Global` policy entry (see
 [Policy: blast-radius thresholding](#policy-blast-radius-thresholding))
 is the backstop for that: a shared ceiling identity churn can't reset,
 regardless of how many identities are involved. Unbounded growth of the
-`Identity`-keyed history map itself, and namespace collisions between
-IP-derived and DN-derived identity strings, remain open — see TODO.md.
+`Identity`-keyed history map itself remains open — see TODO.md.
 
 ## Audit logging
 
@@ -719,8 +724,7 @@ Adding another listener/upstream pair is likewise config-only — another
   certificate. A caller can still churn through an unbounded number of
   distinct DNs (each gets its own fresh `PerIdentity` budget); a
   `ThresholdScope::Global` backstop bounds the aggregate regardless, but
-  nothing yet bounds the `Identity`-keyed history map's cardinality or
-  namespaces IP-derived identities apart from DN-derived ones — see
+  nothing yet bounds the `Identity`-keyed history map's cardinality — see
   TODO.md.
 - Every `[[proxy]]` entry hardcodes `LdapConnector` as its connector; the
   config-driven path (as opposed to `ProxyBuilder`, used directly) can front

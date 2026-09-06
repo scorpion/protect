@@ -58,7 +58,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
       `Global` backstop's aggregate ceiling, not a per-caller one. Unbounded
       history-map cardinality and the IP/DN identity-namespace collision
       remain open — see the following two items.
-- [ ] **Identity namespace collision between peer-IP and bind-DN
+- [x] **Identity namespace collision between peer-IP and bind-DN
       derivation.** [`Identity`](src/core/identity.rs) is one flat,
       un-namespaced string used both for `Identity::from_peer_addr`
       (`"10.0.0.5"`) and for a bind DN
@@ -69,6 +69,16 @@ priority; within a group, roughly in the order you'd want to tackle them.
       touching that peer's actual connection. Fix direction: prefix/tag
       identity values by their source (`ip:`/`dn:`) so the two derivation
       methods can never collide.
+      Fixed: `Identity::from_peer_addr` now formats as `ip:<addr>` and a
+      new `Identity::from_bind_dn` (used by the confirmed-bind promotion
+      path in `src/proxy.rs`, replacing a bare `Identity(dn)` construction)
+      formats as `dn:<dn>` — the two prefixes are disjoint by construction,
+      so a DN crafted to read identically to some peer's IP-address string
+      (e.g. a bind DN of literally `127.0.0.1`) now produces `dn:127.0.0.1`,
+      never colliding with that peer's `ip:127.0.0.1` bucket in
+      `ThresholdPolicy`'s history map. See the
+      `peer_ip_and_bind_dn_never_collide_even_with_matching_text` test in
+      `src/core/identity.rs`.
 - [ ] **Unbounded identity cardinality enables unauthenticated memory/disk
       exhaustion.** Every actionable request — even one immediately
       blocked by the window check — creates a permanent entry in

@@ -393,7 +393,7 @@ fn resolve_pending_bind(
         return Ok(());
     };
     if success {
-        *bind_state.identity.lock().unwrap() = Identity(dn);
+        *bind_state.identity.lock().unwrap() = Identity::from_bind_dn(dn);
     }
     Ok(())
 }
