@@ -34,6 +34,23 @@ type Result<T> = std::result::Result<T, ConfigError>;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub proxy: Vec<ProxyConfig>,
+    /// Present to serve a Prometheus `/metrics` endpoint for the whole
+    /// process — one endpoint covering every `[[proxy]]` entry's
+    /// connections/decisions/latency, not one per entry, since they share
+    /// one process-wide metrics recorder. Absent by default (opt-in, like
+    /// `state_db`): a deployment that doesn't scrape Prometheus shouldn't
+    /// pay for a listening socket it never uses.
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Address the Prometheus text-format `/metrics` endpoint listens on.
+    /// Typically bound to localhost or a private network, not the same
+    /// address directory traffic arrives on — nothing here authenticates
+    /// scrape requests.
+    pub listen_addr: SocketAddr,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -369,6 +386,46 @@ mod tests {
         assert_eq!(
             listen_tls.client_ca_file,
             Some(PathBuf::from("certs/agent-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn metrics_endpoint_is_absent_by_default() {
+        let config: Config = toml::from_str(
+            r#"
+            [[proxy]]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addr = "127.0.0.1:389"
+
+            [proxy.policy]
+            file = "policies/ldap.toml"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.metrics.is_none());
+    }
+
+    #[test]
+    fn parses_metrics_endpoint() {
+        let config: Config = toml::from_str(
+            r#"
+            [[proxy]]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addr = "127.0.0.1:389"
+
+            [proxy.policy]
+            file = "policies/ldap.toml"
+
+            [metrics]
+            listen_addr = "127.0.0.1:9090"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.metrics.unwrap().listen_addr.to_string(),
+            "127.0.0.1:9090"
         );
     }
 

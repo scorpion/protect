@@ -88,3 +88,11 @@ file = "policies/ldap.toml"
 #
 # [proxy.policy]
 # file = "policies/other.toml"
+
+# Uncomment to serve a Prometheus text-format /metrics endpoint for the
+# whole process (connection counts, allow/block rates, upstream connect
+# latency, TLS handshake failures) — one endpoint covering every [[proxy]]
+# entry above, not one per entry. Bind it to localhost or a private network:
+# nothing here authenticates scrape requests.
+# [metrics]
+# listen_addr = "127.0.0.1:9090"

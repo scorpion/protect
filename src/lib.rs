@@ -213,6 +213,10 @@ async fn reload_policies_on_signal(
 /// entry's fatal error brings down the whole process rather than leaving the
 /// others silently orphaned.
 pub async fn run_with_config(config: &config::Config) -> Result<()> {
+    if let Some(metrics) = &config.metrics {
+        core::metrics::install_prometheus_exporter(metrics.listen_addr)?;
+    }
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let mut builders = Vec::with_capacity(config.proxy.len());

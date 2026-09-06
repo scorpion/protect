@@ -233,10 +233,28 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## Medium — observability & operations
 
-- [ ] **No metrics.** Only `tracing` logs exist
+- [x] **No metrics.** Only `tracing` logs exist
       ([`audit::log_decision`](src/core/audit.rs)); there's no
       Prometheus/OpenTelemetry counters for allow/block rates, active
-      connections, upstream latency, or TLS handshake failures.
+      connections, upstream latency, or TLS handshake failures. Fixed:
+      [`core::metrics`](src/core/metrics.rs) records exactly those four
+      things through the `metrics` facade crate (a no-op until a recorder
+      is installed, so `ProxyBuilder` embedders pay nothing unless they opt
+      in) — `ai_protect_connections_active`/`_total` via a `ConnectionGuard`
+      tied to each connection's task lifetime, `ai_protect_policy_decisions_total`
+      (labeled `decision`/`backend`/`operation`) recorded alongside
+      `audit::log_decision`, `ai_protect_upstream_connect_duration_seconds`
+      timing `Connector::connect_upstream` (connection setup, not a
+      per-request round trip — the relay doesn't correlate individual
+      request/response frames), and `ai_protect_tls_handshake_failures_total`
+      (labeled `hop`: `listen`/`listen_starttls`/`upstream`) covering all
+      three handshake points on either side of the proxy.
+      `run_with_config` installs a Prometheus text-format `/metrics`
+      listener via `core::metrics::install_prometheus_exporter` when the
+      new top-level `[metrics]` table (`listen_addr`) is present in
+      `config.toml` — one process-wide endpoint, opt-in, covering every
+      `[[proxy]]` entry. See "Metrics" in
+      [ARCHITECTURE.md](ARCHITECTURE.md#metrics).
 - [ ] **No structured log output option.** `tracing_subscriber::fmt::init()`
       in [`main.rs`](src/main.rs) emits human-readable text only; a JSON
       formatter option would make shipping to a SIEM much less painful, and

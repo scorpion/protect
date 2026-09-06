@@ -161,6 +161,25 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   (`Connector::bind_identity`).
 - [src/core/audit.rs](src/core/audit.rs) — structured `tracing` logging of every policy
   decision (allow or block), independent of the policy logic itself.
+- [src/core/metrics.rs](src/core/metrics.rs) — Prometheus metrics, recorded
+  through the `metrics` facade crate so call sites (`proxy.rs`,
+  `connector/ldap.rs`) don't need to know whether a recorder is installed —
+  every recording function is a documented no-op without one, which is what
+  lets `ProxyBuilder` embedders skip metrics entirely. Covers connection
+  counts (`ai_protect_connections_active`/`_total`, via a
+  `ConnectionGuard` opened per accepted connection and dropped when it
+  ends), policy allow/block rate (`ai_protect_policy_decisions_total`,
+  labeled by decision/backend/operation — the aggregate counterpart to
+  `audit::log_decision`'s per-event record), upstream connect latency
+  (`ai_protect_upstream_connect_duration_seconds` — timing
+  `Connector::connect_upstream` itself, not a per-request round trip, since
+  the relay doesn't correlate individual request/response frames), and TLS
+  handshake failures (`ai_protect_tls_handshake_failures_total`, labeled by
+  which of the three handshake points — `listen`, `listen_starttls`,
+  `upstream` — failed). `install_prometheus_exporter` is the one concrete
+  recorder `run_with_config` installs, serving Prometheus text format over
+  plain HTTP on `[metrics].listen_addr` when that table is present in
+  `config.toml`.
 
 ## Architecture notes worth knowing before changing things
 
@@ -210,6 +229,9 @@ in `src/lib.rs` cover different amounts of "load this from a file":
   [ARCHITECTURE.md "Graceful shutdown"](ARCHITECTURE.md#graceful-shutdown)),
   and a `SIGHUP` handler that re-reads every entry's policy file in place —
   see [ARCHITECTURE.md "Config hot-reload"](ARCHITECTURE.md#config-hot-reload).
+  Also installs the Prometheus exporter (`core::metrics::install_prometheus_exporter`)
+  when the config's top-level `[metrics]` table is present — one endpoint for
+  the whole process, covering every `[[proxy]]` entry.
 - `builder::ProxyBuilder` — fully programmatic: give it an `Arc<dyn
   Connector>` and a `Vec<Arc<dyn Policy>>` you built yourself (e.g.
   `LdapConnector::new(...)` and `ThresholdPolicy::new(...)`), no file I/O

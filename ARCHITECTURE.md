@@ -460,9 +460,64 @@ is the system's forensic trail: everything a policy blocked, and why, is
 recoverable from logs even though the process holds no persistent state
 beyond the in-memory threshold window.
 
+## Metrics
+
+[`core::metrics`](src/core/metrics.rs) records aggregate counters/gauges/
+histograms through the [`metrics`](https://docs.rs/metrics) facade crate,
+alongside — not instead of — the per-event audit trail above: audit answers
+"what happened and why," metrics answer "how much, how often, how long."
+Every recording call (`ConnectionGuard::open`, `record_decision`,
+`record_upstream_connect`, `record_tls_handshake_failure`) is a documented
+no-op until a recorder is installed, so instrumented call sites in
+`proxy.rs` and `connector/ldap.rs` don't need to know or care whether one
+is — an embedder using `ProxyBuilder` directly pays nothing for this unless
+it installs a recorder itself.
+
+`ai_protect::run_with_config` is the one caller that installs one:
+`core::metrics::install_prometheus_exporter`, wired up when the config's
+top-level `[metrics]` table is present (see
+[Configuration](#configuration)), starts a Prometheus text-format HTTP
+listener on `[metrics].listen_addr`, scraped like any other Prometheus
+target. It's process-wide, not per `[[proxy]]` entry — every entry shares
+one metrics recorder and one `/metrics` endpoint, since `metrics`'s
+recorder is itself a process-global singleton (`install` can only succeed
+once per process; a second call returns
+`BuildError::FailedToSetGlobalRecorder` instead of panicking).
+
+Four things are tracked:
+
+- **Connections** — `ai_protect_connections_active` (gauge) and
+  `ai_protect_connections_total` (counter), via a `ConnectionGuard` opened
+  when `proxy::serve` spawns a connection's task and dropped when that task
+  ends, however it ends (clean finish, error, or shutdown's forced abort) —
+  a `Drop` impl rather than an explicit decrement at every return point, so
+  the gauge can't drift out of sync with reality.
+- **Policy decisions** — `ai_protect_policy_decisions_total`, labeled by
+  `decision` (`allow`/`block`), `backend`, and `operation`. Recorded
+  alongside `audit::log_decision` at the same call site in
+  `proxy::handle_client_frame`, as the aggregate counterpart to audit's
+  per-event record.
+- **Upstream connect latency** — `ai_protect_upstream_connect_duration_seconds`
+  (histogram), timing `Connector::connect_upstream` itself (TCP dial plus,
+  when configured, its TLS/StartTLS handshake). This is connection *setup*
+  latency, not a per-request round trip: the relay loop forwards both
+  directions concurrently without correlating individual request/response
+  frames by LDAP message ID (see [Request lifecycle](#request-lifecycle)),
+  so there's no existing seam to time an individual request against its
+  response without decoding every frame just to do so — connection setup is
+  the one discrete, already-measured step available cheaply.
+- **TLS handshake failures** — `ai_protect_tls_handshake_failures_total`,
+  labeled `hop` — `listen` (implicit TLS on `[proxy.listen_tls]`),
+  `listen_starttls` (the client-facing StartTLS upgrade in
+  `proxy::maybe_upgrade_to_tls`), or `upstream` (implicit or StartTLS TLS to
+  the real directory, in `LdapConnector::connect_upstream`) — covering all
+  three points a handshake can happen on either hop (see
+  [Transport](#transport-plaintext-or-tls)).
+
 ## Configuration
 
-Two kinds of TOML file, deliberately kept separate:
+Two kinds of TOML file, deliberately kept separate, plus one optional
+top-level table:
 
 - [`Config`](src/config.rs) (`config.toml`, template in
   `config.example.toml`) — process-level settings: an array of `[[proxy]]`
@@ -489,6 +544,11 @@ Two kinds of TOML file, deliberately kept separate:
   Policy>>`. The only type today is `"threshold"`, deserializing straight
   into [`ThresholdConfig`](src/core/policy/threshold.rs) (durations are plain
   `window_secs` integers, since TOML has no native duration type).
+- Optional top-level `[metrics]` table in `config.toml` (not per `[[proxy]]`
+  entry — see [Metrics](#metrics)): just `listen_addr`, the address the
+  Prometheus `/metrics` endpoint listens on. Absent by default; a
+  deployment that doesn't scrape Prometheus doesn't get a listening socket
+  it never uses.
 
 This split exists because policy files are one-per-connector/backend and may
 encode deployment-specific thresholds or naming that shouldn't live in the

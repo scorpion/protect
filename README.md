@@ -16,8 +16,8 @@ can independently run plaintext LDAP or LDAPS.
 > **Status:** early. TOML-based config and policy files, TLS on both hops
 > (including optional mutual TLS and RFC 4511 StartTLS), bounded concurrent
 > connections with per-I/O timeouts, graceful shutdown on SIGTERM/SIGINT,
-> policy-file hot-reload on SIGHUP, a unit + end-to-end test suite, and CI
-> all exist. See
+> policy-file hot-reload on SIGHUP, Prometheus metrics, a unit + end-to-end
+> test suite, and CI all exist. See
 > [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and
 > [TODO.md](TODO.md) for the gap list to a production-ready deployment.
 
@@ -94,6 +94,12 @@ cp policies/ldap.example.toml policies/ldap.toml
 Both files are gitignored (see [.gitignore](.gitignore)); `ai-protect`
 fails fast with a message pointing at the matching example file if either
 is missing.
+
+Optionally, add a top-level `[metrics]` table to `config.toml` (commented
+out in the example) to serve Prometheus metrics — connection counts,
+policy allow/block rates, upstream connect latency, and TLS handshake
+failures — over plain HTTP at `/metrics` on `listen_addr`. One endpoint
+covers every `[[proxy]]` entry; absent by default.
 
 ## Running
 

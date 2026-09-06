@@ -18,6 +18,8 @@ pub enum Error {
     Tls(#[from] crate::core::tls::TlsError),
     #[error(transparent)]
     Proxy(#[from] crate::proxy::ProxyError),
+    #[error(transparent)]
+    Metrics(#[from] metrics_exporter_prometheus::BuildError),
     #[error("proxy builder requires a connector before serving")]
     MissingConnector,
 }

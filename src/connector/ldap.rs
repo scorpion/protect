@@ -118,7 +118,11 @@ impl LdapConnector {
         if self.upstream_starttls {
             negotiate_starttls(&mut tcp).await?;
         }
-        Ok(MaybeTlsStream::Tls(tls.connect(tcp).await?))
+        let connected = tls.connect(tcp).await;
+        if connected.is_err() {
+            crate::core::metrics::record_tls_handshake_failure("upstream");
+        }
+        Ok(MaybeTlsStream::Tls(connected?))
     }
 
     /// Recognizes an RFC 4511 StartTLS extended request and builds the

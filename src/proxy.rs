@@ -165,6 +165,7 @@ pub async fn serve(
 
         connections.spawn(async move {
             let _permit = permit;
+            let _connection_guard = crate::core::metrics::ConnectionGuard::open();
             let result = async {
                 // LDAP is request/response with lots of small frames; without
                 // this, Nagle's algorithm plus delayed ACKs can add tens of
@@ -175,8 +176,14 @@ pub async fn serve(
                 let client_stream = match &listen_tls {
                     None => MaybeTlsStream::Plain(client_stream),
                     Some(tls) => MaybeTlsStream::Tls(
-                        with_timeout(io_timeout, async { Ok(tls.accept(client_stream).await?) })
-                            .await?,
+                        with_timeout(io_timeout, async {
+                            let accepted = tls.accept(client_stream).await;
+                            if accepted.is_err() {
+                                crate::core::metrics::record_tls_handshake_failure("listen");
+                            }
+                            Ok(accepted?)
+                        })
+                        .await?,
                     ),
                 };
                 handle_connection(
@@ -248,8 +255,14 @@ async fn maybe_upgrade_to_tls(
     match connector.upgrade_request(&frame)? {
         Some(response) => {
             with_timeout(io_timeout, async { Ok(tcp.write_all(&response).await?) }).await?;
-            let tls_stream =
-                with_timeout(io_timeout, async { Ok(starttls.accept(tcp).await?) }).await?;
+            let tls_stream = with_timeout(io_timeout, async {
+                let accepted = starttls.accept(tcp).await;
+                if accepted.is_err() {
+                    crate::core::metrics::record_tls_handshake_failure("listen_starttls");
+                }
+                Ok(accepted?)
+            })
+            .await?;
             Ok((MaybeTlsStream::Tls(tls_stream), None))
         }
         None => Ok((MaybeTlsStream::Plain(tcp), Some(frame))),
@@ -267,7 +280,9 @@ async fn handle_connection(
     let (client_stream, first_client_frame) =
         maybe_upgrade_to_tls(client_stream, &listen_starttls, &connector, io_timeout).await?;
 
+    let connect_started = std::time::Instant::now();
     let upstream_stream = with_timeout(io_timeout, connector.connect_upstream()).await?;
+    crate::core::metrics::record_upstream_connect(connect_started.elapsed());
     // Starting identity, in place until (and unless) a simple LDAP bind names
     // a DN — see `ClientRelayContext`/`handle_client_frame`.
     let identity = Identity::from_peer_addr(peer_addr);
@@ -390,6 +405,7 @@ async fn handle_client_frame(
     };
     let decision = evaluate_all(ctx.policies, &action, &policy_ctx);
     crate::core::audit::log_decision(identity, &action, &decision);
+    crate::core::metrics::record_decision(&action, &decision);
 
     match decision {
         Decision::Allow => {
