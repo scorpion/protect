@@ -122,7 +122,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## High
 
-- [ ] **No TLS support for the Valkey-backed HA state store.**
+- [x] **No TLS support for the Valkey-backed HA state store.**
       [`Cargo.toml`](Cargo.toml)'s `redis` dependency
       (`features = ["tokio-comp", "connection-manager"]`) enables no
       `tls-*` feature, and no TLS-capable crate appears anywhere in
@@ -138,6 +138,26 @@ priority; within a group, roughly in the order you'd want to tackle them.
       direction: enable a `tls-*` feature on the `redis` dependency, thread
       an optional CA/cert config through `ValkeyStateDbConfig`, and
       document the `rediss://` scheme.
+      Fixed: `Cargo.toml`'s `redis` dependency gained the
+      `tokio-rustls-comp` feature (pulls in `tls-rustls`, unifying with the
+      `rustls`/`tokio-rustls` versions this crate already depends on for
+      LDAPS). `ValkeyStateDbConfig` gained optional `ca_file` and
+      `client_cert` (`{ cert_file, key_file }`) fields, mirroring
+      `UpstreamTlsConfig`'s shape for the same two cases (internal CA,
+      mutual TLS). A new [`ValkeyTlsConfig`](src/core/policy/store/valkey.rs)
+      carries these into `ValkeyStore::open`, which now installs the
+      process-wide `rustls` crypto provider
+      (`core::tls::ensure_crypto_provider`, exposed `pub(crate)` for this)
+      before building a client — via plain `redis::Client::open` when no
+      CA/cert override is set (a `rediss://` URL still works, validated
+      against the OS trust store, exactly like an `upstream_tls` LDAPS hop
+      with no `ca_file`), or `redis::Client::build_with_tls` when one is.
+      Documented in ARCHITECTURE.md's "Valkey-backed policy state" section
+      and `policies/ldap.example.toml`. See
+      `parses_state_db_valkey_tls_config` in
+      `src/core/policy/threshold.rs` and
+      `open_rejects_a_client_cert_without_a_matching_key` in
+      `src/core/policy/store/valkey.rs`.
 
 ## Medium
 

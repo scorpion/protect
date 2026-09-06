@@ -91,8 +91,11 @@ type Result<T> = std::result::Result<T, TlsError>;
 
 /// rustls 0.23 requires a process-wide default crypto provider before any
 /// `ClientConfig`/`ServerConfig` can be built. Installing twice (e.g. across
-/// tests in the same process) is harmless, so callers just ignore the result.
-fn ensure_crypto_provider() {
+/// tests in the same process) is harmless, so callers just ignore the
+/// result. `pub(crate)` because `ValkeyStore` (a `rediss://`-capable
+/// `HistoryStore`) also builds a `rustls` TLS config and needs this even
+/// when neither LDAP hop in the same process uses TLS at all.
+pub(crate) fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 

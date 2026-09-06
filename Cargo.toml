@@ -10,7 +10,7 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 rasn = "0.28.14"
 rasn-ldap = "0.28.14"
-redis = { version = "1.7.0", default-features = false, features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.7.0", default-features = false, features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 # `tls12` kept deliberately: Active Directory (a target directory) only
 # gained TLS 1.3 for LDAPS in Windows Server 2022, so many real deployments

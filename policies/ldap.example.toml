@@ -49,6 +49,14 @@ window_secs = 60
 # [policy.state_db]
 # url = "redis://127.0.0.1:6379"
 # key_prefix = "ai_protect:threshold"
+#
+# Use a rediss:// URL instead to encrypt this hop. With no further config,
+# the server's certificate is validated against the OS trust store. For an
+# internal CA and/or mutual TLS, add:
+# ca_file = "certs/valkey-ca.pem"
+# [policy.state_db.client_cert]
+# cert_file = "certs/ai-protect-client.pem"
+# key_file = "certs/ai-protect-client.key"
 
 # Recommended: a second threshold entry with scope = "global", run as a
 # backstop alongside the per-identity one above. A per-identity budget

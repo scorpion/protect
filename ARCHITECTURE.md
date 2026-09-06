@@ -445,6 +445,22 @@ cross-instance sync. The failure mode is otherwise the same as SQLite's:
 an invalid URL (the one failure `open` can detect synchronously) logs a
 warning and falls back to pure in-memory behavior.
 
+Using a `rediss://` (rather than `redis://`) URL encrypts this hop —
+the `redis` crate is built with its `tokio-rustls-comp` feature
+specifically so that scheme works. With no further config, the server's
+certificate is validated against the OS trust store, same as an
+`upstream_tls` LDAPS hop with no `ca_file` set. `ValkeyStateDbConfig`'s
+optional `ca_file` (an internal CA) and `client_cert` (mutual TLS,
+`{ cert_file, key_file }`, both required together) cover the same two
+cases `UpstreamTlsConfig` does for LDAPS — see
+[`ValkeyTlsConfig`](src/core/policy/store/valkey.rs), which
+`ValkeyStore::open` uses to switch from the plain `redis::Client::open`
+path to `redis::Client::build_with_tls` once either is set. Either way,
+`open` first installs the process-wide `rustls` crypto provider rustls
+0.23 requires (`core::tls::ensure_crypto_provider`) — needed here
+independently of whether either LDAP hop uses TLS at all, since this may
+be the only TLS-using code path in the process.
+
 ## Identity
 
 [`Identity`](src/core/identity.rs) is an opaque wrapper around a string

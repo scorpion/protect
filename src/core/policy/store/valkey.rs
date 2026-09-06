@@ -14,13 +14,37 @@
 //! sets it actually holds.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::Context;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use tokio::sync::Mutex;
 
+use crate::core::tls::ensure_crypto_provider;
+
 use super::HistoryStore;
+
+/// Optional TLS settings for a `rediss://` `ValkeyStateDbConfig`. All-`None`
+/// (the default) still works for a `rediss://` URL — `redis::Client::open`
+/// validates the server's certificate against the OS trust store in that
+/// case, the same as `SqliteStore`'s deployment needs no extra config for
+/// the common case. These fields exist for the two cases that do: an
+/// internal CA (`ca_file`) or a Valkey/Redis server requiring mutual TLS
+/// (`client_cert_file`/`client_key_file`, both required together).
+#[derive(Debug, Clone, Default)]
+pub struct ValkeyTlsConfig {
+    pub ca_file: Option<PathBuf>,
+    pub client_cert_file: Option<PathBuf>,
+    pub client_key_file: Option<PathBuf>,
+}
+
+impl ValkeyTlsConfig {
+    fn is_default(&self) -> bool {
+        self.ca_file.is_none() && self.client_cert_file.is_none() && self.client_key_file.is_none()
+    }
+}
 
 pub struct ValkeyStore {
     client: redis::Client,
@@ -35,7 +59,8 @@ pub struct ValkeyStore {
 }
 
 impl ValkeyStore {
-    /// Parses `url` (e.g. `redis://valkey:6379/0`) but doesn't connect —
+    /// Parses `url` (e.g. `redis://valkey:6379/0` or, for an encrypted
+    /// connection, `rediss://valkey:6379/0`) but doesn't connect —
     /// connecting is async, and this is called from `ThresholdPolicy::new`,
     /// a synchronous constructor with no executor requirement. The first
     /// `sync` call connects lazily (see `connection`).
@@ -46,8 +71,56 @@ impl ValkeyStore {
     /// `state_db` pointed at Valkey, and it catches up within one
     /// `flush_interval` via the same background task that later performs
     /// cross-instance sync.
-    pub fn open(url: &str, key_prefix: String) -> redis::RedisResult<Self> {
-        let client = redis::Client::open(url)?;
+    ///
+    /// `tls` is ignored for a plain `redis://` URL. For `rediss://`, an
+    /// all-default `tls` builds a client the same way `redis::Client::open`
+    /// always has (system trust store, no client certificate); a non-default
+    /// `tls` instead builds one via `redis::Client::build_with_tls` with the
+    /// given CA and/or client certificate — see [`ValkeyTlsConfig`]. Either
+    /// way, this installs the process-wide `rustls` crypto provider
+    /// `rediss://` needs (see `ensure_crypto_provider`), since this may be
+    /// the only TLS-using code path in a process whose LDAP hops are both
+    /// plaintext.
+    pub fn open(url: &str, key_prefix: String, tls: ValkeyTlsConfig) -> anyhow::Result<Self> {
+        ensure_crypto_provider();
+
+        let client = if tls.is_default() {
+            redis::Client::open(url).context("parsing Valkey/Redis state_db URL")?
+        } else {
+            let root_cert = tls
+                .ca_file
+                .map(|path| {
+                    std::fs::read(&path)
+                        .with_context(|| format!("reading Valkey TLS ca_file {}", path.display()))
+                })
+                .transpose()?;
+            let client_tls = match (tls.client_cert_file, tls.client_key_file) {
+                (Some(cert_path), Some(key_path)) => Some(redis::ClientTlsConfig {
+                    client_cert: std::fs::read(&cert_path).with_context(|| {
+                        format!(
+                            "reading Valkey TLS client_cert file {}",
+                            cert_path.display()
+                        )
+                    })?,
+                    client_key: std::fs::read(&key_path).with_context(|| {
+                        format!("reading Valkey TLS client_key file {}", key_path.display())
+                    })?,
+                }),
+                (None, None) => None,
+                _ => anyhow::bail!(
+                    "Valkey state_db TLS config: client_cert_file and client_key_file must be set together"
+                ),
+            };
+            redis::Client::build_with_tls(
+                url,
+                redis::TlsCertificates {
+                    client_tls,
+                    root_cert,
+                },
+            )
+            .context("building TLS-enabled Valkey/Redis client")?
+        };
+
         Ok(Self {
             client,
             key_prefix,
@@ -168,14 +241,38 @@ mod tests {
 
     #[test]
     fn open_rejects_an_invalid_url_without_connecting() {
-        assert!(ValkeyStore::open("not-a-url", "ai_protect".into()).is_err());
+        assert!(
+            ValkeyStore::open("not-a-url", "ai_protect".into(), ValkeyTlsConfig::default())
+                .is_err()
+        );
     }
 
     #[test]
     fn history_key_is_namespaced_by_prefix_and_identity() {
-        let store = ValkeyStore::open("redis://127.0.0.1:6379", "ai_protect".into()).unwrap();
+        let store = ValkeyStore::open(
+            "redis://127.0.0.1:6379",
+            "ai_protect".into(),
+            ValkeyTlsConfig::default(),
+        )
+        .unwrap();
 
         assert_eq!(store.history_key("alice"), "ai_protect:history:alice");
+    }
+
+    #[test]
+    fn open_rejects_a_client_cert_without_a_matching_key() {
+        let tls = ValkeyTlsConfig {
+            ca_file: None,
+            client_cert_file: Some("cert.pem".into()),
+            client_key_file: None,
+        };
+
+        let result = ValkeyStore::open("rediss://127.0.0.1:6379", "ai_protect".into(), tls);
+        let Err(err) = result else {
+            panic!("expected an error");
+        };
+
+        assert!(err.to_string().contains("must be set together"));
     }
 
     // The tests below exercise `sync` against a real Valkey/Redis server and
@@ -196,7 +293,7 @@ mod tests {
             return;
         };
         let key_prefix = format!("ai_protect_test:{}", unique_test_suffix());
-        let store = ValkeyStore::open(&url, key_prefix).unwrap();
+        let store = ValkeyStore::open(&url, key_prefix, ValkeyTlsConfig::default()).unwrap();
 
         let rows = store
             .sync(
@@ -223,8 +320,9 @@ mod tests {
             return;
         };
         let key_prefix = format!("ai_protect_test:{}", unique_test_suffix());
-        let instance_a = ValkeyStore::open(&url, key_prefix.clone()).unwrap();
-        let instance_b = ValkeyStore::open(&url, key_prefix).unwrap();
+        let instance_a =
+            ValkeyStore::open(&url, key_prefix.clone(), ValkeyTlsConfig::default()).unwrap();
+        let instance_b = ValkeyStore::open(&url, key_prefix, ValkeyTlsConfig::default()).unwrap();
 
         instance_a
             .sync(&[("alice".to_string(), 1_000)], 0)

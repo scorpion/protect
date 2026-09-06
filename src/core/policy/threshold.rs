@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer};
 use crate::core::action::Action;
 use crate::core::identity::Identity;
 
-use super::store::{Anchor, HistoryStore, SqliteStore, ValkeyStore};
+use super::store::{Anchor, HistoryStore, SqliteStore, ValkeyStore, ValkeyTlsConfig};
 use super::{Decision, Policy, PolicyContext};
 
 /// Where `ThresholdPolicy` persists/shares its sliding-window history.
@@ -25,6 +25,11 @@ pub enum StateDbConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValkeyStateDbConfig {
+    /// Use a `rediss://` (rather than `redis://`) URL to encrypt this hop —
+    /// see `ca_file`/`client_cert` below for options beyond trusting the OS
+    /// certificate store. A `rediss://` URL with neither set still works,
+    /// exactly like connecting to LDAPS with no `upstream_tls.ca_file`
+    /// configured.
     pub url: String,
     /// Namespaces this policy's keys so multiple `ThresholdPolicy`s (or an
     /// unrelated application) can share one Valkey instance without their
@@ -33,6 +38,26 @@ pub struct ValkeyStateDbConfig {
     /// as with two policies pointed at the same SQLite file.
     #[serde(default = "default_valkey_key_prefix")]
     pub key_prefix: String,
+    /// PEM-encoded CA certificate(s) to trust instead of the OS trust store.
+    /// Needed when the Valkey/Redis server's certificate is signed by an
+    /// internal/enterprise CA. Ignored for a plain `redis://` URL.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Client certificate ai-protect presents to Valkey/Redis. Needed when
+    /// the server requires mutual TLS on this hop. Ignored for a plain
+    /// `redis://` URL.
+    #[serde(default)]
+    pub client_cert: Option<ValkeyClientCertConfig>,
+}
+
+/// A certificate/key pair `ValkeyStateDbConfig` presents for mutual TLS —
+/// the same shape as `config::ClientCertConfig` for the upstream LDAPS hop,
+/// but a separate type since policy config (this file) and process config
+/// (`src/config.rs`) are deliberately independent modules (see CLAUDE.md).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValkeyClientCertConfig {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
 }
 
 fn default_valkey_key_prefix() -> String {
@@ -203,7 +228,12 @@ impl ThresholdPolicy {
                 }
             },
             Some(StateDbConfig::Valkey(valkey)) => {
-                match ValkeyStore::open(&valkey.url, valkey.key_prefix.clone()) {
+                let tls = ValkeyTlsConfig {
+                    ca_file: valkey.ca_file.clone(),
+                    client_cert_file: valkey.client_cert.as_ref().map(|c| c.cert_file.clone()),
+                    client_key_file: valkey.client_cert.as_ref().map(|c| c.key_file.clone()),
+                };
+                match ValkeyStore::open(&valkey.url, valkey.key_prefix.clone(), tls) {
                     Ok(store) => Some(PersistentState {
                         store: Arc::new(store),
                         pending: Mutex::new(Vec::new()),
@@ -495,6 +525,43 @@ mod tests {
             Some(StateDbConfig::Valkey(valkey)) => {
                 assert_eq!(valkey.url, "redis://valkey:6379");
                 assert_eq!(valkey.key_prefix, "ai_protect:threshold");
+                assert!(valkey.ca_file.is_none());
+                assert!(valkey.client_cert.is_none());
+            }
+            other => panic!("expected a Valkey state_db, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_state_db_valkey_tls_config() {
+        let config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            [state_db]
+            url = "rediss://valkey:6379"
+            ca_file = "certs/valkey-ca.pem"
+            [state_db.client_cert]
+            cert_file = "certs/ai-protect-client.pem"
+            key_file = "certs/ai-protect-client.key"
+            "#,
+        )
+        .unwrap();
+
+        match config.state_db {
+            Some(StateDbConfig::Valkey(valkey)) => {
+                assert_eq!(valkey.url, "rediss://valkey:6379");
+                assert_eq!(valkey.ca_file, Some(PathBuf::from("certs/valkey-ca.pem")));
+                let client_cert = valkey.client_cert.unwrap();
+                assert_eq!(
+                    client_cert.cert_file,
+                    PathBuf::from("certs/ai-protect-client.pem")
+                );
+                assert_eq!(
+                    client_cert.key_file,
+                    PathBuf::from("certs/ai-protect-client.key")
+                );
             }
             other => panic!("expected a Valkey state_db, got {other:?}"),
         }
@@ -729,6 +796,8 @@ mod tests {
             state_db: Some(StateDbConfig::Valkey(ValkeyStateDbConfig {
                 url: "not-a-valid-url".into(),
                 key_prefix: "ai_protect_test".into(),
+                ca_file: None,
+                client_cert: None,
             })),
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
@@ -857,6 +926,8 @@ mod tests {
             state_db: Some(StateDbConfig::Valkey(ValkeyStateDbConfig {
                 url: url.clone(),
                 key_prefix: key_prefix.clone(),
+                ca_file: None,
+                client_cert: None,
             })),
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,

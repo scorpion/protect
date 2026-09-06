@@ -22,7 +22,7 @@ pub mod valkey;
 use std::collections::HashMap;
 
 pub use sqlite::SqliteStore;
-pub use valkey::ValkeyStore;
+pub use valkey::{ValkeyStore, ValkeyTlsConfig};
 
 /// A wall-clock-anchored snapshot of `Instant::now()` at the moment it was
 /// taken, letting `Instant` (monotonic, process-local) round-trip through a
