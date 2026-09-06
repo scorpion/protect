@@ -40,6 +40,10 @@ cargo clippy                    # lint
 ./test.sh                       # real end-to-end test: brings up dockerized lldap, runs the real
                                  # binary in front of it, drives it with ldapsearch/ldapmodify/
                                  # ldapwhoami/ldappasswd; requires docker, cargo, OpenLDAP client tools
+./soak.sh                       # load/soak test: same setup as test.sh, but sustained concurrent
+                                 # load against a release build while sampling RSS/fd count, plus a
+                                 # connection-limit burst; requires the same tools as test.sh + curl;
+                                 # not part of cargo test or CI, run manually (see README.md#loadsoak-testing)
 cargo +nightly fuzz run decode       # fuzz BER message decoding (LdapConnector::decode et al.)
 cargo +nightly fuzz run read_frame   # fuzz frame length parsing (read_frame)
                                  # both require a nightly toolchain + `cargo install cargo-fuzz`;

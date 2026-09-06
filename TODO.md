@@ -355,5 +355,22 @@ priority; within a group, roughly in the order you'd want to tackle them.
       manually via `cargo +nightly fuzz run decode` /
       `cargo +nightly fuzz run read_frame` after touching either target's
       code. See "Fuzzing" in [README.md](README.md#fuzzing).
-- [ ] **No load/soak testing** to validate behavior (memory, fd count,
+- [x] **No load/soak testing** to validate behavior (memory, fd count,
       latency) under many concurrent connections or sustained throughput.
+      Fixed: [`soak.sh`](soak.sh), following the same real-binary-over-the-
+      wire approach as `test.sh` rather than a synthetic benchmark. Phase A
+      runs a pool of concurrent workers (default 40) against a release
+      build for a sustained duration (default 20s), each opening a fresh
+      connection per operation (mostly searches, some modifies) to mirror
+      many short-lived clients rather than a few long ones, while sampling
+      the proxy's own RSS and open-fd count throughout; it then checks
+      memory didn't run away, every connection was cleaned up (fd count and
+      the `ai_protect_connections_active` metric both back at baseline/0
+      after load stops), and read latency stayed sane. Phase B bursts far
+      more concurrent connection attempts (default 300) than a deliberately
+      low `max_connections` cap to confirm the `Semaphore` rejects the
+      excess immediately rather than queuing/hanging, and that the proxy
+      recovers cleanly afterward. Requires the same tools as `test.sh`
+      (docker, cargo, OpenLDAP client tools) plus `curl` to scrape
+      `/metrics`; like fuzzing, it's a manual check, not wired into `cargo
+      test` or CI. See "Load/soak testing" in [README.md](README.md#loadsoak-testing).

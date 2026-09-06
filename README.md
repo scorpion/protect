@@ -196,6 +196,28 @@ Each runs indefinitely until stopped (`Ctrl-C`) or a crash is found (saved
 under `fuzz/artifacts/`); pass `-- -max_total_time=60` to bound a run, e.g.
 for a quick local check.
 
+## Load/soak testing
+
+[soak.sh](soak.sh) drives the real release binary the same way
+[test.sh](test.sh) does, but with many concurrent, sustained connections
+instead of a handful of correctness checks — the two things a unit/e2e
+suite can't catch: a memory or file-descriptor leak, or the connection
+Semaphore not actually shedding load. It runs a pool of concurrent workers
+against ai-protect for a sustained duration while sampling its RSS and
+open-fd count, then checks memory and fd count both settle back down and
+`ai_protect_connections_active` returns to `0` once load stops; then bursts
+far more concurrent connection attempts than a low `max_connections` cap to
+confirm the excess is rejected immediately instead of queued/hung. Requires
+the same tools as `test.sh` plus `curl`.
+
+```sh
+./soak.sh
+DURATION_SECS=60 CONCURRENCY=200 BURST_CONCURRENCY=1000 ./soak.sh   # heavier run
+```
+
+Not part of `cargo test` or CI — run manually, e.g. after touching
+`src/proxy.rs`, connection limits, or the metrics/health modules.
+
 ## Development
 
 ```sh
@@ -204,6 +226,7 @@ cargo fmt      # format
 cargo clippy   # lint
 cargo test     # unit + in-process integration tests
 ./test.sh      # real end-to-end test against a live LDAP server
+./soak.sh      # load/soak test against a live LDAP server
 ```
 
 CI ([.github/workflows/ci.yaml](.github/workflows/ci.yaml)) runs `cargo

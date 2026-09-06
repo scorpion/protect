@@ -319,6 +319,17 @@ part of `cargo test` or CI (fuzzing runs indefinitely by design), so run it
 manually after touching either of those two files. See "Fuzzing" in
 [README.md](README.md#fuzzing).
 
+[soak.sh](soak.sh) is a load/soak test: same real-binary-over-the-wire
+approach as `test.sh`, but a pool of concurrent workers sustaining load
+against a release build while sampling the proxy's own RSS/open-fd count
+(catching a leak or a connection that never gets cleaned up), plus a burst
+of far more concurrent connections than a low `max_connections` cap to
+confirm `ConnectionLimits`'s `Semaphore` sheds the excess immediately
+instead of queuing. Requires the same tools as `test.sh` plus `curl`; also
+not part of `cargo test`/CI — run manually after touching `src/proxy.rs`,
+connection limits, or `core::metrics`/`core::health`. See "Load/soak
+testing" in [README.md](README.md#loadsoak-testing).
+
 ## Conventions
 
 - Rust 2024 edition. The public setup/config surface (config/policy file
