@@ -303,9 +303,10 @@ in-memory state, and `proxy::serve`/`builder::ProxyBuilder` can be driven
 end-to-end over real (loopback) TCP/TLS connections, as their existing
 tests do.
 
-Run `cargo fmt` and `cargo clippy` before considering a change done; neither
-is currently wired into CI (there is no CI config in this repo yet), so
-they're on the honor system.
+Run `cargo fmt` and `cargo clippy` before considering a change done; both are
+also enforced in CI (`.github/workflows/ci.yaml`'s `lint` job), along with a
+`security_audit` job running `cargo audit` against the RustSec advisory
+database on every push/PR.
 
 ## Conventions
 

@@ -187,7 +187,9 @@ cargo test     # unit + in-process integration tests
 ```
 
 CI ([.github/workflows/ci.yaml](.github/workflows/ci.yaml)) runs `cargo
-build`/`cargo test` on stable, beta, and nightly for every push and PR.
+build`/`cargo test` on stable, beta, and nightly, `cargo fmt --check`/
+`cargo clippy -D warnings` on stable, and a `cargo audit` supply-chain scan
+against the RustSec advisory database — all on every push and PR.
 
 ## Documentation
 

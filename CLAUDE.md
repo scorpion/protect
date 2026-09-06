@@ -42,8 +42,7 @@ cargo clippy                    # lint
                                  # ldapwhoami/ldappasswd; requires docker, cargo, OpenLDAP client tools
 ```
 
-`cargo fmt`/`cargo clippy` are not wired into CI — run them before considering a change done anyway.
-CI ([.github/workflows/ci.yaml](.github/workflows/ci.yaml)) runs `cargo build`/`cargo test` on stable, beta, and nightly for every push and PR.
+CI ([.github/workflows/ci.yaml](.github/workflows/ci.yaml)) runs `cargo build`/`cargo test` on stable, beta, and nightly, `cargo fmt --check`/`cargo clippy -D warnings` on stable, and `cargo audit` (RustSec advisory scan) — all for every push and PR. Run `cargo fmt`/`cargo clippy` locally before considering a change done anyway, so CI doesn't catch it first.
 
 Local upstream for manual testing: `cp .env.example .env` (fill in secrets) then `docker compose up -d lldap`.
 

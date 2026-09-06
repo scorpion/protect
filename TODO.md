@@ -316,9 +316,19 @@ priority; within a group, roughly in the order you'd want to tackle them.
       bare-metal/VM rollouts and a Helm chart is only useful once there's a
       real k8s deployment shape (resource limits, probe wiring, secret
       mounting conventions) to template, which hasn't been decided yet.
-- [ ] **No CI pipeline** — no GitHub Actions (or equivalent) running
+- [x] **No CI pipeline** — no GitHub Actions (or equivalent) running
       `cargo test` / `cargo clippy` / `cargo fmt --check`, and no
       supply-chain scanning (`cargo audit` / `cargo deny`) on dependencies.
+      Fixed: [`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) gained
+      two jobs alongside the existing `build_and_test` matrix (stable/beta/
+      nightly `cargo build`+`cargo test`, unchanged) — `lint` (stable-only:
+      `cargo fmt --all -- --check` and `cargo clippy --all-targets
+      --all-features -- -D warnings`, so a warning fails the build the same
+      as a test failure) and `security_audit` (`cargo audit` via
+      `taiki-e/install-action@cargo-audit`, checking every dependency in
+      `Cargo.lock` against the RustSec advisory database). All three jobs
+      run on every push and PR; none require new repo permissions or
+      secrets beyond the default `GITHUB_TOKEN`.
 
 ## Low — cleanup & polish
 
