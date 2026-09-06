@@ -205,6 +205,8 @@ async fn handle_connection(
         maybe_upgrade_to_tls(client_stream, &listen_starttls, &connector, io_timeout).await?;
 
     let upstream_stream = with_timeout(io_timeout, connector.connect_upstream()).await?;
+    // Starting identity, in place until (and unless) a simple LDAP bind names
+    // a DN — see `ClientRelayContext`/`handle_client_frame`.
     let identity = Identity::from_peer_addr(peer_addr);
 
     let (client_read, client_write) = tokio::io::split(client_stream);
@@ -226,10 +228,10 @@ async fn handle_connection(
 
     let client_to_upstream = {
         let client_write = client_write.clone();
+        let mut identity = identity;
         let ctx = ClientRelayContext {
             connector: &connector,
             policies: &policies,
-            identity: &identity,
             io_timeout,
         };
         async move {
@@ -238,6 +240,7 @@ async fn handle_connection(
                 &mut upstream_write,
                 client_write,
                 first_client_frame,
+                &mut identity,
                 &ctx,
             )
             .await
@@ -268,11 +271,12 @@ async fn relay_upstream_responses(
 /// Groups the pieces `handle_client_frame` needs beyond the frame and I/O
 /// handles themselves, so it and `relay_client_requests` stay under
 /// clippy's argument-count lint instead of growing a parameter for every
-/// policy-evaluation dependency.
+/// policy-evaluation dependency. `identity` isn't here: unlike these fields,
+/// it can change mid-connection (a bind can replace it), so it's threaded
+/// through separately as `&mut Identity`.
 struct ClientRelayContext<'a> {
     connector: &'a Arc<dyn Connector>,
     policies: &'a [Arc<dyn Policy>],
-    identity: &'a Identity,
     io_timeout: Duration,
 }
 
@@ -281,16 +285,17 @@ async fn relay_client_requests(
     upstream_write: &mut (impl AsyncWrite + Unpin),
     client_write: Arc<Mutex<WriteHalf<ClientStream>>>,
     first_frame: Option<Vec<u8>>,
+    identity: &mut Identity,
     ctx: &ClientRelayContext<'_>,
 ) -> Result<()> {
     if let Some(frame) = first_frame {
-        handle_client_frame(frame, upstream_write, &client_write, ctx).await?;
+        handle_client_frame(frame, upstream_write, &client_write, identity, ctx).await?;
     }
 
     while let Some(frame) =
         with_timeout(ctx.io_timeout, ctx.connector.read_frame(client_read)).await?
     {
-        handle_client_frame(frame, upstream_write, &client_write, ctx).await?;
+        handle_client_frame(frame, upstream_write, &client_write, identity, ctx).await?;
     }
     Ok(())
 }
@@ -299,8 +304,17 @@ async fn handle_client_frame(
     frame: Vec<u8>,
     upstream_write: &mut (impl AsyncWrite + Unpin),
     client_write: &Arc<Mutex<WriteHalf<ClientStream>>>,
+    identity: &mut Identity,
     ctx: &ClientRelayContext<'_>,
 ) -> Result<()> {
+    // A successful simple bind ties this connection to a real,
+    // password-verified principal — a strictly more specific identity than
+    // the peer address it replaces, so later frames on this connection are
+    // policed and audited under the bind DN instead.
+    if let Some(dn) = ctx.connector.bind_identity(&frame)? {
+        *identity = Identity(dn);
+    }
+
     let Some(action) = ctx.connector.decode(&frame)? else {
         return with_timeout(ctx.io_timeout, async {
             Ok(upstream_write.write_all(&frame).await?)
@@ -309,10 +323,10 @@ async fn handle_client_frame(
     };
 
     let policy_ctx = PolicyContext {
-        identity: ctx.identity.clone(),
+        identity: identity.clone(),
     };
     let decision = evaluate_all(ctx.policies, &action, &policy_ctx);
-    crate::core::audit::log_decision(ctx.identity, &action, &decision);
+    crate::core::audit::log_decision(identity, &action, &decision);
 
     match decision {
         Decision::Allow => {
@@ -344,7 +358,8 @@ mod tests {
 
     use super::*;
     use crate::connector::ldap::test_support::{
-        decode_message, encode_message, extended_request_frame, modify_request_frame,
+        bind_request_frame, decode_message, encode_message, extended_request_frame,
+        modify_request_frame,
     };
     use crate::connector::ldap::{LdapConnector, START_TLS_OID, read_frame};
     use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy};
@@ -460,6 +475,130 @@ mod tests {
 
         // Give the upstream task a moment to finish asserting it never received the frame.
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    #[tokio::test]
+    async fn bind_dn_becomes_identity_so_same_peer_gets_separate_budgets() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let bind_response = |message_id: u32| {
+            encode_message(
+                message_id,
+                ProtocolOp::BindResponse(rasn_ldap::BindResponse::new(
+                    ResultCode::Success,
+                    "".into(),
+                    "".into(),
+                    None,
+                    None,
+                )),
+            )
+        };
+        let modify_response = |message_id: u32| {
+            encode_message(
+                message_id,
+                ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                    ResultCode::Success,
+                    "".into(),
+                    "".into(),
+                ))),
+            )
+        };
+
+        // Two connections, each binding then locking a different account.
+        // Answers a bind with a BindResponse and a modify with a
+        // ModifyResponse so the test client can tell "reached upstream and
+        // succeeded" apart from "blocked locally" without caring about exact
+        // bytes.
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
+
+                let bind_frame = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+                let message_id = decode_message(&bind_frame).message_id;
+                upstream_stream
+                    .write_all(&bind_response(message_id))
+                    .await
+                    .unwrap();
+
+                let modify_frame = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+                let message_id = decode_message(&modify_frame).message_id;
+                upstream_stream
+                    .write_all(&modify_response(message_id))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        // Budget for exactly one action per identity: if both connections
+        // below (same loopback source address) shared a budget keyed by
+        // peer address, the second modify would be blocked instead of
+        // reaching upstream.
+        let policies: Vec<Arc<dyn Policy>> =
+            vec![Arc::new(ThresholdPolicy::new(ThresholdConfig {
+                max_per_request: 10,
+                max_per_window: 1,
+                window: Duration::from_secs(60),
+            }))];
+        tokio::spawn(serve(
+            proxy_listener,
+            None,
+            None,
+            connector,
+            policies,
+            ConnectionLimits::default(),
+        ));
+
+        let assert_modify_reached_upstream =
+            |frame: &[u8], who: &str| match decode_message(frame).protocol_op {
+                ProtocolOp::ModifyResponse(ModifyResponse(result)) => {
+                    assert_eq!(
+                        result.result_code,
+                        ResultCode::Success,
+                        "{who}'s modify should have reached upstream, not been blocked locally"
+                    );
+                }
+                other => panic!("expected ModifyResponse, got {other:?}"),
+            };
+
+        let mut alice_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        alice_stream
+            .write_all(&bind_request_frame(1, "cn=alice,dc=example,dc=com"))
+            .await
+            .unwrap();
+        read_frame(&mut alice_stream).await.unwrap().unwrap();
+        alice_stream
+            .write_all(&modify_request_frame(
+                2,
+                "cn=alice,dc=example,dc=com",
+                "userAccountControl",
+                b"514",
+            ))
+            .await
+            .unwrap();
+        let alice_reply = read_frame(&mut alice_stream).await.unwrap().unwrap();
+        assert_modify_reached_upstream(&alice_reply, "alice");
+
+        let mut bob_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        bob_stream
+            .write_all(&bind_request_frame(1, "cn=bob,dc=example,dc=com"))
+            .await
+            .unwrap();
+        read_frame(&mut bob_stream).await.unwrap().unwrap();
+        bob_stream
+            .write_all(&modify_request_frame(
+                2,
+                "cn=bob,dc=example,dc=com",
+                "userAccountControl",
+                b"514",
+            ))
+            .await
+            .unwrap();
+        let bob_reply = read_frame(&mut bob_stream).await.unwrap().unwrap();
+        assert_modify_reached_upstream(&bob_reply, "bob");
     }
 
     #[tokio::test]

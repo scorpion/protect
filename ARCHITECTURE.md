@@ -153,8 +153,9 @@ socket. Rejection (no certificate, or one not signed by `client_ca_file`)
 surfaces as a failed or immediately-terminated handshake; the connection
 is dropped and logged like any other connection-setup error, never
 forwarded upstream. This is authentication only — it doesn't yet feed into
-`Identity` (still address-based, see [Identity](#identity)) or per-client
-policy.
+`Identity` or per-client policy; identity is derived from the LDAP bind DN
+where available, not the mTLS client certificate (see
+[Identity](#identity)).
 
 Both hops can also negotiate TLS mid-session via RFC 4511 StartTLS instead
 of dialing implicit TLS (LDAPS) from the first byte — for directories and
@@ -248,15 +249,35 @@ Redis) for the window to be enforced correctly across instances.
 
 ## Identity
 
-[`Identity`](src/core/identity.rs) is currently just the client's source IP
-address, stringified (the ephemeral port is dropped, so it survives
-reconnects). It exists as its own type (rather than passing `SocketAddr`
-around directly) so that policies and audit logging depend on an
-abstraction, not a transport detail — the intent is for this to become
-LDAP-bind-derived (or otherwise credential-derived) identity later without
-changing `Policy`, `ThresholdPolicy`, or `audit::log_decision` signatures.
-Today it still does **not** distinguish two clients behind the same
-NAT/egress address, and isn't tied to any authenticated principal.
+[`Identity`](src/core/identity.rs) is an opaque wrapper around a string
+(rather than passing `SocketAddr` around directly) so that policies and
+audit logging depend on an abstraction, not a transport detail. A
+connection's `Identity` starts as the client's source IP address,
+stringified (the ephemeral port is dropped, so it survives reconnects), and
+`proxy::handle_client_frame` replaces it the moment
+[`Connector::bind_identity`](src/core/connector.rs) recognizes a
+frame that establishes a more specific one —
+[`LdapConnector::bind_identity`](src/connector/ldap.rs) does this for a
+simple (DN + password) `BindRequest` naming a non-empty DN, since a
+password-verified DN is a real principal rather than just an address two
+unrelated agents might share.
+
+This closes the main gap with pure address-based identity: two agents
+behind the same NAT/egress no longer share one blast-radius budget as long
+as they bind under different DNs (see the `bind_dn_becomes_identity_*` test
+in [src/proxy.rs](src/proxy.rs)). It does **not** verify the bind actually
+succeeds — the proxy relays requests and responses independently and
+doesn't correlate a `BindResponse` back to the request that produced it,
+so `Identity` moves as soon as the `BindRequest` frame is seen, optimistically,
+before upstream has any chance to reject it. In practice this is low-risk:
+a bind that fails upstream leaves the session unauthenticated there, so
+follow-on writes under the claimed DN still get rejected by the real
+directory (assuming anonymous writes are disabled) — the false identity
+just doesn't get to *do* anything. Anonymous binds (empty DN) and SASL
+binds (the `name` field isn't password-verified the way it is for a simple
+bind) leave the current identity unchanged. A connection that never binds
+keeps its address-based identity for its whole lifetime, so anonymous/
+unauthenticated traffic behaves exactly as before.
 
 ## Audit logging
 
@@ -340,7 +361,9 @@ an existing type is a config-only change (another `[[policy]]` table).
 
 - No persistent/shared state — a restart or a second instance resets
   threshold history.
-- `Identity` is address-based, not credential-based.
+- `Identity` is derived from an unverified bind DN (falling back to source
+  address) — see the caveats in [Identity](#identity) — not from an
+  authenticated principal such as a validated mTLS client certificate.
 - Only one connector/policy-file pair can be wired up at a time;
   `ai_protect::run` doesn't yet dispatch multiple `[policy].file`s for
   multiple connectors.

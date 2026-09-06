@@ -73,22 +73,25 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   policy engine never has to understand a wire protocol.
 - [src/core/connector.rs](src/core/connector.rs) — the `Connector` trait
   (`connect_upstream`/`read_frame`/`decode`/`build_rejection`/
-  `upgrade_request`) that `src/proxy.rs` is written against, plus
-  `DuplexStream`, the boxable `AsyncRead + AsyncWrite` object every
+  `upgrade_request`/`bind_identity`) that `src/proxy.rs` is written against,
+  plus `DuplexStream`, the boxable `AsyncRead + AsyncWrite` object every
   connector's upstream connection is returned as. This is what makes "a
   new backend is a new connector, not a proxy.rs change" literally true
-  rather than aspirational. `upgrade_request` defaults to `Ok(None)`
-  ("this protocol has no in-session TLS upgrade"), so it's opt-in per
-  connector.
+  rather than aspirational. `upgrade_request` and `bind_identity` each
+  default to `Ok(None)` ("this protocol has no in-session TLS upgrade" /
+  "no identity-establishing request"), so both are opt-in per connector.
 - [src/connector/ldap.rs](src/connector/ldap.rs) — the only connector today.
   Reads BER-framed LDAP messages off the wire (`read_frame`), decodes
   `ModifyRequest`s via `rasn`/`rasn-ldap`, and flags ones touching a known
   account-lock attribute (`LOCK_ATTRIBUTES`, covering AD/OpenLDAP/389 DS
   schemas) as an `Action`. Also builds the `UnwillingToPerform` rejection
-  response sent back to a blocked client, and recognizes RFC 4511 StartTLS
+  response sent back to a blocked client, recognizes RFC 4511 StartTLS
   extended requests (`upgrade_request`) so a client can upgrade a
-  plaintext connection to TLS mid-session. Exposes this as both inherent
-  methods (used directly by its own tests) and an `impl Connector`.
+  plaintext connection to TLS mid-session, and recognizes a simple
+  `BindRequest` naming a non-empty DN (`bind_identity`) so the proxy can
+  key policy/audit identity off that DN instead of the peer address.
+  Exposes this as both inherent methods (used directly by its own tests)
+  and an `impl Connector`.
 - [src/core/policy.rs](src/core/policy.rs) — the `Policy` trait
   (`evaluate(&Action, &PolicyContext) -> Decision`) and `evaluate_all`, which
   runs every configured policy and stops at the first `Block`.
@@ -104,9 +107,11 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   the `Vec<Arc<dyn Policy>>` `main.rs` hands to the proxy. Adding a new
   `Policy` impl means adding a variant to the `PolicyEntry` enum here, not
   changing the file format.
-- [src/core/identity.rs](src/core/identity.rs) — `Identity`, currently just the peer's
-  source IP as a string (port dropped so it's stable across reconnects). No
-  auth/bind-based identity yet.
+- [src/core/identity.rs](src/core/identity.rs) — `Identity`, an opaque
+  wrapper around a string. Starts as the peer's source IP (port dropped so
+  it's stable across reconnects); `proxy::handle_client_frame` replaces it
+  mid-connection with the DN from a simple LDAP bind, once one is seen
+  (`Connector::bind_identity`).
 - [src/core/audit.rs](src/core/audit.rs) — structured `tracing` logging of every policy
   decision (allow or block), independent of the policy logic itself.
 
@@ -134,9 +139,12 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   §5.1) rather than relying on a higher-level LDAP library for transport
   framing, since the proxy needs raw frame boundaries to forward bytes
   unmodified when a message isn't inspected.
-- `Identity` is peer-address-based only; there's no LDAP bind/auth
-  correlation yet. Don't assume it maps to a stable principal across
-  reconnects.
+- `Identity` starts peer-address-based and is upgraded to a bind DN once a
+  simple LDAP bind is seen on the connection (see `bind_identity`), but
+  that DN is never verified against the actual `BindResponse` — the proxy
+  doesn't correlate responses per connection. Don't assume it maps to a
+  stable, verified principal; a failed bind still moves `Identity` before
+  upstream has a chance to reject it.
 
 ## Using ai-protect as a library
 

@@ -46,4 +46,20 @@ pub trait Connector: Send + Sync {
         let _ = frame;
         Ok(None)
     }
+
+    /// If `frame` establishes the connection's identity for policy purposes
+    /// (LDAP's simple `BindRequest` is the only example today), returns that
+    /// identity's string form so the proxy can replace its current
+    /// `Identity` with it. This exists because two agents sharing a
+    /// NAT/egress address otherwise share one blast-radius budget under
+    /// address-based identity alone — a bind DN distinguishes them. `Ok(None)`
+    /// means "not an identity-establishing request" (including anonymous or
+    /// SASL binds, whose named DN isn't password-verified the way a simple
+    /// bind's is), and the proxy leaves the connection's current identity
+    /// unchanged. Defaults to "this protocol has no such mechanism," so
+    /// connectors that don't support it need no changes.
+    fn bind_identity(&self, frame: &[u8]) -> anyhow::Result<Option<String>> {
+        let _ = frame;
+        Ok(None)
+    }
 }

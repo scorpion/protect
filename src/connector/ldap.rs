@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rasn_ldap::{
-    ChangeOperation, ExtendedRequest, ExtendedResponse, LdapMessage, LdapResult, ModifyResponse,
-    ProtocolOp, ResultCode,
+    AuthenticationChoice, ChangeOperation, ExtendedRequest, ExtendedResponse, LdapMessage,
+    LdapResult, ModifyResponse, ProtocolOp, ResultCode,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -157,6 +157,28 @@ impl LdapConnector {
         }))
     }
 
+    /// Decode a BindRequest and, if it's a simple (DN + password) bind naming
+    /// a non-empty DN, return that DN so the proxy can start tracking policy
+    /// history under it instead of the client's source address — necessary
+    /// because two agents behind the same NAT/egress otherwise share one
+    /// blast-radius budget, and a source address alone proves nothing about
+    /// which principal is acting. Anonymous binds (empty DN) and SASL binds
+    /// (the `name` field there isn't password-verified the way it is for a
+    /// simple bind — the real identity comes from the SASL mechanism) return
+    /// `None`, leaving the connection's current identity unchanged, as does
+    /// every non-bind frame.
+    pub fn bind_identity(&self, frame: &[u8]) -> Result<Option<String>> {
+        let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
+        let ProtocolOp::BindRequest(bind) = &message.protocol_op else {
+            return Ok(None);
+        };
+        if bind.name.0.is_empty() || !matches!(bind.authentication, AuthenticationChoice::Simple(_))
+        {
+            return Ok(None);
+        }
+        Ok(Some(bind.name.0.clone()))
+    }
+
     /// Build a well-formed LDAP ModifyResponse rejecting the request whose raw
     /// bytes are `frame`, so the caller learns why without the request ever
     /// reaching the real directory.
@@ -204,6 +226,10 @@ impl Connector for LdapConnector {
 
     fn upgrade_request(&self, frame: &[u8]) -> Result<Option<Vec<u8>>> {
         self.upgrade_request(frame)
+    }
+
+    fn bind_identity(&self, frame: &[u8]) -> Result<Option<String>> {
+        self.bind_identity(frame)
     }
 }
 
@@ -342,6 +368,17 @@ pub(crate) mod test_support {
         )
     }
 
+    pub fn sasl_bind_request_frame(message_id: u32, dn: &str) -> Vec<u8> {
+        encode_message(
+            message_id,
+            ProtocolOp::BindRequest(BindRequest::new(
+                3,
+                dn.into(),
+                AuthenticationChoice::Sasl(rasn_ldap::SaslCredentials::new("GSSAPI".into(), None)),
+            )),
+        )
+    }
+
     pub fn extended_request_frame(message_id: u32, oid: &str) -> Vec<u8> {
         encode_message(
             message_id,
@@ -357,6 +394,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{
         bind_request_frame, decode_message, extended_request_frame, modify_request_frame,
+        sasl_bind_request_frame,
     };
     use super::*;
 
@@ -456,6 +494,47 @@ mod tests {
         let action = connector().decode(&frame).unwrap();
 
         assert!(action.is_some());
+    }
+
+    #[test]
+    fn bind_identity_extracts_dn_from_simple_bind() {
+        let frame = bind_request_frame(1, "cn=alice,dc=example,dc=com");
+
+        let identity = connector().bind_identity(&frame).unwrap();
+
+        assert_eq!(identity.as_deref(), Some("cn=alice,dc=example,dc=com"));
+    }
+
+    #[test]
+    fn bind_identity_ignores_anonymous_bind() {
+        let frame = bind_request_frame(1, "");
+
+        let identity = connector().bind_identity(&frame).unwrap();
+
+        assert!(identity.is_none());
+    }
+
+    #[test]
+    fn bind_identity_ignores_sasl_bind() {
+        let frame = sasl_bind_request_frame(1, "cn=alice,dc=example,dc=com");
+
+        let identity = connector().bind_identity(&frame).unwrap();
+
+        assert!(identity.is_none());
+    }
+
+    #[test]
+    fn bind_identity_ignores_non_bind_operations() {
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
+
+        let identity = connector().bind_identity(&frame).unwrap();
+
+        assert!(identity.is_none());
     }
 
     #[test]

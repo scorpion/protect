@@ -73,13 +73,25 @@ priority; within a group, roughly in the order you'd want to tackle them.
 
 ## High — identity & policy coverage
 
-- [ ] **Identity is source-IP-only.** [`Identity::from_peer_addr`](src/core/identity.rs)
+- [x] **Identity is source-IP-only.** [`Identity::from_peer_addr`](src/core/identity.rs)
       means two agents behind the same NAT/egress (very common for
       containerized/agent-fleet deployments) share one blast-radius budget,
       and a reconnect resets nothing but also proves nothing. Derive identity
       from the LDAP bind DN (or the mTLS client cert CN, once mTLS exists)
       instead — `Identity` is already an opaque type specifically so this
-      swap doesn't touch `Policy`/`ThresholdPolicy`/audit signatures.
+      swap doesn't touch `Policy`/`ThresholdPolicy`/audit signatures. Fixed:
+      `Connector` gained a `bind_identity` hook (default no-op, same pattern
+      as `upgrade_request`); `LdapConnector::bind_identity` recognizes a
+      simple (DN + password) `BindRequest` naming a non-empty DN and
+      `proxy::handle_client_frame` swaps the connection's `Identity` to it,
+      falling back to (and starting as) the peer address otherwise. Two
+      agents behind the same NAT/egress now get separate blast-radius
+      budgets as long as they bind under different DNs. Known limitation:
+      the bind isn't correlated against its `BindResponse`, so `Identity`
+      moves as soon as the request is seen, optimistically — see the
+      caveat in [ARCHITECTURE.md](ARCHITECTURE.md#identity). mTLS-cert-CN-
+      derived identity remains unimplemented if bind DN coverage isn't
+      enough (e.g. SASL-only deployments).
 - [ ] **Policy only watches `ModifyRequest`.** [`LdapConnector::decode`](src/connector/ldap.rs)
       only turns lock-attribute `Modify` operations into `Action`s. A bulk
       `DelRequest` (mass account deletion) or bulk `AddRequest` (mass account
