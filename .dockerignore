@@ -1,0 +1,12 @@
+# Keeps the build context small — the Dockerfile only ever COPYs
+# Cargo.toml/Cargo.lock/src, but everything below still gets sent to the
+# daemon unless excluded here.
+target/
+logs/
+db.sqlite*
+.git/
+.env
+config.toml
+certs/
+policies/*
+!policies/*.example.toml

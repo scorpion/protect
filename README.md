@@ -134,6 +134,26 @@ When enabled, every log line goes to both stdout (human-readable) and
 the latter is what to point a log shipper or SIEM at. See "Audit logging"
 in [ARCHITECTURE.md](ARCHITECTURE.md#audit-logging).
 
+### Docker
+
+[docker/rust/Dockerfile](docker/rust/Dockerfile) builds the release binary
+in one stage and copies it into a minimal Debian runtime image in another.
+`config.toml`/`policies/*.toml`/`certs/` are deliberately not baked into the
+image (they're gitignored — see [Configuration](#configuration)) — mount
+them in at runtime instead:
+
+```sh
+docker build -f docker/rust/Dockerfile -t ai-protect .
+docker run --rm \
+  -p 3890:3890 \
+  -v "$PWD/config.toml:/app/config.toml:ro" \
+  -v "$PWD/policies:/app/policies:ro" \
+  ai-protect
+```
+
+The container runs as an unprivileged user and writes `./logs` relative to
+its `/app` working directory, same as running the binary directly.
+
 ## Local testing
 
 [compose.yaml](compose.yaml) runs a disposable

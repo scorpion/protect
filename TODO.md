@@ -290,8 +290,32 @@ priority; within a group, roughly in the order you'd want to tackle them.
       probe going quiet mid-drain would get the process killed outright,
       defeating the point of draining. See "Health" in
       [ARCHITECTURE.md](ARCHITECTURE.md#health).
-- [ ] **No deployment packaging** — no Dockerfile, systemd unit, or Helm
-      chart yet; needed for a repeatable rollout.
+- [x] **No deployment packaging** — no Dockerfile, systemd unit, or Helm
+      chart yet; needed for a repeatable rollout. Fixed for the Dockerfile:
+      [`docker/rust/Dockerfile`](docker/rust/Dockerfile) is a two-stage
+      build — a `rust:1-slim-bookworm` stage compiles the release binary
+      (LTO + single codegen unit, per `Cargo.toml`'s `[profile.release]`,
+      with dependencies cached in their own layer via a dummy `src/main.rs`
+      built before the real source is copied in), copied into a
+      `debian:bookworm-slim` runtime stage with just `ca-certificates`
+      (needed for `rustls-native-certs` to validate an upstream's LDAPS/
+      StartTLS certificate against the OS trust store) and an unprivileged
+      user. `config.toml`/`policies/*.toml`/`certs/` are deliberately not
+      baked into the image — they're gitignored (secrets, environment-
+      specific addresses) — so they're mounted in at runtime instead; see
+      "Docker" in [README.md](README.md#docker) for the build/run commands.
+      Verified end-to-end: built the image, ran it with a mounted
+      `config.toml`/policy file, confirmed the LDAP listener and the new
+      `/healthz`/`/readyz` endpoint (see the entry above) both answered
+      correctly and `./logs` was created and writable under the
+      unprivileged user. `.dockerignore` added alongside it to keep the
+      build context small. Known limitation, deliberately out of scope for
+      this pass: no systemd unit or Helm chart yet — a container image is
+      the one packaging format needed to unblock most orchestrators (k8s,
+      Nomad, plain `docker run`) directly; a systemd unit only matters for
+      bare-metal/VM rollouts and a Helm chart is only useful once there's a
+      real k8s deployment shape (resource limits, probe wiring, secret
+      mounting conventions) to template, which hasn't been decided yet.
 - [ ] **No CI pipeline** — no GitHub Actions (or equivalent) running
       `cargo test` / `cargo clippy` / `cargo fmt --check`, and no
       supply-chain scanning (`cargo audit` / `cargo deny`) on dependencies.
