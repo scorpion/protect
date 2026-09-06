@@ -236,6 +236,9 @@ against the RustSec advisory database — all on every push and PR.
 
 ## Documentation
 
+- [docs/README.md](docs/README.md) — end-user documentation: what
+  ai-protect does, how to install and configure it, and how its LDAP
+  policy behaves in practice
 - [AGENTS.md](AGENTS.md) — module map and conventions for anyone (human or
   agent) working on this codebase
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system design, request lifecycle,
