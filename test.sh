@@ -200,11 +200,11 @@ start_proxy() {
 
     printf '%s\n' "$policy_contents" >"$policy_file"
     cat >"$config_file" <<EOF
-[proxy]
+[[proxy]]
 listen_addr = "127.0.0.1:${port}"
 upstream_addr = "${UPSTREAM_HOST}:${UPSTREAM_PORT}"
 
-[policy]
+[proxy.policy]
 file = "${policy_file}"
 EOF
 

@@ -20,16 +20,20 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("config file {path} has no [[proxy]] entries — nothing to listen on")]
+    NoProxies { path: PathBuf },
 }
 
 type Result<T> = std::result::Result<T, ConfigError>;
 
 /// Process configuration, loaded from a TOML file (see `config.example.toml`
-/// for the schema and `[Config::load]` for how the path is resolved).
+/// for the schema and `[Config::load]` for how the path is resolved). Each
+/// `[[proxy]]` entry is an independent listener/upstream/policy triple —
+/// `ai_protect::run_with_config` runs every entry concurrently, so one
+/// process can front more than one directory or listen address at once.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub proxy: ProxyConfig,
-    pub policy: PolicySource,
+    pub proxy: Vec<ProxyConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +63,7 @@ pub struct ProxyConfig {
     /// — also acts as an idle-connection timeout.
     #[serde(default = "default_io_timeout_secs")]
     pub io_timeout_secs: u64,
+    pub policy: PolicySource,
 }
 
 fn default_max_connections() -> usize {
@@ -119,10 +124,11 @@ pub struct ClientCertConfig {
 }
 
 /// Points at the TOML file describing the policies to run against decoded
-/// actions (see `src/policy/config.rs`). Kept separate from `Config` itself
-/// so policy definitions — which may encode deployment-specific thresholds
-/// or naming — can be gitignored and iterated on independently of process
-/// config.
+/// actions (see `src/policy/config.rs`). Kept separate from `ProxyConfig`
+/// itself — one per `[[proxy]]` entry, since each fronts its own
+/// connector/backend — so policy definitions (which may encode
+/// deployment-specific thresholds or naming) can be gitignored and iterated
+/// on independently of process config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PolicySource {
     pub file: PathBuf,
@@ -136,10 +142,16 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+        let config: Config = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        if config.proxy.is_empty() {
+            return Err(ConfigError::NoProxies {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(config)
     }
 }
 
@@ -151,28 +163,64 @@ mod tests {
     fn parses_minimal_config() {
         let config: Config = toml::from_str(
             r#"
-            [proxy]
+            [[proxy]]
             listen_addr = "127.0.0.1:3890"
             upstream_addr = "127.0.0.1:389"
 
-            [policy]
+            [proxy.policy]
             file = "policies/ldap.toml"
             "#,
         )
         .unwrap();
 
-        assert_eq!(config.proxy.listen_addr.to_string(), "127.0.0.1:3890");
-        assert_eq!(config.proxy.upstream_addr.port(), 389);
-        assert_eq!(config.policy.file, PathBuf::from("policies/ldap.toml"));
-        assert!(config.proxy.upstream_tls.is_none());
-        assert!(config.proxy.listen_tls.is_none());
+        assert_eq!(config.proxy.len(), 1);
+        let proxy = &config.proxy[0];
+        assert_eq!(proxy.listen_addr.to_string(), "127.0.0.1:3890");
+        assert_eq!(proxy.upstream_addr.port(), 389);
+        assert_eq!(proxy.policy.file, PathBuf::from("policies/ldap.toml"));
+        assert!(proxy.upstream_tls.is_none());
+        assert!(proxy.listen_tls.is_none());
         assert_eq!(
-            config.proxy.max_connections,
+            proxy.max_connections,
             ConnectionLimits::default().max_connections
         );
         assert_eq!(
-            config.proxy.io_timeout_secs,
+            proxy.io_timeout_secs,
             ConnectionLimits::default().io_timeout.as_secs()
+        );
+    }
+
+    #[test]
+    fn parses_multiple_proxy_entries() {
+        let config: Config = toml::from_str(
+            r#"
+            [[proxy]]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addr = "127.0.0.1:389"
+
+            [proxy.policy]
+            file = "policies/ldap.toml"
+
+            [[proxy]]
+            listen_addr = "127.0.0.1:3891"
+            upstream_addr = "127.0.0.1:2389"
+
+            [proxy.policy]
+            file = "policies/other.toml"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.proxy.len(), 2);
+        assert_eq!(config.proxy[0].listen_addr.to_string(), "127.0.0.1:3890");
+        assert_eq!(
+            config.proxy[0].policy.file,
+            PathBuf::from("policies/ldap.toml")
+        );
+        assert_eq!(config.proxy[1].listen_addr.to_string(), "127.0.0.1:3891");
+        assert_eq!(
+            config.proxy[1].policy.file,
+            PathBuf::from("policies/other.toml")
         );
     }
 
@@ -180,27 +228,27 @@ mod tests {
     fn parses_connection_limit_overrides() {
         let config: Config = toml::from_str(
             r#"
-            [proxy]
+            [[proxy]]
             listen_addr = "127.0.0.1:3890"
             upstream_addr = "127.0.0.1:389"
             max_connections = 10
             io_timeout_secs = 5
 
-            [policy]
+            [proxy.policy]
             file = "policies/ldap.toml"
             "#,
         )
         .unwrap();
 
-        assert_eq!(config.proxy.max_connections, 10);
-        assert_eq!(config.proxy.io_timeout_secs, 5);
+        assert_eq!(config.proxy[0].max_connections, 10);
+        assert_eq!(config.proxy[0].io_timeout_secs, 5);
     }
 
     #[test]
     fn parses_config_with_tls_on_both_hops() {
         let config: Config = toml::from_str(
             r#"
-            [proxy]
+            [[proxy]]
             listen_addr = "127.0.0.1:6360"
             upstream_addr = "127.0.0.1:636"
 
@@ -212,32 +260,33 @@ mod tests {
             cert_file = "certs/server.pem"
             key_file = "certs/server.key"
 
-            [policy]
+            [proxy.policy]
             file = "policies/ldap.toml"
             "#,
         )
         .unwrap();
 
-        let upstream_tls = config.proxy.upstream_tls.unwrap();
+        let proxy = &config.proxy[0];
+        let upstream_tls = proxy.upstream_tls.clone().unwrap();
         assert_eq!(upstream_tls.server_name, "dc01.corp.example.com");
         assert_eq!(
             upstream_tls.ca_file,
             Some(PathBuf::from("certs/internal-ca.pem"))
         );
-        let listen_tls = config.proxy.listen_tls.unwrap();
+        let listen_tls = proxy.listen_tls.clone().unwrap();
         assert_eq!(listen_tls.cert_file, PathBuf::from("certs/server.pem"));
         assert_eq!(listen_tls.key_file, PathBuf::from("certs/server.key"));
         assert!(upstream_tls.client_cert.is_none());
         assert!(listen_tls.client_ca_file.is_none());
         assert!(!upstream_tls.starttls);
-        assert!(config.proxy.listen_starttls.is_none());
+        assert!(proxy.listen_starttls.is_none());
     }
 
     #[test]
     fn parses_config_with_starttls() {
         let config: Config = toml::from_str(
             r#"
-            [proxy]
+            [[proxy]]
             listen_addr = "127.0.0.1:3890"
             upstream_addr = "127.0.0.1:389"
 
@@ -249,14 +298,15 @@ mod tests {
             cert_file = "certs/server.pem"
             key_file = "certs/server.key"
 
-            [policy]
+            [proxy.policy]
             file = "policies/ldap.toml"
             "#,
         )
         .unwrap();
 
-        assert!(config.proxy.upstream_tls.unwrap().starttls);
-        let listen_starttls = config.proxy.listen_starttls.unwrap();
+        let proxy = &config.proxy[0];
+        assert!(proxy.upstream_tls.clone().unwrap().starttls);
+        let listen_starttls = proxy.listen_starttls.clone().unwrap();
         assert_eq!(listen_starttls.cert_file, PathBuf::from("certs/server.pem"));
         assert_eq!(listen_starttls.key_file, PathBuf::from("certs/server.key"));
     }
@@ -265,7 +315,7 @@ mod tests {
     fn parses_config_with_mutual_tls() {
         let config: Config = toml::from_str(
             r#"
-            [proxy]
+            [[proxy]]
             listen_addr = "127.0.0.1:6360"
             upstream_addr = "127.0.0.1:636"
 
@@ -282,13 +332,14 @@ mod tests {
             key_file = "certs/server.key"
             client_ca_file = "certs/agent-ca.pem"
 
-            [policy]
+            [proxy.policy]
             file = "policies/ldap.toml"
             "#,
         )
         .unwrap();
 
-        let upstream_tls = config.proxy.upstream_tls.unwrap();
+        let proxy = &config.proxy[0];
+        let upstream_tls = proxy.upstream_tls.clone().unwrap();
         let client_cert = upstream_tls.client_cert.unwrap();
         assert_eq!(
             client_cert.cert_file,
@@ -299,7 +350,7 @@ mod tests {
             PathBuf::from("certs/ai-protect-client.key")
         );
 
-        let listen_tls = config.proxy.listen_tls.unwrap();
+        let listen_tls = proxy.listen_tls.clone().unwrap();
         assert_eq!(
             listen_tls.client_ca_file,
             Some(PathBuf::from("certs/agent-ca.pem"))
@@ -312,5 +363,16 @@ mod tests {
 
         assert!(err.to_string().contains("reading config file"));
         assert!(matches!(err, ConfigError::Read { .. }));
+    }
+
+    #[test]
+    fn load_rejects_a_config_with_no_proxy_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "proxy = []\n").unwrap();
+
+        let err = Config::load(&path).unwrap_err();
+
+        assert!(matches!(err, ConfigError::NoProxies { .. }));
     }
 }

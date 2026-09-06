@@ -38,10 +38,13 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   lives next to the code producing it.
 - [src/config.rs](src/config.rs) — process configuration, loaded from a TOML
   file (`config.toml` by default, or a path given as the first CLI arg; see
-  `config.example.toml` for the schema). Policy definitions are deliberately
-  *not* part of this file — `[policy].file` just points at the TOML file
-  `policy::config::load` (in `src/core/policy/config.rs`) parses into
-  `Vec<Arc<dyn Policy>>`.
+  `config.example.toml` for the schema). An array of `[[proxy]]` entries,
+  each an independent listener/upstream/policy triple — `run_with_config`
+  builds and runs one per entry concurrently, so a single process can front
+  more than one directory or listen address. Policy definitions are
+  deliberately *not* part of this file — each entry's `[proxy.policy].file`
+  just points at the TOML file `policy::config::load` (in
+  `src/core/policy/config.rs`) parses into `Vec<Arc<dyn Policy>>`.
 - [src/proxy.rs](src/proxy.rs) — the connection loop: accepts a
   client, dials upstream, and relays frames in both directions concurrently
   via `tokio::select!`. Client→upstream frames are decoded and evaluated
@@ -183,8 +186,8 @@ in `src/lib.rs` cover different amounts of "load this from a file":
 
 - `run(config_path)` — fully file-driven, what the binary calls.
 - `run_with_config(&Config)` — skip the config file (`Config`'s fields are
-  all `pub`) but still load policies from the file `config.policy.file`
-  points at.
+  all `pub`) but still load each `[[proxy]]` entry's policies from the file
+  its `proxy.policy.file` points at. Runs every entry concurrently.
 - `builder::ProxyBuilder` — fully programmatic: give it an `Arc<dyn
   Connector>` and a `Vec<Arc<dyn Policy>>` you built yourself (e.g.
   `LdapConnector::new(...)` and `ThresholdPolicy::new(...)`), no file I/O

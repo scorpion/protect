@@ -162,10 +162,23 @@ priority; within a group, roughly in the order you'd want to tackle them.
       falls back to in-memory rather than stopping the proxy from
       starting). A local `valkey` service (`docker compose --profile ha up
       -d valkey`) is available for testing this backend.
-- [ ] **Single connector/listener only.** `ai_protect::run` wires up exactly
-      one `LdapConnector` behind one listener; there's no way to front more
+- [x] **Single connector/listener only.** `ai_protect::run` wired up exactly
+      one `LdapConnector` behind one listener; there was no way to front more
       than one directory or protocol from a single deployment (see
       [ARCHITECTURE.md "Multiple upstreams / multiple listeners"](ARCHITECTURE.md#extension-points)).
+      Fixed: `Config` is now `Vec<ProxyConfig>` (`[[proxy]]` array-of-tables
+      in `config.toml`), each entry an independent
+      listen/upstream/TLS/policy-file quintuple. `ai_protect::run_with_config`
+      builds one `ProxyBuilder` per entry and runs all of them concurrently
+      as sibling tasks in a `tokio::task::JoinSet`, returning (and aborting
+      every other entry) as soon as any one exits — normally only on error,
+      mirroring the previous single-listener behavior extended to "any
+      listener failing brings down the process." `Config::load` fails fast
+      if the array is empty. Each entry still hardcodes `LdapConnector` as
+      its connector, so this covers multiple listeners/upstreams for the one
+      protocol this proxy already speaks, not yet a mix of protocols in one
+      process — see the note in
+      [ARCHITECTURE.md "Known gaps"](ARCHITECTURE.md#known-gaps-by-design-at-this-stage).
 - [ ] **No config hot-reload.** Changing thresholds, addresses, or TLS
       settings requires a process restart, which currently also hard-drops
       every in-flight connection (see next item).

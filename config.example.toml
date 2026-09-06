@@ -3,7 +3,12 @@
 # config.toml is gitignored (see .gitignore) since a real deployment's
 # addresses may be sensitive; this file is the tracked template.
 
-[proxy]
+# Each [[proxy]] entry is an independent listener/upstream/policy triple —
+# ai-protect runs every entry concurrently, so one process can front more
+# than one directory (or the same directory on more than one listen
+# address/protocol variant) at once. A single-directory deployment just
+# needs one [[proxy]] entry, as below.
+[[proxy]]
 # Address ai-protect listens on for incoming LDAP client connections.
 listen_addr = "127.0.0.1:3890"
 # Address of the real upstream LDAP directory this proxies to.
@@ -61,8 +66,21 @@ upstream_addr = "127.0.0.1:389"
 # also acts as an idle-connection timeout. Defaults to 60.
 # io_timeout_secs = 60
 
-[policy]
+[proxy.policy]
 # Path (relative to the working directory ai-protect is run from) to the
 # TOML file describing the policies to run against decoded actions, in
-# order. See policies/ldap.example.toml for the schema.
+# order. See policies/ldap.example.toml for the schema. Each [[proxy]] entry
+# has its own policy file — this is what lets two entries share a process
+# but run different thresholds.
 file = "policies/ldap.toml"
+
+# Uncomment to front a second directory (or a second listen address/protocol
+# variant of the same one) from this same process. Every [[proxy]] entry
+# needs its own listen_addr and its own [proxy.policy] table; everything
+# else above (TLS, connection limits) is optional per entry too.
+# [[proxy]]
+# listen_addr = "127.0.0.1:3891"
+# upstream_addr = "127.0.0.1:2389"
+#
+# [proxy.policy]
+# file = "policies/other.toml"

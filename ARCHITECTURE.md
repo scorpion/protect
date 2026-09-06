@@ -236,7 +236,7 @@ indefinitely:
   disconnected.
 
 Both are configurable per deployment (`max_connections`/`io_timeout_secs`
-in `[proxy]`, see `config.example.toml`) or programmatically
+per `[[proxy]]` entry, see `config.example.toml`) or programmatically
 (`ProxyBuilder::limits`).
 
 ## Policy: blast-radius thresholding
@@ -380,24 +380,29 @@ beyond the in-memory threshold window.
 
 ## Configuration
 
-Two independent TOML files, deliberately kept separate:
+Two kinds of TOML file, deliberately kept separate:
 
 - [`Config`](src/config.rs) (`config.toml`, template in
-  `config.example.toml`) — process-level settings: `[proxy]` listen/upstream
-  addresses, optional `[proxy.upstream_tls]` (`server_name`, optional
-  `ca_file`, optional `[proxy.upstream_tls.client_cert]` for mTLS to the
-  upstream, `starttls` to negotiate TLS via RFC 4511 StartTLS instead of
-  dialing implicit TLS) and `[proxy.listen_tls]` (`cert_file`, `key_file`,
-  optional `client_ca_file` for mTLS from clients) tables controlling TLS
-  on each hop, plus `[proxy.listen_starttls]` (same shape as
-  `[proxy.listen_tls]`) to accept plaintext and let a client upgrade via
-  StartTLS instead (see [Transport](#transport-plaintext-or-tls)), and
-  `[policy].file` pointing at the policy file to load. `Config::load` reads
-  whichever path is given as the first CLI arg, defaulting to
-  `config.toml` in the working directory.
-- Policy definitions (`policies/ldap.toml`, template in
-  `policies/ldap.example.toml`) — an ordered list of `[[policy]]` tables,
-  each tagged by `type` and parsed by
+  `config.example.toml`) — process-level settings: an array of `[[proxy]]`
+  entries, each one an independent listener/upstream/policy triple.
+  `Config::load` reads whichever path is given as the first CLI arg,
+  defaulting to `config.toml` in the working directory, and fails fast if
+  the array is empty (nothing to listen on). Each entry has its own
+  `listen_addr`/`upstream_addr`, optional `[proxy.upstream_tls]`
+  (`server_name`, optional `ca_file`, optional
+  `[proxy.upstream_tls.client_cert]` for mTLS to the upstream, `starttls` to
+  negotiate TLS via RFC 4511 StartTLS instead of dialing implicit TLS) and
+  `[proxy.listen_tls]` (`cert_file`, `key_file`, optional `client_ca_file`
+  for mTLS from clients) tables controlling TLS on each hop, plus
+  `[proxy.listen_starttls]` (same shape as `[proxy.listen_tls]`) to accept
+  plaintext and let a client upgrade via StartTLS instead (see
+  [Transport](#transport-plaintext-or-tls)), and its own `[proxy.policy].file`
+  pointing at the policy file to load for that entry specifically —
+  `ai_protect::run_with_config` runs every entry concurrently (see
+  [Extension points](#extension-points)).
+- Policy definitions (one file per `[[proxy]]` entry, e.g.
+  `policies/ldap.toml`, template in `policies/ldap.example.toml`) — an
+  ordered list of `[[policy]]` tables, each tagged by `type` and parsed by
   [`policy::config::load`](src/core/policy/config.rs) into a `Vec<Arc<dyn
   Policy>>`. The only type today is `"threshold"`, deserializing straight
   into [`ThresholdConfig`](src/core/policy/threshold.rs) (durations are plain
@@ -405,14 +410,18 @@ Two independent TOML files, deliberately kept separate:
 
 This split exists because policy files are one-per-connector/backend and may
 encode deployment-specific thresholds or naming that shouldn't live in the
-same file — or necessarily the same commit history — as network config. Both
-`config.toml` and everything under `policies/` besides the tracked
-`*.example.toml` files are gitignored; `ai_protect::run` fails fast with a
-message pointing at the matching example file if either is missing.
+same file — or necessarily the same commit history — as network config; two
+`[[proxy]]` entries in the same `config.toml` are free to point at the same
+policy file or two entirely different ones. Both `config.toml` and
+everything under `policies/` besides the tracked `*.example.toml` files are
+gitignored; `ai_protect::run` fails fast with a message pointing at the
+matching example file if either is missing.
 
 Adding a new policy *type* is a Rust change (a `PolicyEntry` variant in
 `policy::config` plus the `Policy` impl); adding a new policy *instance* of
 an existing type is a config-only change (another `[[policy]]` table).
+Adding another listener/upstream pair is likewise config-only — another
+`[[proxy]]` entry.
 
 ## Extension points
 
@@ -422,10 +431,13 @@ an existing type is a config-only change (another `[[policy]]` table).
   its own framing (`read_frame`), decoding (`decode`), and rejection-building
   (`build_rejection`), producing `Action`s for the operations worth policing.
   Hand an `Arc::new(YourConnector::new(...))` to `ProxyBuilder::connector`
-  (or wire it into `ai_protect::run_with_config` alongside/instead of
-  `LdapConnector`). `src/proxy.rs` and the policy engine need no changes —
-  this is no longer just a convention to follow, it's enforced by
-  `proxy::run`'s signature taking `Arc<dyn Connector>`.
+  (embedders build and `serve()` their own `ProxyBuilder`s; the config-driven
+  path's private `build_proxy` helper in `src/lib.rs`, one call per
+  `[[proxy]]` entry, would need a Rust change to select a connector type
+  per entry instead of always building an `LdapConnector`). `src/proxy.rs`
+  and the policy engine need no changes — this is no longer just a
+  convention to follow, it's enforced by `proxy::run`'s signature taking
+  `Arc<dyn Connector>`.
 - **New policy rule**: implement `Policy` and add it via
   `ProxyBuilder::policy`/`policies` (or `[[policy]]` entries in a policy
   file, which is a config-only change once the `Policy` impl and its
@@ -439,11 +451,14 @@ an existing type is a config-only change (another `[[policy]]` table).
   see the library-usage section of [AGENTS.md](AGENTS.md#using-ai-protect-as-a-library).
   No TOML file is required; a `Connector` and `Policy` list constructed
   in-memory are enough.
-- **Multiple upstreams / multiple listeners**: not modeled yet.
-  `proxy::run`/`ProxyBuilder` take one `listen_addr` and one connector bound
-  to one upstream; supporting several would mean either multiple
-  `ProxyBuilder::serve` tasks or extending `Config` to a list and adding a
-  dispatch layer.
+- **Multiple upstreams / multiple listeners**: `proxy::run`/`ProxyBuilder`
+  still take one `listen_addr` and one connector bound to one upstream each,
+  but `Config` is a `Vec<ProxyConfig>` (`[[proxy]]` array-of-tables) and
+  `ai_protect::run_with_config` builds one `ProxyBuilder` per entry and
+  `serve()`s them concurrently as sibling tasks in a `tokio::task::JoinSet` —
+  see [Configuration](#configuration). Embedders using `ProxyBuilder`
+  directly (skipping `Config` entirely) get the same effect by spawning
+  multiple `serve()` tasks themselves.
 
 ## Known gaps (by design, at this stage)
 
@@ -453,9 +468,13 @@ an existing type is a config-only change (another `[[policy]]` table).
 - `Identity` is derived from an unverified bind DN (falling back to source
   address) — see the caveats in [Identity](#identity) — not from an
   authenticated principal such as a validated mTLS client certificate.
-- Only one connector/policy-file pair can be wired up at a time;
-  `ai_protect::run` doesn't yet dispatch multiple `[policy].file`s for
-  multiple connectors.
+- Every `[[proxy]]` entry hardcodes `LdapConnector` as its connector; the
+  config-driven path (as opposed to `ProxyBuilder`, used directly) can front
+  several LDAP upstreams but not a mix of protocols in one process without a
+  Rust change to select a connector type per entry.
+- One `[[proxy]]` entry's fatal error aborts every other entry in the same
+  process (see `run_with_config`) rather than restarting just the failed
+  one — there's no per-entry supervision/backoff.
 
 These aren't oversights to work around silently; they're the next pieces of
 this architecture, and changes that touch those areas should extend the
