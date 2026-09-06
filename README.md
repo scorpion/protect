@@ -12,10 +12,10 @@ blast-radius policies and either forwarded or rejected with a proper LDAP
 error, with every decision logged. Each hop (client-facing and upstream)
 can independently run plaintext LDAP or LDAPS.
 
-> **Status:** early. TOML-based config and policy files, TLS on both hops,
-> a unit + end-to-end test suite, and CI all exist; there's still no
-> persistent/shared policy state, no mutual TLS, and no StartTLS. See
-> [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and
+> **Status:** early. TOML-based config and policy files, TLS on both hops
+> (including optional mutual TLS), a unit + end-to-end test suite, and CI
+> all exist; there's still no persistent/shared policy state and no
+> StartTLS. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and
 > [TODO.md](TODO.md) for the gap list to a production-ready deployment.
 
 ## How it works

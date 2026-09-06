@@ -74,6 +74,11 @@ pub struct UpstreamTlsConfig {
     /// internal/enterprise CA.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
+    /// Client certificate ai-protect presents to the upstream. Needed when
+    /// the directory requires mutual TLS on this hop rather than trusting
+    /// whoever dials in.
+    #[serde(default)]
+    pub client_cert: Option<ClientCertConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -81,6 +86,22 @@ pub struct ListenTlsConfig {
     /// PEM-encoded certificate (chain) presented to clients.
     pub cert_file: PathBuf,
     /// PEM-encoded private key matching `cert_file`.
+    pub key_file: PathBuf,
+    /// PEM-encoded CA certificate(s) used to verify client certificates on
+    /// this listener. When present, ai-protect requires and verifies a
+    /// client certificate from every connecting client (mutual TLS) instead
+    /// of trusting whoever can reach the socket — authenticating *which*
+    /// agent is connecting rather than just its source IP.
+    #[serde(default)]
+    pub client_ca_file: Option<PathBuf>,
+}
+
+/// A certificate/key pair used to present a client certificate during a TLS
+/// handshake (upstream mutual TLS today; shared shape in case the listener
+/// side ever needs to present one too).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClientCertConfig {
+    pub cert_file: PathBuf,
     pub key_file: PathBuf,
 }
 
@@ -193,6 +214,53 @@ mod tests {
         let listen_tls = config.proxy.listen_tls.unwrap();
         assert_eq!(listen_tls.cert_file, PathBuf::from("certs/server.pem"));
         assert_eq!(listen_tls.key_file, PathBuf::from("certs/server.key"));
+        assert!(upstream_tls.client_cert.is_none());
+        assert!(listen_tls.client_ca_file.is_none());
+    }
+
+    #[test]
+    fn parses_config_with_mutual_tls() {
+        let config: Config = toml::from_str(
+            r#"
+            [proxy]
+            listen_addr = "127.0.0.1:6360"
+            upstream_addr = "127.0.0.1:636"
+
+            [proxy.upstream_tls]
+            server_name = "dc01.corp.example.com"
+            ca_file = "certs/internal-ca.pem"
+
+            [proxy.upstream_tls.client_cert]
+            cert_file = "certs/ai-protect-client.pem"
+            key_file = "certs/ai-protect-client.key"
+
+            [proxy.listen_tls]
+            cert_file = "certs/server.pem"
+            key_file = "certs/server.key"
+            client_ca_file = "certs/agent-ca.pem"
+
+            [policy]
+            file = "policies/ldap.toml"
+            "#,
+        )
+        .unwrap();
+
+        let upstream_tls = config.proxy.upstream_tls.unwrap();
+        let client_cert = upstream_tls.client_cert.unwrap();
+        assert_eq!(
+            client_cert.cert_file,
+            PathBuf::from("certs/ai-protect-client.pem")
+        );
+        assert_eq!(
+            client_cert.key_file,
+            PathBuf::from("certs/ai-protect-client.key")
+        );
+
+        let listen_tls = config.proxy.listen_tls.unwrap();
+        assert_eq!(
+            listen_tls.client_ca_file,
+            Some(PathBuf::from("certs/agent-ca.pem"))
+        );
     }
 
     #[test]

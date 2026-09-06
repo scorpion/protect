@@ -404,7 +404,8 @@ mod tests {
             upstream_stream.write_all(&canned_response).await.unwrap();
         });
 
-        let listen_tls = ListenTls::from_files(tls.cert_file.path(), tls.key_file.path()).unwrap();
+        let listen_tls =
+            ListenTls::from_files(tls.cert_file.path(), tls.key_file.path(), None).unwrap();
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
@@ -416,7 +417,8 @@ mod tests {
             ConnectionLimits::default(),
         ));
 
-        let client_dialer = UpstreamTls::new(tls.server_name, Some(tls.cert_file.path())).unwrap();
+        let client_dialer =
+            UpstreamTls::new(tls.server_name, Some(tls.cert_file.path()), None).unwrap();
         let tcp = TcpStream::connect(proxy_addr).await.unwrap();
         let mut client_stream = client_dialer.connect(tcp).await.unwrap();
 
@@ -450,7 +452,7 @@ mod tests {
         let expected_request = request_frame.clone();
         let canned_response = response_frame.clone();
         let upstream_acceptor =
-            ListenTls::from_files(tls.cert_file.path(), tls.key_file.path()).unwrap();
+            ListenTls::from_files(tls.cert_file.path(), tls.key_file.path(), None).unwrap();
         tokio::spawn(async move {
             let (tcp, _) = upstream_listener.accept().await.unwrap();
             let mut upstream_stream = upstream_acceptor.accept(tcp).await.unwrap();
@@ -459,7 +461,221 @@ mod tests {
             upstream_stream.write_all(&canned_response).await.unwrap();
         });
 
-        let upstream_tls = UpstreamTls::new(tls.server_name, Some(tls.cert_file.path())).unwrap();
+        let upstream_tls =
+            UpstreamTls::new(tls.server_name, Some(tls.cert_file.path()), None).unwrap();
+        let connector: Arc<dyn Connector> =
+            Arc::new(LdapConnector::new(upstream_addr, Some(upstream_tls)));
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(serve(
+            proxy_listener,
+            None,
+            connector,
+            allow_all_policies(),
+            ConnectionLimits::default(),
+        ));
+
+        let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        client_stream.write_all(&request_frame).await.unwrap();
+
+        let received_response = read_frame(&mut client_stream).await.unwrap().unwrap();
+        assert_eq!(received_response, response_frame);
+    }
+
+    #[tokio::test]
+    async fn client_facing_mtls_relays_when_client_presents_trusted_certificate() {
+        let server_tls = self_signed_tls("localhost");
+        let trusted_client = self_signed_tls("agent-1");
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let request_frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
+        let response_frame = encode_message(
+            1,
+            ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                ResultCode::Success,
+                "".into(),
+                "".into(),
+            ))),
+        );
+
+        let expected_request = request_frame.clone();
+        let canned_response = response_frame.clone();
+        tokio::spawn(async move {
+            let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
+            let received = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+            assert_eq!(received, expected_request);
+            upstream_stream.write_all(&canned_response).await.unwrap();
+        });
+
+        let listen_tls = ListenTls::from_files(
+            server_tls.cert_file.path(),
+            server_tls.key_file.path(),
+            Some(trusted_client.cert_file.path()),
+        )
+        .unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        tokio::spawn(serve(
+            proxy_listener,
+            Some(listen_tls),
+            connector,
+            allow_all_policies(),
+            ConnectionLimits::default(),
+        ));
+
+        let client_dialer = UpstreamTls::new(
+            server_tls.server_name,
+            Some(server_tls.cert_file.path()),
+            Some((
+                trusted_client.cert_file.path(),
+                trusted_client.key_file.path(),
+            )),
+        )
+        .unwrap();
+        let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut client_stream = client_dialer.connect(tcp).await.unwrap();
+
+        client_stream.write_all(&request_frame).await.unwrap();
+        let received_response = read_frame(&mut client_stream).await.unwrap().unwrap();
+        assert_eq!(received_response, response_frame);
+    }
+
+    /// TLS 1.3's client considers its handshake done once it's sent its own
+    /// `Finished`, before it's seen how the server reacted to the client
+    /// certificate it (didn't) present — so a client-auth rejection doesn't
+    /// necessarily surface as an error from `connect()` itself. The server
+    /// aborts the connection right after, so it always shows up as either a
+    /// failed handshake or the very next read failing/hitting EOF.
+    async fn client_tls_was_rejected(dialer: &UpstreamTls, tcp: TcpStream) -> bool {
+        let mut client_stream = match dialer.connect(tcp).await {
+            Ok(stream) => stream,
+            Err(_) => return true,
+        };
+        let mut buf = [0u8; 1];
+        match timeout(Duration::from_secs(2), client_stream.read(&mut buf))
+            .await
+            .expect("server should reject the connection promptly, not leave it hanging")
+        {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(_) => true,
+        }
+    }
+
+    #[tokio::test]
+    async fn client_facing_mtls_rejects_client_without_trusted_certificate() {
+        let server_tls = self_signed_tls("localhost");
+        let trusted_client = self_signed_tls("agent-1");
+        // A real, distinct identity — just not the one the listener trusts.
+        let untrusted_client = self_signed_tls("agent-2");
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let listen_tls = ListenTls::from_files(
+            server_tls.cert_file.path(),
+            server_tls.key_file.path(),
+            Some(trusted_client.cert_file.path()),
+        )
+        .unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        tokio::spawn(serve(
+            proxy_listener,
+            Some(listen_tls),
+            connector,
+            allow_all_policies(),
+            ConnectionLimits::default(),
+        ));
+
+        let no_cert_dialer = UpstreamTls::new(
+            server_tls.server_name,
+            Some(server_tls.cert_file.path()),
+            None,
+        )
+        .unwrap();
+        let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        assert!(
+            client_tls_was_rejected(&no_cert_dialer, tcp).await,
+            "connection must be rejected when no client certificate is presented"
+        );
+
+        let untrusted_dialer = UpstreamTls::new(
+            server_tls.server_name,
+            Some(server_tls.cert_file.path()),
+            Some((
+                untrusted_client.cert_file.path(),
+                untrusted_client.key_file.path(),
+            )),
+        )
+        .unwrap();
+        let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        assert!(
+            client_tls_was_rejected(&untrusted_dialer, tcp).await,
+            "connection must be rejected when the presented certificate isn't signed by the trusted client CA"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_presents_client_certificate_to_upstream_mtls() {
+        let tls = self_signed_tls("dc01.corp.example.com");
+        let proxy_identity = self_signed_tls("ai-protect");
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let request_frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
+        let response_frame = encode_message(
+            1,
+            ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                ResultCode::Success,
+                "".into(),
+                "".into(),
+            ))),
+        );
+
+        let expected_request = request_frame.clone();
+        let canned_response = response_frame.clone();
+        // Requiring a client cert here means this test only passes if
+        // `UpstreamTls` actually presents one during the handshake.
+        let upstream_acceptor = ListenTls::from_files(
+            tls.cert_file.path(),
+            tls.key_file.path(),
+            Some(proxy_identity.cert_file.path()),
+        )
+        .unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = upstream_listener.accept().await.unwrap();
+            let mut upstream_stream = upstream_acceptor.accept(tcp).await.unwrap();
+            let received = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+            assert_eq!(received, expected_request);
+            upstream_stream.write_all(&canned_response).await.unwrap();
+        });
+
+        let upstream_tls = UpstreamTls::new(
+            tls.server_name,
+            Some(tls.cert_file.path()),
+            Some((
+                proxy_identity.cert_file.path(),
+                proxy_identity.key_file.path(),
+            )),
+        )
+        .unwrap();
         let connector: Arc<dyn Connector> =
             Arc::new(LdapConnector::new(upstream_addr, Some(upstream_tls)));
 

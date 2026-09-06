@@ -48,7 +48,13 @@ pub async fn run_with_config(config: &config::Config) -> Result<()> {
         .proxy
         .upstream_tls
         .as_ref()
-        .map(|tls| core::tls::UpstreamTls::new(&tls.server_name, tls.ca_file.as_deref()))
+        .map(|tls| {
+            let client_cert = tls
+                .client_cert
+                .as_ref()
+                .map(|c| (c.cert_file.as_path(), c.key_file.as_path()));
+            core::tls::UpstreamTls::new(&tls.server_name, tls.ca_file.as_deref(), client_cert)
+        })
         .transpose()?;
     let connector: Arc<dyn core::connector::Connector> = Arc::new(
         connector::ldap::LdapConnector::new(config.proxy.upstream_addr, upstream_tls),
@@ -58,7 +64,13 @@ pub async fn run_with_config(config: &config::Config) -> Result<()> {
         .proxy
         .listen_tls
         .as_ref()
-        .map(|tls| core::tls::ListenTls::from_files(&tls.cert_file, &tls.key_file))
+        .map(|tls| {
+            core::tls::ListenTls::from_files(
+                &tls.cert_file,
+                &tls.key_file,
+                tls.client_ca_file.as_deref(),
+            )
+        })
         .transpose()?;
 
     let policies = core::policy::config::load(&config.policy.file)?;

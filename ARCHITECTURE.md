@@ -134,14 +134,27 @@ logic nor the proxy loop needs to branch on:
   validating the upstream's certificate against a configured `server_name`
   (required since directory certs are issued for hostnames, not the IP in
   `upstream_addr`) and trusting either the OS store or a configured
-  `ca_file`. [`tls::ListenTls`](src/core/tls.rs) builds a `ServerConfig` from a
+  `ca_file`. When the upstream itself requires mutual TLS, an optional
+  client cert/key pair (`[proxy.upstream_tls.client_cert]`) is presented
+  during the handshake instead of `with_no_client_auth()`.
+  [`tls::ListenTls`](src/core/tls.rs) builds a `ServerConfig` from a
   cert/key pair and performs the server-side handshake for clients
   connecting to `listen_addr`. Both are `Option`al and independent: ai-protect
   can terminate LDAPS for clients while speaking plaintext LDAP upstream, do
   the reverse, both, or neither.
 
-Neither direction does mutual TLS (client certificate authentication) —
-`ClientConfig`/`ServerConfig` are both built with `with_no_client_auth()`.
+`ListenTls` supports mutual TLS on the client-facing hop: when
+`[proxy.listen_tls].client_ca_file` is set, it builds a
+`WebPkiClientVerifier` from that CA instead of `with_no_client_auth()`,
+requiring every connecting client to present a certificate signed by it
+before the handshake completes — the proxy then authenticates *which*
+agent is connecting rather than just trusting whoever can reach the
+socket. Rejection (no certificate, or one not signed by `client_ca_file`)
+surfaces as a failed or immediately-terminated handshake; the connection
+is dropped and logged like any other connection-setup error, never
+forwarded upstream. This is authentication only — it doesn't yet feed into
+`Identity` (still address-based, see [Identity](#identity)) or per-client
+policy.
 
 Both hops are implicit TLS only (LDAPS on a dedicated port, negotiated
 before any LDAP bytes are exchanged) — StartTLS (the RFC 4511 extended
@@ -200,11 +213,13 @@ Two independent TOML files, deliberately kept separate:
 - [`Config`](src/config.rs) (`config.toml`, template in
   `config.example.toml`) — process-level settings: `[proxy]` listen/upstream
   addresses, optional `[proxy.upstream_tls]` (`server_name`, optional
-  `ca_file`) and `[proxy.listen_tls]` (`cert_file`, `key_file`) tables
-  controlling TLS on each hop (see [Transport](#transport-plaintext-or-tls)),
-  and `[policy].file` pointing at the policy file to load. `Config::load`
-  reads whichever path is given as the first CLI arg, defaulting to
-  `config.toml` in the working directory.
+  `ca_file`, optional `[proxy.upstream_tls.client_cert]` for mTLS to the
+  upstream) and `[proxy.listen_tls]` (`cert_file`, `key_file`, optional
+  `client_ca_file` for mTLS from clients) tables controlling TLS on each hop
+  (see [Transport](#transport-plaintext-or-tls)), and `[policy].file`
+  pointing at the policy file to load. `Config::load` reads whichever path
+  is given as the first CLI arg, defaulting to `config.toml` in the working
+  directory.
 - Policy definitions (`policies/ldap.toml`, template in
   `policies/ldap.example.toml`) — an ordered list of `[[policy]]` tables,
   each tagged by `type` and parsed by
@@ -259,8 +274,6 @@ an existing type is a config-only change (another `[[policy]]` table).
 
 - No persistent/shared state — a restart or a second instance resets
   threshold history.
-- No mutual TLS — `[proxy.listen_tls]`/`[proxy.upstream_tls]` cover
-  server-side certificates only, not client certificate authentication.
 - No StartTLS — only implicit TLS (LDAPS) is supported on either hop, so a
   directory or client that expects to upgrade a plaintext port 389
   connection mid-session isn't accommodated.

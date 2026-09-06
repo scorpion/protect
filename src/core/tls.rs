@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
@@ -47,6 +48,21 @@ pub enum TlsError {
     AddNativeCa {
         #[source]
         source: rustls::Error,
+    },
+    #[error("setting client certificate for upstream mutual TLS")]
+    ClientAuthCert {
+        #[source]
+        source: rustls::Error,
+    },
+    #[error("adding client CA certificate to listener's client-auth trust store")]
+    AddClientCa {
+        #[source]
+        source: rustls::Error,
+    },
+    #[error("building client certificate verifier from client CA")]
+    ClientCertVerifier {
+        #[source]
+        source: rustls::server::VerifierBuilderError,
     },
     #[error("invalid upstream TLS server name {name:?}")]
     InvalidServerName {
@@ -97,7 +113,15 @@ impl UpstreamTls {
     /// root of trust — the usual case for directories whose LDAPS
     /// certificate is signed by an internal/enterprise CA that may not be
     /// present on the host running ai-protect.
-    pub fn new(server_name: &str, ca_file: Option<&Path>) -> Result<Self> {
+    ///
+    /// When `client_cert` (cert file, key file) is given, it's presented to
+    /// the upstream as a client certificate — for directories that require
+    /// mutual TLS on this hop rather than trusting whoever dials in.
+    pub fn new(
+        server_name: &str,
+        ca_file: Option<&Path>,
+        client_cert: Option<(&Path, &Path)>,
+    ) -> Result<Self> {
         ensure_crypto_provider();
 
         let mut roots = RootCertStore::empty();
@@ -118,9 +142,17 @@ impl UpstreamTls {
             }
         }
 
-        let config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let builder = ClientConfig::builder().with_root_certificates(roots);
+        let config = match client_cert {
+            Some((cert_file, key_file)) => {
+                let certs = load_certs(cert_file)?;
+                let key = load_key(key_file)?;
+                builder
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|source| TlsError::ClientAuthCert { source })?
+            }
+            None => builder.with_no_client_auth(),
+        };
         let server_name = ServerName::try_from(server_name.to_string()).map_err(|source| {
             TlsError::InvalidServerName {
                 name: server_name.to_string(),
@@ -149,14 +181,38 @@ pub struct ListenTls {
 }
 
 impl ListenTls {
-    pub fn from_files(cert_file: &Path, key_file: &Path) -> Result<Self> {
+    /// When `client_ca_file` is given, connecting clients must present a
+    /// certificate signed by it — mutual TLS, so the proxy authenticates
+    /// *which* agent is connecting instead of just trusting whoever can
+    /// reach the socket. When absent, any client can complete the handshake
+    /// without presenting a certificate, matching prior behavior.
+    pub fn from_files(
+        cert_file: &Path,
+        key_file: &Path,
+        client_ca_file: Option<&Path>,
+    ) -> Result<Self> {
         ensure_crypto_provider();
 
         let certs = load_certs(cert_file)?;
         let key = load_key(key_file)?;
 
+        let client_verifier = match client_ca_file {
+            Some(path) => {
+                let mut roots = RootCertStore::empty();
+                for cert in load_certs(path)? {
+                    roots
+                        .add(cert)
+                        .map_err(|source| TlsError::AddClientCa { source })?;
+                }
+                WebPkiClientVerifier::builder(Arc::new(roots))
+                    .build()
+                    .map_err(|source| TlsError::ClientCertVerifier { source })?
+            }
+            None => WebPkiClientVerifier::no_client_auth(),
+        };
+
         let config = ServerConfig::builder()
-            .with_no_client_auth()
+            .with_client_cert_verifier(client_verifier)
             .with_single_cert(certs, key)
             .map_err(|source| TlsError::ServerConfig { source })?;
 

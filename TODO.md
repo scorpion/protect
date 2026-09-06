@@ -26,11 +26,19 @@ priority; within a group, roughly in the order you'd want to tackle them.
       concurrent connections, closing anything over the limit immediately;
       every read/write on both hops (TLS handshakes included) races against
       `io_timeout`, doubling as an idle timeout.
-- [ ] **No mutual TLS.** Both `ClientConfig`/`ServerConfig` in
+- [x] **No mutual TLS.** Both `ClientConfig`/`ServerConfig` in
       [`src/core/tls.rs`](src/core/tls.rs) use `with_no_client_auth()`. Right now
       anything that can reach the listener and speak LDAP is trusted equally;
       client certificate auth would let the proxy authenticate *which* agent
-      is connecting instead of just trusting its source IP.
+      is connecting instead of just trusting its source IP. Fixed: `ListenTls`
+      now takes an optional `client_ca_file` (`[proxy.listen_tls].client_ca_file`
+      in config) — when set, it builds a `WebPkiClientVerifier` from that CA and
+      requires every connecting client to present a certificate signed by it,
+      rejecting the handshake otherwise. `UpstreamTls` symmetrically takes an
+      optional client cert/key pair (`[proxy.upstream_tls.client_cert]`) to
+      present when the upstream itself requires mTLS. This is authentication
+      only — `Identity` (see below) is still address-based, not tied to the
+      presented certificate.
 - [ ] **StartTLS unsupported.** Only implicit TLS (LDAPS) is implemented on
       either hop (see updated [ARCHITECTURE.md](ARCHITECTURE.md#transport-plaintext-or-tls)).
       Any environment standardized on port 389 + StartTLS instead of 636
