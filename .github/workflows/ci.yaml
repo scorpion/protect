@@ -18,7 +18,7 @@ jobs:
           - beta
           - nightly
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - run: cargo build --verbose
       - run: cargo test --verbose
@@ -27,7 +27,7 @@ jobs:
     name: fmt & clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all -- --check
@@ -37,6 +37,6 @@ jobs:
     name: supply-chain audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
