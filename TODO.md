@@ -184,7 +184,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
       regardless. See `logs_an_oversized_identity_and_target_truncated` and
       `truncate_for_log_does_not_split_a_multi_byte_char` in
       `src/core/audit.rs`.
-- [ ] **`/metrics` and `/health` unauthenticated exposure needs to be a
+- [x] **`/metrics` and `/health` unauthenticated exposure needs to be a
       hard deployment requirement, not just documentation.** Both are
       correctly documented as unauthenticated by design
       ([`config.rs`](src/config.rs)'s doc comments on `MetricsConfig`/
@@ -194,6 +194,16 @@ priority; within a group, roughly in the order you'd want to tackle them.
       direction: add this as an explicit, checked item in deployment
       docs/runbooks (firewall or network-policy restriction), since the
       code itself can't enforce a network topology decision.
+      Fixed: added a "Production deployment checklist" section to
+      [docs/INSTALLATION.md](docs/INSTALLATION.md#production-deployment-checklist),
+      the end-user deployment doc, spelling out that binding
+      `[metrics]`/`[health]`'s `listen_addr` to localhost/a private range is
+      necessary but not sufficient on its own (a still-routable private
+      address, or a later config change widening the bind), and requiring
+      an actual firewall rule or network policy restricting both ports to
+      metrics/orchestration systems as a checked go-live item, not just a
+      documentation note. No code change: this is a network-topology
+      decision the code can't enforce, as the fix direction says.
 
 ## Low — hardening & process
 

@@ -255,6 +255,24 @@ Network settings (`listen_addr`, `upstream_addr`, TLS, connection limits)
 are read once at startup and need a restart to change — only the policy
 file hot-reloads.
 
+## Production deployment checklist
+
+Neither of these is enforced by the code — they're network-topology
+decisions only you can make — so treat them as hard requirements to check
+off before going live, not optional hardening:
+
+- [ ] **`/metrics` and `/health` are unreachable from client-facing
+  networks.** Neither endpoint authenticates its caller (see
+  [Metrics and health checks](#metrics-and-health-checks) above), and both
+  are off by default for exactly this reason. Binding `listen_addr` to
+  `127.0.0.1` or a private range is necessary but not sufficient on its
+  own — a container/VM with that private address still routable from the
+  wrong network, or a later config change that widens the bind address,
+  would silently expose them. Back the bind address with an actual
+  firewall rule or network policy (e.g. a Kubernetes `NetworkPolicy`
+  restricting ingress on both ports to your metrics/orchestration
+  systems only) and verify it — don't rely on the config file alone.
+
 ## Stopping and restarting
 
 `SIGTERM` or `SIGINT` (Ctrl-C) triggers a graceful shutdown: `ai-protect`
