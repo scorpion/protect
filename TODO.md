@@ -54,10 +54,12 @@ priority; within a group, roughly in the order you'd want to tackle them.
       off to the same TLS handshake implicit TLS uses. Both ends reuse
       `ListenTls`/`UpstreamTls`, so mTLS/trust-store/SNI behavior is
       identical regardless of how the handshake was triggered.
-- [ ] **Native cert-store load errors are swallowed.** [`tls.rs:49`](src/core/tls.rs)
+- [x] **Native cert-store load errors are swallowed.** [`tls.rs:49`](src/core/tls.rs)
       iterates `rustls_native_certs::load_native_certs().certs` and silently
       discards `.errors` — a partially-broken OS trust store fails open
-      instead of being logged.
+      instead of being logged. Fixed: each entry in `.errors` is now logged
+      via `tracing::warn!` before the successfully-loaded certs are added to
+      the trust store.
 - [ ] **Confirm the TLS version floor.** `rustls`/`tokio-rustls` are built
       with the `tls12` feature enabled alongside 1.3 ([`Cargo.toml`](Cargo.toml)).
       Decide whether TLS 1.2 needs to stay for compatibility with older

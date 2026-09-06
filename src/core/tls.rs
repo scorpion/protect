@@ -134,7 +134,11 @@ impl UpstreamTls {
                 }
             }
             None => {
-                for cert in rustls_native_certs::load_native_certs().certs {
+                let native_certs = rustls_native_certs::load_native_certs();
+                for error in &native_certs.errors {
+                    tracing::warn!(%error, "failed to load a native root certificate");
+                }
+                for cert in native_certs.certs {
                     roots
                         .add(cert)
                         .map_err(|source| TlsError::AddNativeCa { source })?;
