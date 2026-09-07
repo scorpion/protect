@@ -12,6 +12,13 @@ pub enum OperationKind {
     /// affected users out of their accounts just as a bulk `AccountLock`
     /// would (see `LdapConnector::decode`).
     PasswordReset,
+    /// An entry being renamed or moved (LDAP `ModifyDNRequest`, RFC 4511
+    /// §4.9) — reported unconditionally, like `Delete`/`Create`, since a
+    /// move into a quarantine OU can disable an account as effectively as
+    /// `AccountLock`, and there's no cheap way to tell that apart from an
+    /// ordinary rename without querying the directory (see
+    /// `LdapConnector::decode`).
+    Rename,
 }
 
 /// A normalized, backend-agnostic representation of an operation a client is

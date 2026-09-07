@@ -6,7 +6,8 @@ use rasn::types::OctetString;
 use rasn::{AsnType, Decode, Decoder, Encode};
 use rasn_ldap::{
     AddResponse, AuthenticationChoice, ChangeOperation, DelResponse, ExtendedRequest,
-    ExtendedResponse, LdapMessage, LdapResult, ModifyResponse, ProtocolOp, ResultCode,
+    ExtendedResponse, LdapMessage, LdapResult, ModifyDnResponse, ModifyResponse, ProtocolOp,
+    ResultCode,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -196,16 +197,18 @@ impl LdapConnector {
     /// Decode a full LDAP message frame and, if it represents an operation the
     /// policy engine cares about, return a normalized `Action`. A `Modify` is
     /// only actionable if it touches a lock attribute (most modifies are
-    /// mundane attribute edits); a `Del`/`Add` is actionable unconditionally —
-    /// removing or creating an entry outright is at least as high-blast-radius
-    /// as a lock, and unlike `Modify` there's no cheap way to further narrow
-    /// it to "account-like" objects without querying the directory, which
-    /// this proxy deliberately never does. An `ExtendedRequest` is actionable
+    /// mundane attribute edits); a `Del`/`Add`/`ModDnRequest` is actionable
+    /// unconditionally — removing, creating, or renaming/moving an entry
+    /// outright is at least as high-blast-radius as a lock (a move into a
+    /// quarantine OU is a standard AD account-disable workflow), and unlike
+    /// `Modify` there's no cheap way to further narrow any of them to
+    /// "account-like" objects without querying the directory, which this
+    /// proxy deliberately never does. An `ExtendedRequest` is actionable
     /// only for the RFC 3062 Password Modify OID — every other extended
     /// operation (including StartTLS) is left alone here, since
     /// `upgrade_request` already handles the one that needs a response before
     /// `decode` would ever see it. Returns `None` for everything else (binds,
-    /// searches, ...), which the proxy passes straight through.
+    /// searches, compares, ...), which the proxy passes straight through.
     pub fn decode(&self, frame: &[u8]) -> Result<Option<Action>> {
         let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
 
@@ -243,6 +246,12 @@ impl LdapConnector {
                 backend: "ldap",
                 operation: OperationKind::Create,
                 target: cap_dn(add.entry.0.clone()),
+                blast_radius: 1,
+            })),
+            ProtocolOp::ModDnRequest(mod_dn) => Ok(Some(Action {
+                backend: "ldap",
+                operation: OperationKind::Rename,
+                target: cap_dn(mod_dn.entry.0.clone()),
                 blast_radius: 1,
             })),
             ProtocolOp::ExtendedReq(ExtendedRequest {
@@ -341,6 +350,7 @@ impl LdapConnector {
             ProtocolOp::ModifyRequest(_) => ProtocolOp::ModifyResponse(ModifyResponse(result)),
             ProtocolOp::DelRequest(_) => ProtocolOp::DelResponse(DelResponse(result)),
             ProtocolOp::AddRequest(_) => ProtocolOp::AddResponse(AddResponse(result)),
+            ProtocolOp::ModDnRequest(_) => ProtocolOp::ModDnResponse(ModifyDnResponse(result)),
             ProtocolOp::ExtendedReq(_) => ProtocolOp::ExtendedResp(ExtendedResponse {
                 result_code: result.result_code,
                 matched_dn: result.matched_dn,
@@ -485,7 +495,7 @@ pub(crate) mod test_support {
     use rasn::types::{OctetString, SetOf};
     use rasn_ldap::{
         AddRequest, AuthenticationChoice, BindRequest, ChangeOperation, DelRequest, LdapMessage,
-        ModifyRequest, ModifyRequestChanges, PartialAttribute, ProtocolOp,
+        ModifyDnRequest, ModifyRequest, ModifyRequestChanges, PartialAttribute, ProtocolOp,
     };
 
     pub fn encode_message(message_id: u32, protocol_op: ProtocolOp) -> Vec<u8> {
@@ -529,6 +539,18 @@ pub(crate) mod test_support {
             ProtocolOp::AddRequest(AddRequest {
                 entry: dn.into(),
                 attributes: vec![],
+            }),
+        )
+    }
+
+    pub fn mod_dn_request_frame(message_id: u32, dn: &str, new_rdn: &str) -> Vec<u8> {
+        encode_message(
+            message_id,
+            ProtocolOp::ModDnRequest(ModifyDnRequest {
+                entry: dn.into(),
+                new_rdn: new_rdn.into(),
+                delete_old_rdn: true,
+                new_superior: None,
             }),
         )
     }
@@ -590,8 +612,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{
         add_request_frame, bind_request_frame, decode_message, del_request_frame,
-        extended_request_frame, modify_request_frame, password_modify_request_frame,
-        sasl_bind_request_frame,
+        extended_request_frame, mod_dn_request_frame, modify_request_frame,
+        password_modify_request_frame, sasl_bind_request_frame,
     };
     use super::*;
 
@@ -719,6 +741,21 @@ mod tests {
 
         assert_eq!(action.backend, "ldap");
         assert_eq!(action.operation, OperationKind::Create);
+        assert_eq!(action.target, "cn=alice,dc=example,dc=com");
+        assert_eq!(action.blast_radius, 1);
+    }
+
+    #[test]
+    fn decodes_mod_dn_request_as_rename_action_unconditionally() {
+        let frame = mod_dn_request_frame(1, "cn=alice,dc=example,dc=com", "cn=alice2");
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.backend, "ldap");
+        assert_eq!(action.operation, OperationKind::Rename);
         assert_eq!(action.target, "cn=alice,dc=example,dc=com");
         assert_eq!(action.blast_radius, 1);
     }
@@ -950,6 +987,25 @@ mod tests {
                 assert_eq!(result.diagnostic_message.0, "too many creates");
             }
             other => panic!("expected AddResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejection_for_mod_dn_request_returns_mod_dn_response() {
+        let frame = mod_dn_request_frame(7, "cn=alice,dc=example,dc=com", "cn=alice2");
+
+        let rejection = connector()
+            .build_rejection(&frame, "too many renames")
+            .unwrap();
+        let message = decode_message(&rejection);
+
+        assert_eq!(message.message_id, 7);
+        match message.protocol_op {
+            ProtocolOp::ModDnResponse(ModifyDnResponse(result)) => {
+                assert_eq!(result.result_code, ResultCode::UnwillingToPerform);
+                assert_eq!(result.diagnostic_message.0, "too many renames");
+            }
+            other => panic!("expected ModDnResponse, got {other:?}"),
         }
     }
 

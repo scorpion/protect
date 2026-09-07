@@ -8,11 +8,11 @@ in the first place, see [INSTALLATION.md](INSTALLATION.md).
 ## The short version
 
 `ai-protect` decodes just enough of each request to tell whether it's one
-of four kinds of account-affecting change. If it isn't, the request is
+of five kinds of account-affecting change. If it isn't, the request is
 forwarded untouched — `ai-protect` doesn't parse it at all, so there's no
 speed or compatibility cost for the searches, binds, compares, and
 ordinary attribute edits that make up the bulk of directory traffic. If
-it is one of the four, it's checked against your configured policy before
+it is one of the five, it's checked against your configured policy before
 being allowed through.
 
 ## Requests that are inspected
@@ -22,14 +22,15 @@ being allowed through.
 | **Modify** | it adds or replaces one of a fixed set of account-lock attributes (see [Account-lock attributes](#account-lock-attributes-recognized) below) |
 | **Delete** | always — removing an entry outright |
 | **Add** | always — creating an entry outright |
+| **Modify DN** (rename/move, RFC 4511 §4.9) | always — renaming or moving an entry outright |
 | **Extended: Password Modify** (RFC 3062) | always — a password reset via the standard extended operation |
 
-Everything else — binds, searches, compares, modify-DN, ordinary
-attribute edits that aren't a lock, every other extended operation
-including StartTLS — passes through exactly as sent. `ai-protect` never
-queries the directory itself to make a decision (no lookups, no schema
-awareness beyond the attribute list below), so it adds no extra
-round trips to allowed traffic.
+Everything else — binds, searches, compares, ordinary attribute edits
+that aren't a lock, every other extended operation including StartTLS —
+passes through exactly as sent. `ai-protect` never queries the directory
+itself to make a decision (no lookups, no schema awareness beyond the
+attribute list below), so it adds no extra round trips to allowed
+traffic.
 
 ### Account-lock attributes recognized
 
@@ -51,13 +52,15 @@ attribute — job title, group membership, phone number, anything not in
 this list — passes through untouched regardless of how many attributes
 or values it changes.
 
-### Why Delete and Add are always actionable
+### Why Delete, Add, and Modify DN are always actionable
 
-Unlike a Modify, there's no attribute to narrow on: removing or creating
-an entry is already as disruptive as a lock, and there's no cheap way to
-tell "this is an account" from "this is an OU or a printer object"
-without querying the directory — which `ai-protect` deliberately never
-does. Every Delete and every Add counts.
+Unlike a Modify, there's no attribute to narrow on: removing, creating,
+or renaming/moving an entry is already as disruptive as a lock — moving
+an account into a quarantine OU is a standard Active Directory
+account-disable workflow — and there's no cheap way to tell "this is an
+account" from "this is an OU or a printer object" without querying the
+directory — which `ai-protect` deliberately never does. Every Delete,
+Add, and Modify DN counts.
 
 ### Why Password Modify is included
 
@@ -70,9 +73,10 @@ inspects or logs the old or new password values themselves.
 ## What counts against your limits
 
 Each actionable request currently counts as **1** unit of "blast radius"
-regardless of what it targets — a Modify, Delete, Add, or Password Modify
-each affect exactly one entry per request in LDAP, so there's no
-per-request multiplier today. (The underlying `Action` type does carry a
+regardless of what it targets — a Modify, Delete, Add, Modify DN, or
+Password Modify each affect exactly one entry per request in LDAP, so
+there's no per-request multiplier today. (The underlying `Action` type
+does carry a
 blast-radius number for future protocols/operations where one request
 could affect many entries at once; for LDAP it's always 1.)
 
@@ -181,7 +185,7 @@ Each event carries:
 - **identity** — the source IP or bound DN responsible (see
   [Identity](#identity-how-who-is-doing-this-is-determined) above)
 - **backend** — always `ldap` today
-- **operation** — one of `AccountLock`, `Delete`, `Create`,
+- **operation** — one of `AccountLock`, `Delete`, `Create`, `Rename`,
   `PasswordReset`
 - **target** — the DN the request names
 - **blast_radius** — always `1` for LDAP today

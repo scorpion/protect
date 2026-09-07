@@ -60,6 +60,7 @@ fn operation_label(operation: &OperationKind) -> &'static str {
         OperationKind::Delete => "delete",
         OperationKind::Create => "create",
         OperationKind::PasswordReset => "password_reset",
+        OperationKind::Rename => "rename",
     }
 }
 

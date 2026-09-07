@@ -85,12 +85,14 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
   parsing (RFC 4511 §5.1, not delegated to a higher-level LDAP library,
   since raw frame boundaries are needed to forward unmodified bytes),
   `rasn`/`rasn-ldap` decoding of `ModifyRequest`s (recognizing
-  `LOCK_ATTRIBUTES` across AD/OpenLDAP/389 DS schemas), `DelRequest`s, and
-  `AddRequest`s (the latter two unconditionally, since removing/creating an
-  entry outright is already high-blast-radius with no cheap way to narrow
-  it further without querying the directory), and building the matching
-  `UnwillingToPerform` rejection (`ModifyResponse`/`DelResponse`/
-  `AddResponse`) sent to a blocked client. Also decodes the one
+  `LOCK_ATTRIBUTES` across AD/OpenLDAP/389 DS schemas), `DelRequest`s,
+  `AddRequest`s, and `ModifyDnRequest`s (rename/move, RFC 4511 §4.9) (the
+  latter three unconditionally, since removing, creating, or
+  renaming/moving an entry outright is already high-blast-radius with no
+  cheap way to narrow any of them further without querying the
+  directory), and building the matching `UnwillingToPerform` rejection
+  (`ModifyResponse`/`DelResponse`/`AddResponse`/`ModifyDnResponse`) sent
+  to a blocked client. Also decodes the one
   `ExtendedRequest` this proxy polices — RFC 3062 Password Modify — into an
   `Action` (its own hand-rolled `PasswdModifyRequestValue` type, since
   `rasn-ldap` only models core LDAP ops, not this extended operation's
@@ -107,7 +109,7 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
   seam: what's attempted, what it targets, and its `blast_radius` (always
   `1` today; exists so a future bulk-op connector can report >1 without any
   downstream change). `OperationKind` covers `AccountLock`, `Delete`,
-  `Create`, and `PasswordReset`.
+  `Create`, `Rename`, and `PasswordReset`.
 - **`src/core/policy.rs`** + **`src/core/policy/threshold.rs`** — the
   `Policy` trait (`evaluate(&Action, &PolicyContext) -> Decision`) and
   `evaluate_all` (stops at first `Block`, so ordering matters for

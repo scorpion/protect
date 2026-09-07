@@ -54,7 +54,7 @@ roughly in the order you'd want to tackle them.
       `stage_pending_bind_evicts_oldest_message_id_once_at_capacity` and
       `stage_pending_bind_restaging_an_existing_id_does_not_evict` in
       `src/proxy.rs`.
-- [ ] **`ModifyDNRequest` (RFC 4511 §4.9 — rename/move) is not decoded or
+- [x] **`ModifyDNRequest` (RFC 4511 §4.9 — rename/move) is not decoded or
       policed at all.** `LdapConnector::decode`
       ([src/connector/ldap.rs:209-284](src/connector/ldap.rs)) matches
       `ModifyRequest`, `DelRequest`, `AddRequest`, and the Password-Modify
@@ -80,6 +80,21 @@ roughly in the order you'd want to tackle them.
       `Create` are handled today — no cheap way to filter "account-like"
       without querying the directory — and add the matching
       `ModifyDnResponse` case to `build_rejection`.
+      Fixed: `LdapConnector::decode` ([src/connector/ldap.rs](src/connector/ldap.rs))
+      now matches `ProtocolOp::ModDnRequest` unconditionally, the same way
+      `DelRequest`/`AddRequest` are handled, producing an `Action` with a
+      new `OperationKind::Rename` ([src/core/action.rs](src/core/action.rs))
+      and `target` set to the entry's current DN (its post-move name isn't
+      known to the proxy, matching how `Delete`/`Create` report the acted-on
+      DN). `build_rejection` gained the matching `ModDnResponse` case so a
+      blocked rename gets a well-formed `UnwillingToPerform` response
+      instead of the request reaching the real directory. `Rename` is also
+      wired into `metrics::operation_label` and `docs/LDAP.md`/
+      `ARCHITECTURE.md`/`AGENTS.md`/`CLAUDE.md` no longer describe
+      modify-DN as an untouched pass-through. See
+      `decodes_mod_dn_request_as_rename_action_unconditionally` and
+      `build_rejection_for_mod_dn_request_returns_mod_dn_response` in
+      `src/connector/ldap.rs`.
 
 ## Medium
 
