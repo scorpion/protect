@@ -302,6 +302,22 @@ optional hardening:
   you've reviewed this and a restart-time reset is acceptable, that's a
   valid choice too — just make it deliberately, not by leaving the default
   unexamined.
+- [ ] **A `scope = "global"` threshold entry is enabled as a backstop
+  against identity churn.** [policies/ldap.example.toml](../policies/ldap.example.toml)
+  ships its only `scope = "global"` entry commented out under the
+  `PerIdentity` one — copying the example as-is, per
+  [Configuring](#configuring) above, leaves you with only a per-identity
+  budget. A per-identity budget resets whenever a caller claims a fresh
+  (and successfully-verified — see
+  [ARCHITECTURE.md#identity](../ARCHITECTURE.md#identity)) bind DN, so a
+  compromised credential able to churn through many identities — or, per
+  [LDAP.md's Identity section](LDAP.md), any Kerberos-heavy deployment
+  where distinct principals share one address-based identity in the first
+  place — can stay under it indefinitely. Uncomment the second `[[policy]]`
+  entry and size its `max_per_window` well above your expected legitimate
+  aggregate traffic across the whole proxy; it's meant to catch
+  runaway/bulk behavior overall, not to police any one caller the way the
+  `PerIdentity` entry does.
 
 ## Stopping and restarting
 

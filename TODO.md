@@ -262,7 +262,7 @@ roughly in the order you'd want to tackle them.
       documented backstop against identity churn via distinct real DNs —
       instead of the pre-fix, no-correlation/no-backstop behavior they
       previously described.
-- [ ] **The `Global`-scope backstop policy is off by default and only
+- [x] **The `Global`-scope backstop policy is off by default and only
       ever shown commented out.** `policies/ldap.example.toml`'s only
       `scope = "global"` entry is commented out under "Recommended: a
       second threshold entry..."; `docs/INSTALLATION.md`'s "Production
@@ -281,3 +281,15 @@ roughly in the order you'd want to tackle them.
       third checked item to `docs/INSTALLATION.md`'s "Production
       deployment checklist" for enabling a `scope = "global"` backstop
       entry sized well above expected legitimate aggregate traffic.
+      Fixed: `docs/INSTALLATION.md`'s "Production deployment checklist"
+      gained a fourth item, "A `scope = "global"` threshold entry is
+      enabled as a backstop against identity churn," alongside the
+      existing TLS and `state_db` items — it explains that
+      `policies/ldap.example.toml` ships the entry commented out, why a
+      `PerIdentity`-only budget is exposed to identity churn (linking
+      `ARCHITECTURE.md#identity` and `docs/LDAP.md`'s Identity section for
+      the Kerberos-heavy case), and directs the operator to uncomment the
+      second `[[policy]]` entry and size `max_per_window` above expected
+      legitimate aggregate traffic. No code or example-config change: the
+      gap was a go-live prompt missing from the documented checklist, not
+      a default in the shipped example that itself needed changing.
