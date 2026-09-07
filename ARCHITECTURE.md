@@ -362,6 +362,21 @@ encodes "4 accounts is fine, 4,000 is not" with two independent checks:
   `PerIdentity` budget every time (see [Identity](#identity)) — can't reset
   this one too. See `policies/ldap.example.toml` for the two-entry pattern.
 
+`operations` (optional, defaults to all six `OperationKind`s) restricts a
+`[[policy]]` entry to a subset. An action whose `operation` isn't in the
+configured set bypasses this policy entirely — `evaluate` returns
+`Decision::Allow` before touching `max_per_request`/history, not merely
+skipping the block — so the entry's window budget is untouched by traffic
+it wasn't configured to police. Without this, one `max_per_window` applies
+identically to every kind: a budget an operator sized for a legitimate
+burst of routine `AccountLock`/`AccountUnlock` activity (an HR sync, an
+offboarding batch) applies just as loosely to `Delete`/`Create`/`Rename`,
+which have no legitimate reason to burst anywhere near as high and are far
+less reversible. The recommended pattern is two `[[policy]]` entries: one
+lenient, covering `account_lock`/`account_unlock`/`password_reset`, and a
+second, much stricter one filtered to `[delete, create, rename]` — see
+`policies/ldap.example.toml`.
+
 State lives in an in-memory `Mutex<HashMap<Identity, VecDeque<Instant>>>`,
 always — `evaluate` never does I/O, so admitting or blocking a request
 never waits on anything slower than a mutex, regardless of how many

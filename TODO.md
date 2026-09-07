@@ -187,7 +187,7 @@ want to tackle them.
 
 ## Medium — `ThresholdPolicy` pools every policed operation kind into one shared budget
 
-- [ ] **There is no way to configure a stricter blast-radius limit for
+- [x] **There is no way to configure a stricter blast-radius limit for
       irreversible operations (Delete/Create/Rename) than for reversible
       ones (AccountLock/AccountUnlock/PasswordReset) — every `[[policy]]`
       entry applies uniformly to all six.** `ThresholdConfig`
@@ -240,6 +240,37 @@ want to tackle them.
       third `Delete` in-window while an interleaved, unrelated 10th
       `AccountLock` in the same window from the same identity is still
       allowed.
+      Fixed: `ThresholdConfig` gained an optional `operations:
+      Option<Vec<OperationKind>>` field
+      ([src/core/policy/threshold.rs](src/core/policy/threshold.rs)),
+      `None` (the default) preserving today's all-six behavior for every
+      existing config. `OperationKind` itself
+      ([src/core/action.rs](src/core/action.rs)) now derives `Deserialize`
+      (`#[serde(rename_all = "snake_case")]`, so TOML spells the six kinds
+      `account_lock`, `account_unlock`, `delete`, `create`,
+      `password_reset`, `rename`) plus `Copy`/`Hash`, needed to hold it in
+      a `Vec` and compare cheaply. `ThresholdPolicy::evaluate` checks this
+      filter first, before `max_per_request` or any history/lock access:
+      an action whose `operation` isn't in the configured set returns
+      `Decision::Allow` immediately, exactly the "bypass entirely" behavior
+      the fix direction called for, so unrelated traffic never consumes
+      this entry's window budget. `policies/ldap.example.toml` now shows
+      the recommended two-entry pattern — a lenient entry filtered to
+      `account_lock`/`account_unlock`/`password_reset`, and a second, much
+      stricter entry filtered to `delete`/`create`/`rename` — alongside the
+      existing `PerIdentity`+`Global` pattern; ARCHITECTURE.md's "Policy:
+      blast-radius thresholding" section documents `operations` the same
+      way it documents `scope`. Verified with the suggested test,
+      `operations_filter_bypasses_the_policy_entirely_for_unmatched_kinds`
+      (a policy filtered to `[Delete]` with `max_per_window = 2` blocks a
+      third `Delete` while ten interleaved, unrelated `AccountLock`s from
+      the same identity in the same window are all allowed and don't touch
+      the budget), plus a TOML round-trip test
+      (`parses_operations_filter_from_toml_and_defaults_to_none`). All
+      existing `ThresholdConfig` struct-literal call sites across
+      `src/core/policy/threshold.rs`, `src/proxy.rs`, and `src/builder.rs`
+      were updated with the new field; every prior test (143 baseline +
+      the Valkey-auth fix's 3 + this fix's 2 = 148) still passes.
 
 ## Low — health-probe request line can be misread if split across reads
 

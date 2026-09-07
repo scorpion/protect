@@ -18,6 +18,17 @@ window_secs = 60
 # scope = "per_identity" is the default and can be omitted; see the global
 # backstop entry below for the other option.
 
+# Restricts this entry to a subset of operation kinds; omit to apply to all
+# six (the default). Without this, one max_per_window applies identically
+# to every kind — a budget sized for a legitimate burst of routine
+# account-lock/unlock activity applies just as loosely to outright
+# deletes. An action whose operation isn't in this list bypasses this
+# entry entirely (no history/budget consumed), so unrelated traffic never
+# eats into this entry's window — see the stricter, delete/create/rename-
+# only entry below for the companion half of this pattern. Valid kinds:
+# account_lock, account_unlock, delete, create, password_reset, rename.
+# operations = ["account_lock", "account_unlock", "password_reset"]
+
 # Hard cap on the number of distinct identities tracked at once. Once
 # reached, admitting a never-before-seen identity evicts the tracked
 # identity with the least recently recorded activity to make room (logged
@@ -83,4 +94,18 @@ window_secs = 60
 # scope = "global"
 # max_per_request = 10
 # max_per_window = 4000
+# window_secs = 60
+
+# Recommended: a much stricter entry filtered to only the irreversible
+# operations (Delete/Create/Rename) — the companion half of the operations
+# pattern above. Directory-entry deletion, creation, and rename/move have
+# no legitimate reason to burst anywhere near the lock/unlock budget above,
+# and are far less reversible if an over-eager or compromised caller
+# exceeds it. This entry's own window is untouched by lock/unlock/
+# password-reset traffic, since those kinds aren't in its operations list.
+# [[policy]]
+# type = "threshold"
+# operations = ["delete", "create", "rename"]
+# max_per_request = 1
+# max_per_window = 5
 # window_secs = 60

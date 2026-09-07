@@ -209,6 +209,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         }));
 
         tokio::spawn(

@@ -1,4 +1,8 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Deserialize`s in `snake_case` (`"account_lock"`, `"password_reset"`, ...)
+/// so `ThresholdConfig::operations` can name these directly in TOML — see
+/// `policies/ldap.example.toml`'s per-operation-kind threshold pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     AccountLock,
     /// A lock attribute being cleared back to its schema default (LDAP

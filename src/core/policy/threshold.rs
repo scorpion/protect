@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer};
 
-use crate::core::action::Action;
+use crate::core::action::{Action, OperationKind};
 use crate::core::identity::Identity;
 
 use super::store::{
@@ -157,6 +157,19 @@ pub struct ThresholdConfig {
     /// through.
     #[serde(default = "default_max_tracked_identities")]
     pub max_tracked_identities: usize,
+    /// Restricts this policy instance to a subset of `OperationKind`s.
+    /// `None` (the default) applies to all six, preserving today's behavior
+    /// for any config that doesn't set it. `evaluate` bypasses this policy
+    /// entirely — `Decision::Allow` with no history/budget consumed, not
+    /// merely skipping the block — for an action whose `operation` isn't in
+    /// the configured set, so e.g. a policy filtered to `[delete, create,
+    /// rename]` doesn't spend its window budget on unrelated lock/unlock/
+    /// password-reset traffic. Lets an operator run a lenient budget for
+    /// reversible operations alongside a much stricter one for irreversible
+    /// ones (see `policies/ldap.example.toml`), which pooling every kind
+    /// into one shared budget can't express.
+    #[serde(default)]
+    pub operations: Option<Vec<OperationKind>>,
 }
 
 fn default_flush_interval() -> Duration {
@@ -589,6 +602,12 @@ impl ThresholdPolicy {
 
 impl Policy for ThresholdPolicy {
     fn evaluate(&self, action: &Action, ctx: &PolicyContext) -> Decision {
+        if let Some(operations) = &self.config.operations
+            && !operations.contains(&action.operation)
+        {
+            return Decision::Allow;
+        }
+
         if action.blast_radius > self.config.max_per_request {
             return Decision::Block {
                 reason: format!(
@@ -644,7 +663,6 @@ impl Policy for ThresholdPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::action::OperationKind;
 
     #[test]
     fn parses_window_secs_from_toml() {
@@ -884,6 +902,15 @@ mod tests {
         }
     }
 
+    fn action_with_operation(operation: OperationKind, blast_radius: usize) -> Action {
+        Action {
+            backend: "ldap",
+            operation,
+            target: "cn=alice,dc=example,dc=com".into(),
+            blast_radius,
+        }
+    }
+
     fn ctx_for(identity: &Identity) -> PolicyContext {
         PolicyContext {
             identity: identity.clone(),
@@ -900,6 +927,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         });
         let identity = Identity("agent-1".into());
 
@@ -918,6 +946,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         });
         let identity = Identity("agent-1".into());
 
@@ -936,6 +965,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         });
         let identity = Identity("agent-1".into());
 
@@ -959,6 +989,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         });
         let alice = Identity("alice".into());
         let bob = Identity("bob".into());
@@ -978,6 +1009,60 @@ mod tests {
     }
 
     #[test]
+    fn operations_filter_bypasses_the_policy_entirely_for_unmatched_kinds() {
+        let policy = ThresholdPolicy::new(ThresholdConfig {
+            max_per_request: 10,
+            max_per_window: 2,
+            window: Duration::from_secs(60),
+            state_db: None,
+            flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
+            scope: ThresholdScope::PerIdentity,
+            operations: Some(vec![OperationKind::Delete]),
+        });
+        let identity = Identity("agent-1".into());
+
+        // Two deletes fill the max_per_window = 2 budget...
+        assert!(matches!(
+            policy.evaluate(
+                &action_with_operation(OperationKind::Delete, 1),
+                &ctx_for(&identity)
+            ),
+            Decision::Allow
+        ));
+        assert!(matches!(
+            policy.evaluate(
+                &action_with_operation(OperationKind::Delete, 1),
+                &ctx_for(&identity)
+            ),
+            Decision::Allow
+        ));
+
+        // ...ten interleaved, unrelated AccountLocks from the same identity
+        // in the same window never touch this policy's budget at all, since
+        // AccountLock isn't in `operations`.
+        for _ in 0..10 {
+            assert!(matches!(
+                policy.evaluate(
+                    &action_with_operation(OperationKind::AccountLock, 1),
+                    &ctx_for(&identity)
+                ),
+                Decision::Allow
+            ));
+        }
+
+        // A third Delete still trips the exhausted budget — the interleaved
+        // AccountLocks didn't consume any of it, but didn't reset it either.
+        assert!(matches!(
+            policy.evaluate(
+                &action_with_operation(OperationKind::Delete, 1),
+                &ctx_for(&identity)
+            ),
+            Decision::Block { .. }
+        ));
+    }
+
+    #[test]
     fn caps_tracked_identity_count_by_evicting_the_stalest_one() {
         // A cap of 2: admitting a third, never-before-seen identity must
         // evict one of the first two rather than growing the map to 3 —
@@ -991,6 +1076,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 2,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         });
         let alice = Identity("alice".into());
         let bob = Identity("bob".into());
@@ -1040,6 +1126,7 @@ mod tests {
                 flush_interval: Duration::from_secs(2),
                 max_tracked_identities: cap,
                 scope: ThresholdScope::PerIdentity,
+                operations: None,
             });
             for n in 0..cap {
                 let identity = Identity(format!("fill-{n}"));
@@ -1086,6 +1173,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::Global,
+            operations: None,
         });
         let alice = Identity("alice".into());
         let bob = Identity("bob".into());
@@ -1125,6 +1213,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_operations_filter_from_toml_and_defaults_to_none() {
+        let default_config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            "#,
+        )
+        .unwrap();
+        assert_eq!(default_config.operations, None);
+
+        let filtered_config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 5
+            max_per_window = 5
+            window_secs = 60
+            operations = ["delete", "create", "rename"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            filtered_config.operations,
+            Some(vec![
+                OperationKind::Delete,
+                OperationKind::Create,
+                OperationKind::Rename
+            ])
+        );
+    }
+
+    #[test]
     fn falls_back_to_in_memory_when_valkey_url_is_invalid() {
         // `ValkeyStore::open` only parses the URL — it never connects — so
         // this is a pure unit test: a malformed URL is the one failure mode
@@ -1145,6 +1264,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         });
         let identity = Identity("agent-1".into());
 
@@ -1163,6 +1283,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         });
         let identity = Identity("agent-1".into());
 
@@ -1192,6 +1313,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         }
     }
 
@@ -1277,6 +1399,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         };
         let identity = Identity("agent-1".into());
 
@@ -1337,6 +1460,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         };
         let policy = ThresholdPolicy::new(config);
 
@@ -1378,6 +1502,7 @@ mod tests {
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
             scope: ThresholdScope::PerIdentity,
+            operations: None,
         };
         let policy = ThresholdPolicy::new(config);
 
