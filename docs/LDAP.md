@@ -154,18 +154,32 @@ This matters because multiple unrelated clients behind the same NAT or
 egress otherwise share one IP-based budget; binding under distinct DNs
 gives each its own.
 
-**Important caveat:** `ai-protect` does not correlate the bind request
-against its response — identity switches to the claimed DN as soon as
-the `BindRequest` is seen, before the directory has had any chance to
-accept or reject it. In the common case this is low-risk, since an
-unauthenticated session that fails its bind upstream still gets its
-writes rejected by the real directory. It does mean, however, that a
-caller who can issue arbitrary bind requests can currently defeat the
-per-identity window by binding under a fresh, made-up DN before each
-batch of destructive requests, as long as each individual batch stays
-under the configured caps — see [Known limitations](#known-limitations)
-below. Anonymous binds and SASL binds leave the current identity
-unchanged.
+`ai-protect` correlates the bind request against its response by LDAP
+message ID before upgrading identity: a claimed DN is staged but not
+trusted the moment the `BindRequest` is seen, and only promotes the
+connection's identity once the matching `BindResponse` reports success. A
+bind that fails, or is never answered, leaves identity unchanged — a
+caller can't buy a fresh, empty per-identity budget by claiming a
+made-up DN that never actually authenticates. A `scope = "global"`
+policy entry (see [The threshold policy](#the-threshold-policy)) is the
+recommended backstop against a caller that *can* authenticate under many
+distinct real DNs and churns through them to reset its per-identity
+budget — see [Known limitations](#known-limitations) below.
+
+Anonymous binds (empty DN) and SASL binds leave the current identity
+unchanged — a SASL `name` field isn't password-verified the way a simple
+bind's DN is, so it can't be trusted as identity. This matters most for
+Active Directory, one of the three directories `ai-protect` targets:
+AD deployments overwhelmingly authenticate LDAP traffic — interactive and
+service-account alike — via SASL/GSSAPI (Kerberos), not simple DN+password
+binds. In such an environment, expect most connections to stay tracked
+under their source IP for their whole lifetime, meaning distinct
+Kerberos-authenticated principals sharing an egress (a jump box, a
+container host, a NAT gateway) are pooled into one IP-scoped budget and
+one audit identity, not attributed individually. Simple-bind identity
+upgrade still applies fully to directories or traffic that use it (e.g.
+OpenLDAP/389 DS deployments using simple binds, or any AD traffic that
+does).
 
 ## StartTLS
 
@@ -206,15 +220,24 @@ no separate audit store to reconcile against.
 
 `ai-protect` is early-stage. Before relying on it as a hard security
 boundary rather than a safety net against accidents and unsophisticated
-automation, be aware of the most significant current gap:
+automation, be aware of the most significant current gaps:
 
-- **Identity-churn bypass**: as described in
-  [Identity](#identity-how-who-is-doing-this-is-determined) above, a
-  caller able to send its own bind requests can evade the per-identity
-  window by claiming a fresh DN before each batch, since binds aren't
-  verified against their response before policy starts tracking under
-  the new identity. There is currently no global, identity-independent
-  cap as a backstop against this.
+- **Identity-churn volume**: as described in
+  [Identity](#identity-how-who-is-doing-this-is-determined) above, binds
+  are verified against their response before identity is upgraded, so a
+  made-up DN that never authenticates can't reset a budget. A caller that
+  *can* authenticate under many distinct real DNs, however, can still
+  churn through them to get each one its own fresh per-identity budget —
+  a `scope = "global"` policy entry is the backstop for that, but it isn't
+  on by default in the example policy file.
+- **SASL/Kerberos traffic isn't attributed by principal**: identity stays
+  IP-based for anonymous and SASL-bound connections (a SASL `name` field
+  isn't verified the way a simple bind's DN is). Since Active Directory
+  traffic is predominantly SASL/GSSAPI (Kerberos) in most enterprise
+  deployments, expect this to cover the majority of real AD traffic in
+  practice — distinct principals behind a shared egress share one
+  IP-scoped budget and one audit identity. Sizing a `Global`-scope backstop
+  appropriately matters more, not less, in a Kerberos-heavy deployment.
 
 This and other gaps — including some around unbounded identity
 cardinality and TLS support for the Valkey-backed HA state store — are

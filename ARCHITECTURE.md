@@ -523,6 +523,23 @@ as claims, leaving the current identity unchanged. A connection that never
 binds keeps its address-based identity for its whole lifetime, so
 anonymous/unauthenticated traffic behaves exactly as before.
 
+This SASL exclusion is not a corner case for this project's flagship
+target: Active Directory deployments overwhelmingly authenticate LDAP
+traffic — interactive and service-account alike — via SASL/GSSAPI
+(Kerberos), not simple DN+password binds, and a SASL `name` isn't carried
+in a form a passive proxy can verify without GSS-API/keytab integration.
+In such a deployment, expect most connections to stay on address-based
+identity for their whole lifetime: every distinct Kerberos-authenticated
+principal calling through a shared egress (a jump box, a container host, a
+NAT gateway) is pooled into one `ip:`-keyed `PerIdentity` budget, and a
+compromised principal's actions are attributed only to that shared IP in
+the audit trail, not to the principal responsible. This doesn't let an
+attacker exceed the aggregate IP-scoped cap, but it does mean distinct
+legitimate principals can false-positive-block each other. Weigh this when
+sizing `ThresholdScope::Global` (below) for a Kerberos-heavy deployment —
+it's carrying more of the real budget enforcement than in an
+environment where simple binds predominate.
+
 This closes bind-claim verification specifically; it doesn't by itself cap
 how many *distinct* identities one attacker can churn through (an
 unauthenticated caller can still claim an unbounded number of fresh DNs,

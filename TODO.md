@@ -137,7 +137,7 @@ roughly in the order you'd want to tackle them.
       `AGENTS.md`/`CLAUDE.md` no longer describe a lock-attribute delete as
       unexamined. See `decodes_lock_attribute_delete_as_account_unlock_action`
       in `src/connector/ldap.rs`.
-- [ ] **SASL-bound connections never get identity upgraded from source
+- [x] **SASL-bound connections never get identity upgraded from source
       IP, likely covering most real traffic on this project's flagship
       target directory.** `LdapConnector::bind_request`
       ([src/connector/ldap.rs:300-310](src/connector/ldap.rs)) returns
@@ -171,6 +171,22 @@ roughly in the order you'd want to tackle them.
       SASL binds leave the current identity unchanged" actually covers,
       so it's weighed when sizing the `Global` backstop for a
       Kerberos-heavy deployment.
+      Fixed: no code change (a passive proxy genuinely can't verify a SASL
+      principal without GSS-API/keytab integration, as the fix direction
+      notes), but [ARCHITECTURE.md#identity](ARCHITECTURE.md#identity) and
+      [docs/LDAP.md](docs/LDAP.md) now say explicitly, in the Identity
+      section itself rather than only in a limitations footnote, that AD
+      deployments predominantly use SASL/GSSAPI (Kerberos) rather than
+      simple binds, so most real AD traffic is expected to stay on
+      address-based identity for its whole connection lifetime — pooling
+      distinct Kerberos principals behind a shared egress into one
+      `PerIdentity` budget and one audit identity — and that sizing a
+      `scope = "global"` backstop matters more, not less, in a
+      Kerberos-heavy deployment. This also brought `docs/LDAP.md`'s
+      "Identity" and "Known limitations" sections (previously describing
+      the pre-bind-correlation, no-`Global`-backstop behavior) up to date
+      with the mechanics `ARCHITECTURE.md#identity` already documented
+      accurately, resolving the doc-staleness item below as a side effect.
 - [ ] **The hand-rolled `/healthz`/`/readyz` listener has none of the
       per-connection hardening the main proxy path relies on.**
       `core::health::serve`/`handle_connection`
@@ -197,7 +213,7 @@ roughly in the order you'd want to tackle them.
 
 ## Low — hardening & process
 
-- [ ] **`docs/LDAP.md` documents the pre-fix, more-vulnerable
+- [x] **`docs/LDAP.md` documents the pre-fix, more-vulnerable
       bind-verification behavior as current.** `docs/LDAP.md:148-159`
       ("**Important caveat:** `ai-protect` does not correlate the bind
       request against its response — identity switches to the claimed DN
@@ -225,6 +241,14 @@ roughly in the order you'd want to tackle them.
       description (bind-response correlation, `Global`-scope backstop; the
       remaining known gap is *how many* distinct identities a caller can
       churn through, not whether one claim gets verified).
+      Fixed: as part of documenting SASL/Kerberos identity coverage (see
+      the Medium-severity SASL item above), `docs/LDAP.md`'s "Identity" and
+      "Known limitations" sections were rewritten to describe current
+      behavior — bind-request/response correlation by message ID with
+      promotion only on confirmed success, and `scope = "global"` as the
+      documented backstop against identity churn via distinct real DNs —
+      instead of the pre-fix, no-correlation/no-backstop behavior they
+      previously described.
 - [ ] **The `Global`-scope backstop policy is off by default and only
       ever shown commented out.** `policies/ldap.example.toml`'s only
       `scope = "global"` entry is commented out under "Recommended: a
