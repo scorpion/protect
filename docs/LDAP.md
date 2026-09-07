@@ -157,9 +157,10 @@ directory's point of view, nothing happened.
 Policy limits and audit log entries are tracked per **identity**, which
 starts as the client's source IP address (the connection's, not any
 claimed value) and is upgraded the moment `ai-protect` sees a **simple
-bind** (DN + password, not anonymous, not SASL) naming a non-empty DN —
-from then on, that connection's actions are tracked under the bound DN
-instead of its IP.
+bind** (a non-empty DN paired with a non-empty password — not anonymous,
+not SASL, and not an RFC 4513 §5.1.2 "unauthenticated" bind, see below)
+naming a non-empty DN — from then on, that connection's actions are
+tracked under the bound DN instead of its IP.
 
 This matters because multiple unrelated clients behind the same NAT or
 egress otherwise share one IP-based budget; binding under distinct DNs
@@ -177,9 +178,19 @@ recommended backstop against a caller that *can* authenticate under many
 distinct real DNs and churns through them to reset its per-identity
 budget — see [Known limitations](#known-limitations) below.
 
-Anonymous binds (empty DN) and SASL binds leave the current identity
-unchanged — a SASL `name` field isn't password-verified the way a simple
-bind's DN is, so it can't be trusted as identity. This matters most for
+Anonymous binds (empty DN), SASL binds, and RFC 4513 §5.1.2
+"unauthenticated" binds (a non-empty DN paired with an *empty* password)
+all leave the current identity unchanged. A SASL `name` field isn't
+password-verified the way a simple bind's DN is, so it can't be trusted
+as identity. An unauthenticated bind carries no credential at all —
+plenty of real directories still answer it with a plain `resultCode:
+success` while treating the session as anonymous underneath (this is a
+long-standing, well-known LDAP footgun; Active Directory allows it out
+of the box unless `dSHeuristics` explicitly disables it, and OpenLDAP
+allows it unless `disallow bind_anon_cred` is set), so a successful
+`BindResponse` alone is never enough to promote identity — `ai-protect`
+only stages a bind as a pending claim in the first place when the
+password half of the credential is non-empty. This matters most for
 Active Directory, one of the three directories `ai-protect` targets:
 AD deployments overwhelmingly authenticate LDAP traffic — interactive and
 service-account alike — via SASL/GSSAPI (Kerberos), not simple DN+password

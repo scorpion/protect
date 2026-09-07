@@ -132,9 +132,13 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   `AddResponse`/`ExtendedResp`), recognizes RFC 4511 StartTLS extended
   requests (`upgrade_request`, a separate code path from `decode`) so a
   client can upgrade a plaintext connection to TLS mid-session, and
-  recognizes a simple `BindRequest` naming a non-empty DN (`bind_request`,
-  keyed by message ID) so the proxy can stage that DN as a pending identity
-  claim, plus `BindResponse`s (`bind_response`) so the proxy can correlate a
+  recognizes a simple `BindRequest` naming a non-empty DN with a non-empty
+  password (`bind_request`, keyed by message ID) so the proxy can stage
+  that DN as a pending identity claim — an RFC 4513 §5.1.2
+  "unauthenticated" bind (non-empty DN, empty password) is never staged,
+  since many directories answer it with success while treating the
+  session as anonymous underneath — plus `BindResponse`s (`bind_response`)
+  so the proxy can correlate a
   claim to its outcome by message ID and only key policy/audit identity off
   the DN once the bind is confirmed to have actually succeeded — never on
   the claim alone. Exposes this as both inherent methods (used directly by

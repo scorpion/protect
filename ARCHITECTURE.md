@@ -500,11 +500,16 @@ gap by correlating the two on LDAP message ID:
 
 1. **Client direction** (`handle_client_frame`): when
    [`Connector::bind_request`](src/core/connector.rs) recognizes a frame as
-   a simple (DN + password) `BindRequest` naming a non-empty DN —
+   a simple `BindRequest` naming a non-empty DN with a non-empty password —
    [`LdapConnector::bind_request`](src/connector/ldap.rs) is the one
    implementation — its message ID and claimed DN are staged in
    `BindState.pending`. This is a *claim*, not yet trusted for policy
-   purposes; `Identity` doesn't change here.
+   purposes; `Identity` doesn't change here. An RFC 4513 §5.1.2
+   "unauthenticated" bind (non-empty DN, *empty* password) is never staged,
+   regardless of how the upstream answers it: plenty of real directories
+   answer this shape with a plain success `BindResponse` while treating the
+   session as anonymous underneath, so a successful response alone can't be
+   trusted as evidence of a real credential check.
 2. **Upstream direction** (`relay_upstream_responses` →
    `resolve_pending_bind`): every response frame is checked via
    [`Connector::bind_response`](src/core/connector.rs)
@@ -523,11 +528,14 @@ address-based identity from the other direction too: two agents behind the
 same NAT/egress no longer share one blast-radius budget as long as they
 bind under different, real DNs (see the
 `bind_dn_becomes_identity_so_same_peer_gets_separate_budgets` test in the
-same file). Anonymous binds (empty DN) and SASL binds (the `name` field
-isn't password-verified the way it is for a simple bind) are never staged
-as claims, leaving the current identity unchanged. A connection that never
-binds keeps its address-based identity for its whole lifetime, so
-anonymous/unauthenticated traffic behaves exactly as before.
+same file). Anonymous binds (empty DN), SASL binds (the `name` field isn't
+password-verified the way it is for a simple bind), and unauthenticated
+binds (empty password, see above — the
+`unauthenticated_bind_does_not_change_identity_or_reset_budget` test in
+the same file) are never staged as claims, leaving the current identity
+unchanged. A connection that never binds keeps its address-based identity
+for its whole lifetime, so anonymous/unauthenticated traffic behaves
+exactly as before.
 
 This SASL exclusion is not a corner case for this project's flagship
 target: Active Directory deployments overwhelmingly authenticate LDAP

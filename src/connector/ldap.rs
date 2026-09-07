@@ -120,24 +120,38 @@ const MAX_DN_LEN: usize = 256;
 /// its full content (not just a truncated prefix) — so two distinct
 /// oversized DNs that happen to share a prefix still don't collide into the
 /// same `Identity`/history bucket, while the representation itself stays
-/// bounded in size regardless of how large the original DN was. The hash
-/// uses `DefaultHasher`'s fixed (unrandomized) keys deliberately, so the
-/// same oversized DN maps to the same marker within one process run and
-/// across a restart — required for `state_db`-backed history and the
-/// sliding window itself to keep working for a caller using one
-/// consistently oversized DN.
+/// bounded in size regardless of how large the original DN was.
+///
+/// The hash is keyed with `DN_HASH_KEY`, a `RandomState` generated once from
+/// OS randomness the first time this runs and reused for the rest of the
+/// process's life — not `DefaultHasher`'s fixed, hardcoded keys. A fixed key
+/// is identical across every process and every run, so it provides no real
+/// collision resistance against a caller who deliberately wants two
+/// *different* oversized DNs to land on the same marker: since DNs aren't
+/// secret and the key would be public and constant, an attacker could search
+/// offline (a 64-bit output is only a birthday-bound-strength ~2^32 search)
+/// for a garbage DN that collides with a target's real oversized DN, then
+/// launder actions under the victim's `ThresholdPolicy` bucket and audit
+/// identity. Keying with a per-process secret closes that off — collision
+/// search would have to happen live against a running process, and its
+/// results die with that process. The trade-off: the same oversized DN maps
+/// to a *different* marker after a restart, or on another instance, so
+/// `state_db`-backed history for a caller using one consistently oversized
+/// DN doesn't survive a restart the way it does for every DN under
+/// `MAX_DN_LEN`. That's judged acceptable — a real DN is a handful of RDNs
+/// and nowhere close to this length, so this only ever affects already-
+/// abnormal traffic.
 fn cap_dn(dn: String) -> String {
     if dn.len() <= MAX_DN_LEN {
         return dn;
     }
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    dn.hash(&mut hasher);
-    format!(
-        "(oversized DN, {} bytes, hash {:016x})",
-        dn.len(),
-        hasher.finish()
-    )
+    use std::hash::BuildHasher;
+    static DN_HASH_KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    let hash = DN_HASH_KEY
+        .get_or_init(std::collections::hash_map::RandomState::new)
+        .hash_one(&dn);
+    format!("(oversized DN, {} bytes, hash {:016x})", dn.len(), hash)
 }
 
 /// Case-folds a claimed bind DN before it's capped (`cap_dn`) and used as an
@@ -400,27 +414,33 @@ impl LdapConnector {
     }
 
     /// Decode a BindRequest and, if it's a simple (DN + password) bind naming
-    /// a non-empty DN, return its message ID and that DN so the proxy can
-    /// stage it as a pending identity claim instead of trusting it
-    /// immediately — necessary because two agents behind the same NAT/egress
-    /// otherwise share one blast-radius budget, and a source address alone
-    /// proves nothing about which principal is acting, but a *claimed* DN
-    /// proves nothing either until the directory actually verifies the
-    /// password (see `bind_response`, which correlates by this same message
-    /// ID). Anonymous binds (empty DN) and SASL binds (the `name` field
-    /// there isn't password-verified the way it is for a simple bind — the
-    /// real identity comes from the SASL mechanism) return `None`, leaving
-    /// any pending claim alone, as does every non-bind frame. The DN is
-    /// case-folded (`normalize_bind_dn`) and passed through `cap_dn` before
-    /// returning, since it eventually becomes an `Identity` — see each
-    /// function's doc comment.
+    /// a non-empty DN with a non-empty password, return its message ID and
+    /// that DN so the proxy can stage it as a pending identity claim instead
+    /// of trusting it immediately — necessary because two agents behind the
+    /// same NAT/egress otherwise share one blast-radius budget, and a source
+    /// address alone proves nothing about which principal is acting, but a
+    /// *claimed* DN proves nothing either until the directory actually
+    /// verifies the password (see `bind_response`, which correlates by this
+    /// same message ID). Anonymous binds (empty DN), SASL binds (the `name`
+    /// field there isn't password-verified the way it is for a simple bind —
+    /// the real identity comes from the SASL mechanism), and RFC 4513
+    /// §5.1.2 "unauthenticated" binds (a non-empty DN paired with an empty
+    /// password — many directories still answer these with success while
+    /// treating the session as anonymous underneath, so a `BindResponse`
+    /// success alone can't be trusted as a real credential check) all
+    /// return `None`, leaving any pending claim alone, as does every
+    /// non-bind frame. The DN is case-folded (`normalize_bind_dn`) and
+    /// passed through `cap_dn` before returning, since it eventually
+    /// becomes an `Identity` — see each function's doc comment.
     pub fn bind_request(&self, frame: &[u8]) -> Result<Option<(u32, String)>> {
         let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
         let ProtocolOp::BindRequest(bind) = &message.protocol_op else {
             return Ok(None);
         };
-        if bind.name.0.is_empty() || !matches!(bind.authentication, AuthenticationChoice::Simple(_))
-        {
+        let AuthenticationChoice::Simple(password) = &bind.authentication else {
+            return Ok(None);
+        };
+        if bind.name.0.is_empty() || password.is_empty() {
             return Ok(None);
         }
         Ok(Some((
@@ -693,6 +713,17 @@ pub(crate) mod test_support {
         )
     }
 
+    pub fn unauthenticated_bind_request_frame(message_id: u32, dn: &str) -> Vec<u8> {
+        encode_message(
+            message_id,
+            ProtocolOp::BindRequest(BindRequest::new(
+                3,
+                dn.into(),
+                AuthenticationChoice::Simple(OctetString::from(Vec::new())),
+            )),
+        )
+    }
+
     pub fn sasl_bind_request_frame(message_id: u32, dn: &str) -> Vec<u8> {
         encode_message(
             message_id,
@@ -741,7 +772,7 @@ mod tests {
         add_request_frame, bind_request_frame, decode_message, del_request_frame,
         extended_request_frame, mod_dn_request_frame, modify_request_frame,
         modify_request_frame_with_operation, password_modify_request_frame,
-        sasl_bind_request_frame,
+        sasl_bind_request_frame, unauthenticated_bind_request_frame,
     };
     use super::*;
 
@@ -1124,6 +1155,24 @@ mod tests {
     }
 
     #[test]
+    fn cap_dn_never_collides_across_many_equal_length_oversized_dns() {
+        // Regression guard for the keyed-hash fix: with an unkeyed hash
+        // (the old `DefaultHasher::new()` behavior), the key is public and
+        // constant, so an attacker can search offline for a same-length
+        // garbage DN that collides with a victim's. This doesn't prove
+        // collision-resistance on its own, but it does assert the current
+        // keyed hash produces distinct markers for a representative sample
+        // of equal-length oversized DNs, so a future change back to an
+        // unkeyed hash doesn't silently reintroduce the gap unnoticed.
+        let dn_len = MAX_DN_LEN * 4;
+        let capped: std::collections::HashSet<String> = (0..1000u32)
+            .map(|i| cap_dn(format!("{i:0width$}", width = dn_len)))
+            .collect();
+
+        assert_eq!(capped.len(), 1000);
+    }
+
+    #[test]
     fn bind_request_caps_an_oversized_claimed_dn() {
         let huge_dn = "cn=".to_string() + &"a".repeat(MAX_DN_LEN * 4);
         let frame = bind_request_frame(7, &huge_dn);
@@ -1137,6 +1186,15 @@ mod tests {
     #[test]
     fn bind_request_ignores_anonymous_bind() {
         let frame = bind_request_frame(1, "");
+
+        let claim = connector().bind_request(&frame).unwrap();
+
+        assert!(claim.is_none());
+    }
+
+    #[test]
+    fn bind_request_ignores_unauthenticated_bind() {
+        let frame = unauthenticated_bind_request_frame(1, "cn=alice,dc=example,dc=com");
 
         let claim = connector().bind_request(&frame).unwrap();
 

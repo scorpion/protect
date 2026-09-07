@@ -532,6 +532,7 @@ mod tests {
     use crate::connector::ldap::test_support::{
         bind_request_frame, decode_message, del_request_frame, encode_message,
         extended_request_frame, modify_request_frame, password_modify_request_frame,
+        unauthenticated_bind_request_frame,
     };
     use crate::connector::ldap::{LdapConnector, START_TLS_OID, read_frame};
     use crate::core::policy::threshold::{ThresholdConfig, ThresholdPolicy, ThresholdScope};
@@ -1057,6 +1058,151 @@ mod tests {
         // A second modify on the same connection: if the failed bind had
         // (incorrectly) swapped identity to the throwaway DN, this would
         // land in a brand-new, empty budget and be allowed instead of
+        // blocked.
+        client_stream
+            .write_all(&modify_request_frame(
+                3,
+                "cn=alice,dc=example,dc=com",
+                "userAccountControl",
+                b"514",
+            ))
+            .await
+            .unwrap();
+        let second_reply = read_frame(&mut client_stream).await.unwrap().unwrap();
+        match decode_message(&second_reply).protocol_op {
+            ProtocolOp::ModifyResponse(ModifyResponse(result)) => {
+                assert_eq!(result.result_code, ResultCode::UnwillingToPerform);
+            }
+            other => panic!("expected ModifyResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_bind_does_not_change_identity_or_reset_budget() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let modify_response = |message_id: u32| {
+            encode_message(
+                message_id,
+                ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                    ResultCode::Success,
+                    "".into(),
+                    "".into(),
+                ))),
+            )
+        };
+        let bind_response = |message_id: u32, result_code: ResultCode| {
+            encode_message(
+                message_id,
+                ProtocolOp::BindResponse(rasn_ldap::BindResponse::new(
+                    result_code,
+                    "".into(),
+                    "".into(),
+                    None,
+                    None,
+                )),
+            )
+        };
+
+        tokio::spawn(async move {
+            let (mut upstream_stream, _) = upstream_listener.accept().await.unwrap();
+
+            let modify_frame = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+            let message_id = decode_message(&modify_frame).message_id;
+            upstream_stream
+                .write_all(&modify_response(message_id))
+                .await
+                .unwrap();
+
+            // Many real directories answer an RFC 4513 §5.1.2
+            // unauthenticated (empty-password) bind with plain success
+            // while treating the session as anonymous underneath — the
+            // wire-level result gives no indication that no credential was
+            // actually checked, which is exactly why `bind_request` must
+            // never stage this as a pending claim in the first place.
+            let bind_frame = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+            let message_id = decode_message(&bind_frame).message_id;
+            upstream_stream
+                .write_all(&bind_response(message_id, ResultCode::Success))
+                .await
+                .unwrap();
+
+            // The third (blocked) modify below never reaches upstream — keep
+            // this connection open a little longer instead of dropping it
+            // immediately, so the proxy's two concurrent relay directions
+            // (raced via `tokio::select!` in `handle_connection`) don't tear
+            // the whole connection down on upstream EOF before the client
+            // side has a chance to read the locally-generated rejection.
+            let _ = timeout(Duration::from_millis(300), read_frame(&mut upstream_stream)).await;
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::new(upstream_addr, None));
+        // Budget for exactly one action per identity: a second modify on the
+        // same connection must be blocked locally unless the unauthenticated
+        // bind below incorrectly promotes identity to a fresh, made-up DN.
+        let policies: Vec<Arc<dyn Policy>> =
+            vec![Arc::new(ThresholdPolicy::new(ThresholdConfig {
+                max_per_request: 10,
+                max_per_window: 1,
+                window: Duration::from_secs(60),
+                state_db: None,
+                flush_interval: Duration::from_secs(2),
+                max_tracked_identities: 100_000,
+                scope: ThresholdScope::PerIdentity,
+            }))];
+        tokio::spawn(serve(
+            proxy_listener,
+            None,
+            None,
+            connector,
+            policies_rx(policies),
+            ConnectionLimits::default(),
+            no_shutdown(),
+        ));
+
+        let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        client_stream
+            .write_all(&modify_request_frame(
+                1,
+                "cn=alice,dc=example,dc=com",
+                "userAccountControl",
+                b"514",
+            ))
+            .await
+            .unwrap();
+        let first_reply = read_frame(&mut client_stream).await.unwrap().unwrap();
+        match decode_message(&first_reply).protocol_op {
+            ProtocolOp::ModifyResponse(ModifyResponse(result)) => {
+                assert_eq!(result.result_code, ResultCode::Success);
+            }
+            other => panic!("expected ModifyResponse, got {other:?}"),
+        }
+
+        // An empty-password bind naming a brand-new, made-up DN, chosen so a
+        // naive "trust any successful bind" implementation would give it a
+        // fresh, empty budget — but the upstream's success here never
+        // reflects a real credential check.
+        client_stream
+            .write_all(&unauthenticated_bind_request_frame(
+                2,
+                "cn=throwaway,dc=example,dc=com",
+            ))
+            .await
+            .unwrap();
+        let bind_reply = read_frame(&mut client_stream).await.unwrap().unwrap();
+        match decode_message(&bind_reply).protocol_op {
+            ProtocolOp::BindResponse(rasn_ldap::BindResponse { result_code, .. }) => {
+                assert_eq!(result_code, ResultCode::Success);
+            }
+            other => panic!("expected BindResponse, got {other:?}"),
+        }
+
+        // A second modify on the same connection: if the unauthenticated
+        // bind had (incorrectly) swapped identity to the throwaway DN, this
+        // would land in a brand-new, empty budget and be allowed instead of
         // blocked.
         client_stream
             .write_all(&modify_request_frame(
