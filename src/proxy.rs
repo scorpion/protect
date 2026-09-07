@@ -362,6 +362,44 @@ struct BindState {
     pending: StdMutex<HashMap<u32, String>>,
 }
 
+/// Bound on how many not-yet-resolved bind claims `BindState.pending` can
+/// accumulate on one connection. A well-behaved client's claims are drained
+/// promptly by `resolve_pending_bind` as `BindResponse`s arrive, so ordinary
+/// use never comes close to this; it exists only to stop a
+/// pre-authenticated client (reaching `bind_request` requires no valid
+/// credentials at all) from pipelining `BindRequest`s without ever reading a
+/// response and growing this map without bound — unconstrained by
+/// `max_connections` or `io_timeout`, since both cap *connection* count/
+/// idle time, not how much one already-open connection can stage here (see
+/// TODO.md).
+const MAX_PENDING_BINDS: usize = 1024;
+
+/// Stages `dn` in `pending` under `message_id`, first evicting the
+/// oldest (smallest) message ID if `pending` is already at
+/// `MAX_PENDING_BINDS` and `message_id` isn't already staged — bounding
+/// `pending`'s size regardless of how many claims a connection leaves
+/// unresolved. LDAP message IDs aren't guaranteed monotonic by RFC 4511, but
+/// real clients issue them that way, and the exact choice of victim doesn't
+/// matter for the memory bound this exists to guarantee: eviction only ever
+/// runs on a connection that's already misbehaving by leaving
+/// `MAX_PENDING_BINDS` binds unresolved, never in ordinary use. Re-staging
+/// under a message ID already pending (e.g. a client re-sending under the
+/// same still-unresolved ID) overwrites in place and never evicts.
+fn stage_pending_bind(pending: &mut HashMap<u32, String>, message_id: u32, dn: String) {
+    if pending.len() >= MAX_PENDING_BINDS
+        && !pending.contains_key(&message_id)
+        && let Some(&oldest) = pending.keys().min()
+    {
+        pending.remove(&oldest);
+        tracing::warn!(
+            message_id = oldest,
+            max_pending_binds = MAX_PENDING_BINDS,
+            "connection has too many outstanding unresolved BindRequests; evicting oldest pending bind claim"
+        );
+    }
+    pending.insert(message_id, dn);
+}
+
 async fn relay_upstream_responses(
     upstream_read: &mut (impl AsyncRead + Unpin + Send),
     client_write: Arc<Mutex<WriteHalf<ClientStream>>>,
@@ -443,7 +481,7 @@ async fn handle_client_frame(
     // claim that's never actually password-verified upstream can't buy a
     // fresh, empty blast-radius budget under a made-up name.
     if let Some((message_id, dn)) = ctx.connector.bind_request(&frame)? {
-        ctx.bind_state.pending.lock().insert(message_id, dn);
+        stage_pending_bind(&mut ctx.bind_state.pending.lock(), message_id, dn);
     }
 
     let Some(action) = ctx.connector.decode(&frame)? else {
@@ -545,6 +583,44 @@ mod tests {
     /// reports.
     fn policies_rx(policies: Vec<Arc<dyn Policy>>) -> watch::Receiver<Vec<Arc<dyn Policy>>> {
         watch::channel(policies).1
+    }
+
+    #[test]
+    fn stage_pending_bind_evicts_oldest_message_id_once_at_capacity() {
+        let mut pending = HashMap::new();
+        for id in 0..MAX_PENDING_BINDS as u32 {
+            stage_pending_bind(&mut pending, id, format!("cn=user{id}"));
+        }
+        assert_eq!(pending.len(), MAX_PENDING_BINDS);
+
+        // A pre-authenticated client pipelining BindRequests without ever
+        // reading a response must not grow `pending` past the cap.
+        stage_pending_bind(
+            &mut pending,
+            MAX_PENDING_BINDS as u32,
+            "cn=overflow".to_string(),
+        );
+        assert_eq!(pending.len(), MAX_PENDING_BINDS);
+        assert!(
+            !pending.contains_key(&0),
+            "oldest (smallest) message id should have been evicted to make room"
+        );
+        assert!(pending.contains_key(&(MAX_PENDING_BINDS as u32)));
+    }
+
+    #[test]
+    fn stage_pending_bind_restaging_an_existing_id_does_not_evict() {
+        let mut pending = HashMap::new();
+        for id in 0..MAX_PENDING_BINDS as u32 {
+            stage_pending_bind(&mut pending, id, format!("cn=user{id}"));
+        }
+
+        // A client re-sending a BindRequest under a message id it already
+        // has an unresolved claim for must overwrite in place, not evict a
+        // different, unrelated claim to make room.
+        stage_pending_bind(&mut pending, 5, "cn=updated".to_string());
+        assert_eq!(pending.len(), MAX_PENDING_BINDS);
+        assert_eq!(pending.get(&5), Some(&"cn=updated".to_string()));
     }
 
     #[tokio::test]

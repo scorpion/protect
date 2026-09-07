@@ -1,268 +1,213 @@
 # Enterprise deployment TODO
 
-A gap list from a follow-up security review (2026-09-06) of the current state
-(see [ARCHITECTURE.md](ARCHITECTURE.md)), conducted after the previous round
-of hardening (frame-size caps, connection limits/timeouts, mTLS, StartTLS,
-graceful shutdown, hot-reload, metrics, health checks, structured logging,
-fuzzing — all still in place and not re-litigated here). Grouped by
-priority; within a group, roughly in the order you'd want to tackle them.
+A gap list from a full security review (2026-09-06) of the current state
+(see [ARCHITECTURE.md](ARCHITECTURE.md)). This pass re-confirmed the
+previous rounds of hardening are still in place and working as documented
+— frame-size/DN-length caps, connection limits/timeouts, mTLS, StartTLS,
+graceful shutdown, hot-reload, metrics, health checks, structured logging
+with per-field truncation, fuzzing, bind-response correlation for
+`Identity`, `max_tracked_identities` eviction, TLS for the Valkey state
+store, non-poisoning `parking_lot` mutexes on every hot shared lock, and a
+clean `cargo audit` (1239 advisories checked, 256 crates, no hits) — none
+of that is re-litigated below. Grouped by severity; within a group,
+roughly in the order you'd want to tackle them.
 
 ## Critical — policy bypass & resource exhaustion
 
-- [x] **The blast-radius policy can be bypassed by identity churn.**
-      [`LdapConnector::bind_identity`](src/connector/ldap.rs) accepts any DN
-      named in a simple `BindRequest` at face value and
-      [`proxy::handle_client_frame`](src/proxy.rs) swaps the connection's
-      `Identity` to it immediately — it is never correlated against the
-      actual `BindResponse` on the reply path (the request and response
-      relay loops in `proxy.rs` share no state to do this).
-      [`ThresholdPolicy::evaluate`](src/core/policy/threshold.rs) then
-      buckets every budget purely per `Identity`, and there is no policy
-      type anywhere that enforces a global, identity-independent ceiling.
-      The consequence: a caller sends a throwaway `BindRequest` naming a
-      fresh, made-up DN before each batch of destructive operations and
-      gets a brand-new, empty per-identity budget every time, as long as
-      each individual batch stays under `max_per_request`/`max_per_window`
-      — completely defeating "4 accounts is fine, 4,000 is not" for exactly
-      the "compromised credential" actor named in CLAUDE.md's own threat
-      model. [ARCHITECTURE.md#identity](ARCHITECTURE.md#identity) already
-      acknowledges the bind is unverified, but only reasons about the
-      *write itself* getting rejected upstream afterward — it doesn't
-      address that the local forward-or-block decision is made using the
-      unverified claimed identity *before* that rejection could ever
-      happen. Fix direction: don't trust a claimed identity for policy
-      purposes until its `BindResponse` is seen to be `Success` (requires
-      correlating request/response by message ID, which the proxy
-      currently doesn't do at all); add a global, identity-independent
-      aggregate cap as a backstop regardless of how identity is derived.
-      Fixed: `bind_identity` is split into `Connector::bind_request`
-      (stages a claimed DN, keyed by LDAP message ID, without touching
-      identity) and `Connector::bind_response` (reports whether the
-      correlated response succeeded); a new connection-scoped `BindState`
-      in `src/proxy.rs`, shared between the client- and upstream-facing
-      relay directions, resolves a pending claim — promoting `Identity`
-      only on confirmed success — the moment the matching `BindResponse` is
-      seen. A claimed-but-unverified DN can no longer buy a fresh budget
-      (see the `unverified_bind_does_not_change_identity_or_reset_budget`
-      test in `src/proxy.rs`). Separately, `ThresholdPolicy` gained a
-      `scope` option (`PerIdentity`, the default, or `Global`, one shared
-      bucket ignoring identity entirely) so a second `[[policy]]` entry can
-      run as the identity-independent aggregate backstop, undefeatable by
-      identity churn since it isn't keyed by identity at all — see the
-      commented-out example in `policies/ldap.example.toml`. Known
-      limitation: this closes *verification* of one claimed identity, not
-      the number of distinct identities a caller can churn through — an
-      unauthenticated caller can still bind under an unbounded number of
-      real, distinct DNs (if it has credentials for them) or unverified
-      claims (which now just never promote), each only bounded by the
-      `Global` backstop's aggregate ceiling, not a per-caller one. Unbounded
-      history-map cardinality and the IP/DN identity-namespace collision
-      were tracked as the following two items — both since fixed.
-- [x] **Identity namespace collision between peer-IP and bind-DN
-      derivation.** [`Identity`](src/core/identity.rs) is one flat,
-      un-namespaced string used both for `Identity::from_peer_addr`
-      (`"10.0.0.5"`) and for a bind DN
-      (`LdapConnector::bind_identity`). A bind DN deliberately crafted to
-      equal a real peer's IP-address string collides with that peer's
-      budget in `ThresholdPolicy`'s history map, letting an attacker
-      pollute or exhaust a legitimate peer's rate limit without ever
-      touching that peer's actual connection. Fix direction: prefix/tag
-      identity values by their source (`ip:`/`dn:`) so the two derivation
-      methods can never collide.
-      Fixed: `Identity::from_peer_addr` now formats as `ip:<addr>` and a
-      new `Identity::from_bind_dn` (used by the confirmed-bind promotion
-      path in `src/proxy.rs`, replacing a bare `Identity(dn)` construction)
-      formats as `dn:<dn>` — the two prefixes are disjoint by construction,
-      so a DN crafted to read identically to some peer's IP-address string
-      (e.g. a bind DN of literally `127.0.0.1`) now produces `dn:127.0.0.1`,
-      never colliding with that peer's `ip:127.0.0.1` bucket in
-      `ThresholdPolicy`'s history map. See the
-      `peer_ip_and_bind_dn_never_collide_even_with_matching_text` test in
-      `src/core/identity.rs`.
-- [x] **Unbounded identity cardinality enables unauthenticated memory/disk
-      exhaustion.** Every actionable request — even one immediately
-      blocked by the window check — creates a permanent entry in
-      [`ThresholdPolicy`](src/core/policy/threshold.rs)'s
-      `Mutex<HashMap<Identity, VecDeque<Instant>>>`
-      (`entry(ctx.identity.clone()).or_default()`). Entries are pruned by
-      *age* only, never by count, and an `Identity` string has no length
-      cap — it can be as large as a single BER frame allows
-      (`MAX_FRAME_CONTENT_LEN`, 16 MiB). Combined with the identity-churn
-      issue above, an unauthenticated network client with no valid
-      credentials at all can grow this map without bound:
-      `connect → BindRequest(simple, DN=<random unique string>) →
-      DelRequest(anything) → close`, repeated. The same pattern grows the
-      optional persistent backends too —
-      [`SqliteStore`](src/core/policy/store/sqlite.rs)/
-      [`ValkeyStore`](src/core/policy/store/valkey.rs) also only prune by
-      age, not by distinct-identity count, so a steady stream of fresh fake
-      identities grows the on-disk table / Valkey keyspace forever as well.
-      Fix direction: cap identity-string length at ingestion (bind DN, and
-      really any DN accepted into `Action.target`), and bound the history
-      map's cardinality (LRU eviction or a hard cap with a logged warning)
-      independently of the existing age-based pruning.
-      Fixed: two independent bounds. (1) A new `cap_dn` helper in
-      [`src/connector/ldap.rs`](src/connector/ldap.rs) caps every DN
-      extracted from a decoded message (bind DN, and modify/del/add/
-      password-modify `Action.target`) at 256 bytes; a DN over that replaces
-      itself with a small fixed-shape marker carrying its true length and a
-      stable hash of its full content, so oversized DNs stay bounded in size
-      without colliding into each other. (2) A new `max_tracked_identities`
-      config field on `ThresholdConfig` (default 100,000) hard-caps
-      `ThresholdPolicy`'s history map: once reached, admitting a
-      never-before-seen identity evicts the tracked identity with the least
-      recently recorded activity first (`evict_stalest_until`), applied both
-      on the request hot path (`evaluate`) and when folding a `state_db`
-      snapshot back in (`sync_once`/`ThresholdPolicy::new`), so the same
-      cap holds however history got populated. See
-      `caps_tracked_identity_count_by_evicting_the_stalest_one` in
-      `src/core/policy/threshold.rs` and
-      `cap_dn_bounds_the_size_of_an_oversized_dn` in
-      `src/connector/ldap.rs`.
-
-## High
-
-- [x] **No TLS support for the Valkey-backed HA state store.**
-      [`Cargo.toml`](Cargo.toml)'s `redis` dependency
-      (`features = ["tokio-comp", "connection-manager"]`) enables no
-      `tls-*` feature, and no TLS-capable crate appears anywhere in
-      `Cargo.lock`'s dependency graph — confirmed by grepping for
-      `native-tls`/`rustls-tls` there. A `rediss://` URL in
-      [`ValkeyStateDbConfig`](src/core/policy/threshold.rs) will fail at
-      runtime; there is currently no way to encrypt the connection between
-      `ai-protect` instances and the shared Valkey store carrying
-      rate-limit/identity bookkeeping. For a real multi-instance HA
-      deployment this likely fails typical enterprise in-transit-encryption
-      requirements, and it isn't called out as a limitation anywhere in
-      ARCHITECTURE.md's "Valkey-backed policy state" section. Fix
-      direction: enable a `tls-*` feature on the `redis` dependency, thread
-      an optional CA/cert config through `ValkeyStateDbConfig`, and
-      document the `rediss://` scheme.
-      Fixed: `Cargo.toml`'s `redis` dependency gained the
-      `tokio-rustls-comp` feature (pulls in `tls-rustls`, unifying with the
-      `rustls`/`tokio-rustls` versions this crate already depends on for
-      LDAPS). `ValkeyStateDbConfig` gained optional `ca_file` and
-      `client_cert` (`{ cert_file, key_file }`) fields, mirroring
-      `UpstreamTlsConfig`'s shape for the same two cases (internal CA,
-      mutual TLS). A new [`ValkeyTlsConfig`](src/core/policy/store/valkey.rs)
-      carries these into `ValkeyStore::open`, which now installs the
-      process-wide `rustls` crypto provider
-      (`core::tls::ensure_crypto_provider`, exposed `pub(crate)` for this)
-      before building a client — via plain `redis::Client::open` when no
-      CA/cert override is set (a `rediss://` URL still works, validated
-      against the OS trust store, exactly like an `upstream_tls` LDAPS hop
-      with no `ca_file`), or `redis::Client::build_with_tls` when one is.
-      Documented in ARCHITECTURE.md's "Valkey-backed policy state" section
-      and `policies/ldap.example.toml`. See
-      `parses_state_db_valkey_tls_config` in
-      `src/core/policy/threshold.rs` and
-      `open_rejects_a_client_cert_without_a_matching_key` in
-      `src/core/policy/store/valkey.rs`.
+- [x] **Unbounded per-connection bind-claim map allows a single connection
+      to exhaust process memory.** `BindState.pending`
+      (`StdMutex<HashMap<u32, String>>`, [src/proxy.rs:362](src/proxy.rs))
+      is populated by `handle_client_frame` every time
+      `Connector::bind_request` recognizes a simple `BindRequest`
+      ([src/proxy.rs:445-447](src/proxy.rs)), and only ever drained by
+      `resolve_pending_bind` when the correlated `BindResponse` arrives
+      from the upstream ([src/proxy.rs:387-402](src/proxy.rs)). Nothing
+      caps how many distinct message IDs one connection can have staged at
+      once. The client and upstream relay directions run independently
+      (`tokio::select!` in `handle_connection`), so `ai-protect`'s own
+      insert rate is bounded only by how fast one TCP connection can
+      deliver bytes — not by how fast the real directory answers binds,
+      which is often deliberately slow (password hashing, lockout
+      checks). A single pre-authenticated client — reaching `decode`/
+      `bind_request` requires no valid credentials at all — can pipeline
+      BindRequests continuously without ever reading a response and grow
+      this map without bound on one connection, unconstrained by
+      `max_connections`, `io_timeout` (a per-op/idle timeout, not a
+      connection-lifetime cap), or `max_tracked_identities` (which only
+      bounds `ThresholdPolicy`'s history map, a completely separate
+      structure). An OOM here takes down every `[[proxy]]` entry in the
+      process, not just the offending connection — a full availability
+      outage of whatever directory traffic depends on this proxy being up.
+      Fix direction: cap `pending`'s size per connection (e.g. drop the
+      oldest unresolved claim, or close the connection once a threshold of
+      outstanding, unresolved binds is reached).
+      Fixed: `handle_client_frame` now stages every claim through a new
+      `stage_pending_bind` helper ([src/proxy.rs](src/proxy.rs)) instead of
+      inserting directly. Once `pending` reaches a new `MAX_PENDING_BINDS`
+      constant (1024) and a genuinely new message ID arrives, it evicts the
+      oldest (smallest) message ID first — logged at `warn` — capping
+      per-connection memory regardless of how many `BindRequest`s a client
+      pipelines without ever reading a response; re-staging under a
+      message ID already pending overwrites in place without evicting
+      anything. Never triggers in ordinary use, since a well-behaved
+      client's claims are drained promptly by `resolve_pending_bind`. See
+      `stage_pending_bind_evicts_oldest_message_id_once_at_capacity` and
+      `stage_pending_bind_restaging_an_existing_id_does_not_evict` in
+      `src/proxy.rs`.
+- [ ] **`ModifyDNRequest` (RFC 4511 §4.9 — rename/move) is not decoded or
+      policed at all.** `LdapConnector::decode`
+      ([src/connector/ldap.rs:209-284](src/connector/ldap.rs)) matches
+      `ModifyRequest`, `DelRequest`, `AddRequest`, and the Password-Modify
+      `ExtendedReq`; every other `ProtocolOp` — including
+      `ProtocolOp::ModDnRequest(ModifyDnRequest)`, which `rasn_ldap` fully
+      models — falls through the wildcard `_ => Ok(None)` at line 282 and
+      is forwarded byte-for-byte, unlogged and unthrottled, exactly like a
+      read-only `SearchRequest`/`CompareRequest`. `docs/LDAP.md:27`
+      candidly lists "modify-DN" alongside those read-only operations as
+      passing through untouched, without flagging it as a residual gap.
+      ModifyDN achieves several of the exact outcomes this proxy exists to
+      police: moving an account into a "Disabled Users"/quarantine OU is a
+      standard Active Directory account-disable workflow, functionally
+      equivalent to the `AccountLock` action this proxy already recognizes
+      via `userAccountControl`; a bulk rename/relocation can break
+      identity lookups for downstream automation as effectively as a bulk
+      delete. Because `decode` returns `None`, none of it reaches
+      `evaluate_all`, `audit::log_decision`, or the Prometheus counters —
+      a bulk ModifyDN campaign leaves zero trace in the one place this
+      proxy is supposed to guarantee visibility into. Fix direction:
+      decode `ProtocolOp::ModDnRequest` into an `Action` unconditionally
+      (a new `OperationKind`, e.g. `Rename`), the same way `Delete`/
+      `Create` are handled today — no cheap way to filter "account-like"
+      without querying the directory — and add the matching
+      `ModifyDnResponse` case to `build_rejection`.
 
 ## Medium
 
-- [x] **Unbounded DN/identity string length turns the "logs never rotate"
-      limitation into an attacker-controlled disk-fill lever.**
-      [`audit::log_decision`](src/core/audit.rs) writes the raw
-      `identity`/`target` strings into every log line with no truncation.
-      ARCHITECTURE.md's "Known gaps" section already notes
-      `logs/ldap.log` never rotates itself, but treats that as an
-      operational concern about ordinary traffic volume. Combined with the
-      lack of a length cap noted above, an attacker can inflate the disk
-      fill rate on demand by repeatedly issuing actionable requests
-      carrying near-16-MiB DNs. Fix direction: cap the length of
-      identity/target strings actually written to log output, independent
-      of (and in addition to) fixing the underlying cardinality issue
-      above.
-      Fixed: `audit::log_decision` now passes `identity`/`target` through a
-      new `truncate_for_log` helper (cap `MAX_LOGGED_FIELD_LEN`, 512 bytes)
-      before writing the log line, truncating on a UTF-8 char boundary and
-      appending the original byte length. Deliberately independent of
-      `connector::ldap::cap_dn`'s 256-byte DN cap — `audit` stays decoupled
-      from any specific `Connector`, so it can't assume every
-      implementation caps these upstream; this is the last line of defense
-      regardless. See `logs_an_oversized_identity_and_target_truncated` and
-      `truncate_for_log_does_not_split_a_multi_byte_char` in
-      `src/core/audit.rs`.
-- [x] **`/metrics` and `/health` unauthenticated exposure needs to be a
-      hard deployment requirement, not just documentation.** Both are
-      correctly documented as unauthenticated by design
-      ([`config.rs`](src/config.rs)'s doc comments on `MetricsConfig`/
-      `HealthConfig`) and off by default, but nothing enforces that a
-      deployment binds them to a private/localhost-only interface — it's
-      easy to accidentally expose either on a routable address. Fix
-      direction: add this as an explicit, checked item in deployment
-      docs/runbooks (firewall or network-policy restriction), since the
-      code itself can't enforce a network topology decision.
-      Fixed: added a "Production deployment checklist" section to
-      [docs/INSTALLATION.md](docs/INSTALLATION.md#production-deployment-checklist),
-      the end-user deployment doc, spelling out that binding
-      `[metrics]`/`[health]`'s `listen_addr` to localhost/a private range is
-      necessary but not sufficient on its own (a still-routable private
-      address, or a later config change widening the bind), and requiring
-      an actual firewall rule or network policy restricting both ports to
-      metrics/orchestration systems as a checked go-live item, not just a
-      documentation note. No code change: this is a network-topology
-      decision the code can't enforce, as the fix direction says.
+- [ ] **Bulk *unlocking* via a `Delete`-type change to a lock attribute is
+      not policed.** The `touches_lock_attribute` closure in
+      `LdapConnector::decode`
+      ([src/connector/ldap.rs:217-223](src/connector/ldap.rs)) only
+      matches `ChangeOperation::Add | ChangeOperation::Replace`; a
+      `ChangeOperation::Delete` against the same attribute
+      (`pwdAccountLockedTime`, `nsAccountLock`, ...) — which, per the
+      code's own comment, "just clears them back to the schema default" —
+      is never flagged, at any volume or rate. The asymmetry is reasonable
+      for the original threat model (a script *disabling* too many
+      accounts), but it leaves the mirror image — mass-*reactivating*
+      previously-locked/disabled accounts (e.g. stripping lockout state to
+      keep a credential-stuffing run alive against a target set, or
+      reviving a batch of dormant/compromised accounts) — completely
+      outside policy, blast-radius accounting, and the audit trail, even
+      though it's arguably just as security-relevant as the direction this
+      proxy already catches. Fix direction: decide deliberately whether a
+      `Delete` against a `LOCK_ATTRIBUTES` entry should also produce an
+      `Action` (perhaps a distinct `OperationKind::AccountUnlock`, since
+      "4 unlocks" and "4 locks" may warrant different limits) rather than
+      leaving it as an unexamined side effect of the current filter.
+- [ ] **SASL-bound connections never get identity upgraded from source
+      IP, likely covering most real traffic on this project's flagship
+      target directory.** `LdapConnector::bind_request`
+      ([src/connector/ldap.rs:300-310](src/connector/ldap.rs)) returns
+      `None` for any `BindRequest` whose `authentication` isn't
+      `AuthenticationChoice::Simple` — correctly, since a SASL `name`
+      field isn't password-verified the way a simple bind's DN is (see the
+      `bind_request_ignores_sasl_bind` test). `Identity` therefore stays
+      `ip:<addr>` for the connection's whole lifetime. Active Directory —
+      one of the three directories `LOCK_ATTRIBUTES` explicitly targets —
+      overwhelmingly uses SASL/GSSAPI (Kerberos) binds for both
+      interactive and service-account LDAP traffic in a typical enterprise
+      deployment, not simple DN+password binds. In such an environment,
+      the bind-verification/per-identity-budget machinery this project
+      already invested two Critical-severity fixes in
+      (`BindState`/`resolve_pending_bind`/`Identity::from_bind_dn`) may see
+      little real traffic to act on: every distinct Kerberos-authenticated
+      principal calling through a shared egress (a jump box, a container
+      host, a NAT gateway — exactly the shared-egress "AI agent" shape this
+      project's own README motivates itself with) is still pooled into one
+      `ip:`-keyed `PerIdentity` budget, quietly reintroducing the
+      shared-budget problem DN-based identity was built to solve. This
+      doesn't let an attacker exceed the aggregate IP-scoped cap, but it
+      does mean distinct legitimate principals can false-positive-block
+      each other, and a compromised principal's actions are attributed
+      only to a shared IP in the audit trail, not to the principal
+      responsible. Fix direction: SASL/Kerberos identity isn't carried in
+      the LDAP protocol itself in a form a passive proxy can verify
+      without GSS-API/keytab integration, so this is unlikely to be a
+      quick code fix — but ARCHITECTURE.md/`docs/LDAP.md` should say
+      explicitly how much of real-world AD traffic "anonymous binds and
+      SASL binds leave the current identity unchanged" actually covers,
+      so it's weighed when sizing the `Global` backstop for a
+      Kerberos-heavy deployment.
+- [ ] **The hand-rolled `/healthz`/`/readyz` listener has none of the
+      per-connection hardening the main proxy path relies on.**
+      `core::health::serve`/`handle_connection`
+      ([src/core/health.rs:63-103](src/core/health.rs)) hands every
+      accepted connection to an unsupervised `tokio::spawn`, and
+      `handle_connection`'s single `stream.read(&mut buf).await?` has no
+      timeout at all. Contrast with `proxy::serve`/`ConnectionLimits`
+      ([src/proxy.rs:41-65](src/proxy.rs),
+      [132-231](src/proxy.rs)), which caps concurrent connections with a
+      `Semaphore` and races every read/write against `io_timeout`
+      specifically to stop a slow-loris client or hung peer from pinning a
+      task indefinitely. Docs correctly say `/healthz`/`/metrics` must be
+      network-isolated since "nothing here authenticates" requests
+      (`config.rs` doc comments, INSTALLATION.md's deployment checklist),
+      but the code itself doesn't apply the same defense-in-depth here
+      that it applies everywhere else. Anyone who *can* reach this port (a
+      misconfigured network policy, a compromised host on the
+      orchestrator's segment) can open connections that never send a byte,
+      each parked forever in its own task, with no cap on how many
+      accumulate. Fix direction: wrap `handle_connection`'s read in a
+      short fixed timeout (probes are always fast, local callers) and
+      consider a small connection cap, mirroring `ConnectionLimits` at a
+      scale appropriate for a probe endpoint.
 
 ## Low — hardening & process
 
-- [x] **`Mutex::lock().unwrap()` poisoning is a single point of permanent
-      failure in stateful policy/store code.** `ThresholdPolicy.history`,
-      `SqliteStore.conn`, and similar shared locks all panic-and-poison on
-      an internal panic while held; once poisoned, every future policy
-      decision on that instance panics too, silently turning what should
-      be a clean rejection into a dropped connection for the rest of the
-      process's life. No live panic path is currently known (the BER
-      decode/framing code is already fuzzed), but given how central these
-      locks are, consider a non-poisoning mutex (e.g. `parking_lot`) as
-      defense in depth.
-      Fixed: switched every synchronous, non-`.await`-holding shared lock
-      to `parking_lot::Mutex` — `ThresholdPolicy.history`/
-      `PersistentState.pending` in
-      [`src/core/policy/threshold.rs`](src/core/policy/threshold.rs),
-      `SqliteStore.conn` in
-      [`src/core/policy/store/sqlite.rs`](src/core/policy/store/sqlite.rs),
-      and connection-scoped `BindState.identity`/`BindState.pending` in
-      [`src/proxy.rs`](src/proxy.rs). `parking_lot::Mutex::lock()` returns
-      the guard directly (no `LockResult`/poisoning), so a panic while any
-      of these is held no longer wedges every subsequent policy decision on
-      that instance/connection for the rest of the process's life. Left
-      as-is: `client_write`/`ValkeyStore.conn`'s `tokio::sync::Mutex`s
-      (already non-poisoning, and held across `.await` points where
-      parking_lot's guard can't be), and the test-only `SharedBuffer` mutex
-      in `src/core/audit.rs`. No behavior change on the non-panic path;
-      existing test suite covers it unchanged.
-- [x] **Confirm `cargo audit` is currently clean.**
-      Verified: ran `cargo audit` locally (RustSec advisory-db, 1239
-      advisories loaded) against the current `Cargo.lock` (256 crates) — no
-      vulnerability advisories. `rustls-pemfile` (flagged unmaintained,
-      `RUSTSEC-2025-0134`) was a direct dependency in
-      [`Cargo.toml`](Cargo.toml) used only for PEM parsing in
-      [`src/core/tls.rs`](src/core/tls.rs); replaced with the `pem` support
-      that now ships in `rustls-pki-types` (already in the dependency tree
-      via `rustls` itself) — `rustls-pemfile` no longer appears anywhere in
-      `Cargo.lock`. `cargo audit` is clean with no advisories or notices,
-      `cargo test`/`fmt`/`clippy -D warnings` all pass, and recent `main`
-      CI runs (`gh run list`) are green.
-- [x] **Encryption and persistent state are opt-in, not enforced.** TLS/mTLS
-      on both hops and `state_db` persistence are fully implemented but
-      off by default — [`config.example.toml`](config.example.toml) ships
-      with both commented out. Nothing in the code stops a deployment from
-      running fully plaintext/unauthenticated end-to-end, or as a single
-      replica with in-memory-only policy state that resets on every
-      restart. These need to be explicit go-live checklist items for any
-      real deployment, not just available features.
-      Fixed: extended the "Production deployment checklist" section in
-      [docs/INSTALLATION.md](docs/INSTALLATION.md#production-deployment-checklist)
-      (added by the previous `/metrics`/`/health` item) with two more
-      checked items: turning on `[proxy.listen_tls]`/`[proxy.upstream_tls]`
-      (with `client_ca_file` for mTLS) unless both legs are already on a
-      fully trusted network segment, and deciding `state_db` persistence
-      and its TLS (`state_db.ca_file`/`state_db.client_cert` for Valkey,
-      encryption at rest for SQLite) deliberately rather than leaving the
-      in-memory, plaintext default unexamined. No code change: like the
-      `/metrics`/`/health` item, this is a deployment decision the code
-      can't enforce — the fix direction itself asks only for explicit
-      go-live checklist items, not code that refuses to start without
-      them.
+- [ ] **`docs/LDAP.md` documents the pre-fix, more-vulnerable
+      bind-verification behavior as current.** `docs/LDAP.md:148-159`
+      ("**Important caveat:** `ai-protect` does not correlate the bind
+      request against its response — identity switches to the claimed DN
+      as soon as the `BindRequest` is seen...") and `:202-208` ("There is
+      currently no global, identity-independent cap as a backstop against
+      this.") both describe exactly the bypass the "blast-radius policy
+      can be bypassed by identity churn" item earlier in this file's own
+      history closed: `BindState`/`resolve_pending_bind` now correlate
+      request and response by message ID and only promote `Identity` on
+      confirmed success (see `unverified_bind_does_not_change_identity_or_reset_budget`
+      in [src/proxy.rs](src/proxy.rs)), and `ThresholdScope::Global`
+      (`src/core/policy/threshold.rs`) now provides exactly the global
+      backstop the doc says doesn't exist — both accurately described in
+      [ARCHITECTURE.md#identity](ARCHITECTURE.md#identity). This is a
+      documentation-integrity issue, not a code vulnerability, but a
+      security-relevant one: `docs/LDAP.md` explicitly tells readers to
+      consult its "Known limitations" section before "relying on
+      `ai-protect` as a hard security boundary," and currently tells them
+      there's an open bypass with no mitigation when both have shipped.
+      Left uncorrected, it either erodes trust in a control that's
+      actually in place, or risks a future change reintroducing the
+      bypass because the doc never recorded that it needed to stay fixed.
+      Fix direction: update `docs/LDAP.md`'s "Identity" and "Known
+      limitations" sections to match `ARCHITECTURE.md#identity`'s current
+      description (bind-response correlation, `Global`-scope backstop; the
+      remaining known gap is *how many* distinct identities a caller can
+      churn through, not whether one claim gets verified).
+- [ ] **The `Global`-scope backstop policy is off by default and only
+      ever shown commented out.** `policies/ldap.example.toml`'s only
+      `scope = "global"` entry is commented out under "Recommended: a
+      second threshold entry..."; `docs/INSTALLATION.md`'s "Production
+      deployment checklist" (which already has checked items for turning
+      on TLS and deciding `state_db` persistence deliberately) has no
+      equivalent item for this. A deployment that follows the documented
+      "copy the example, adjust the numbers" flow
+      ([INSTALLATION.md#configuring](docs/INSTALLATION.md)) ships with only
+      a `PerIdentity` threshold, inheriting the full "identity churn
+      defeats a per-identity-only budget" exposure this project has
+      already spent real effort closing the *mechanics* for — the
+      mechanism exists and is tested, but nothing in the go-live path
+      prompts an operator to actually turn it on. Same class of gap as
+      "Encryption and persistent state are opt-in, not enforced" (already
+      addressed the same way for TLS/`state_db`). Fix direction: add a
+      third checked item to `docs/INSTALLATION.md`'s "Production
+      deployment checklist" for enabling a `scope = "global"` backstop
+      entry sized well above expected legitimate aggregate traffic.
