@@ -94,6 +94,35 @@ fn cap_dn(dn: String) -> String {
     )
 }
 
+/// Case-folds a claimed bind DN before it's capped (`cap_dn`) and used as an
+/// `Identity` key. LDAP attribute type names are case-insensitive per RFC
+/// 4512, and `caseIgnoreMatch` — the default equality rule for essentially
+/// every RDN attribute a bind DN is built from (`cn`, `uid`, `ou`, `dc`,
+/// `o`, ...) — means the *value* half of an RDN is case-insensitive too:
+/// `cn=alice,dc=example,dc=com`, `CN=alice,DC=example,DC=com`, and
+/// `cn=ALICE,dc=EXAMPLE,dc=COM` all name the exact same directory entry and
+/// produce a genuine, successfully-verified bind. Left unfolded, each
+/// spelling promotes to a distinct `Identity` with its own fresh
+/// `ThresholdPolicy` `PerIdentity` history bucket, letting one principal
+/// multiply its own per-identity rate-limit budget for free just by
+/// varying case between reconnects — see TODO.md. Lowercasing the whole DN
+/// collapses every case spelling into one `Identity`. Deliberately not
+/// applied anywhere `cap_dn` is used for an `Action::target` (modify/del/
+/// add/password-modify) — those strings are only ever used for audit/
+/// forensic display, where the caller's original casing is more useful
+/// than folding it.
+///
+/// This intentionally stops short of full RFC 4514 canonicalization
+/// (re-serializing insignificant whitespace, resolving an attribute type's
+/// numeric-OID form to its descriptive name or vice versa): those gaps only
+/// dilute a `PerIdentity` budget across a couple of extra buckets rather
+/// than defeat it outright the way unfolded case does, and OID<->name
+/// resolution would require modeling the schema of every backend this
+/// proxy fronts.
+fn normalize_bind_dn(dn: String) -> String {
+    dn.to_lowercase()
+}
+
 /// RFC 4511 §4.14.1 — the extended-operation OID a client sends to request
 /// upgrading a plaintext connection to TLS mid-session, instead of dialing
 /// implicit TLS (LDAPS) from the start.
@@ -330,8 +359,9 @@ impl LdapConnector {
     /// there isn't password-verified the way it is for a simple bind — the
     /// real identity comes from the SASL mechanism) return `None`, leaving
     /// any pending claim alone, as does every non-bind frame. The DN is
-    /// passed through `cap_dn` before returning, since it eventually becomes
-    /// an `Identity` — see `cap_dn`'s doc comment.
+    /// case-folded (`normalize_bind_dn`) and passed through `cap_dn` before
+    /// returning, since it eventually becomes an `Identity` — see each
+    /// function's doc comment.
     pub fn bind_request(&self, frame: &[u8]) -> Result<Option<(u32, String)>> {
         let message: LdapMessage = rasn::ber::decode(frame).context("decoding LDAP message")?;
         let ProtocolOp::BindRequest(bind) = &message.protocol_op else {
@@ -341,7 +371,10 @@ impl LdapConnector {
         {
             return Ok(None);
         }
-        Ok(Some((message.message_id, cap_dn(bind.name.0.clone()))))
+        Ok(Some((
+            message.message_id,
+            cap_dn(normalize_bind_dn(bind.name.0.clone())),
+        )))
     }
 
     /// Decode a response frame and, if it's a `BindResponse`, return its
@@ -903,6 +936,32 @@ mod tests {
         let claim = connector().bind_request(&frame).unwrap();
 
         assert_eq!(claim, Some((7, "cn=alice,dc=example,dc=com".to_string())));
+    }
+
+    #[test]
+    fn bind_request_case_folds_claimed_dn_so_spelling_variants_collapse() {
+        // `cn=`/`CN=`/`Cn=` and a caseIgnoreMatch RDN value (`alice` vs
+        // `ALICE`) all authenticate as the exact same directory entry — see
+        // `normalize_bind_dn`. Left unfolded, each spelling would promote to
+        // a distinct `Identity` and multiply the caller's own
+        // `ThresholdPolicy` budget for free (TODO.md).
+        let lower = connector()
+            .bind_request(&bind_request_frame(1, "cn=alice,dc=example,dc=com"))
+            .unwrap();
+        let mixed_type = connector()
+            .bind_request(&bind_request_frame(2, "CN=alice,DC=example,DC=com"))
+            .unwrap();
+        let mixed_value = connector()
+            .bind_request(&bind_request_frame(3, "cn=ALICE,dc=EXAMPLE,dc=COM"))
+            .unwrap();
+
+        let (_, lower_dn) = lower.unwrap();
+        let (_, mixed_type_dn) = mixed_type.unwrap();
+        let (_, mixed_value_dn) = mixed_value.unwrap();
+
+        assert_eq!(lower_dn, "cn=alice,dc=example,dc=com");
+        assert_eq!(lower_dn, mixed_type_dn);
+        assert_eq!(lower_dn, mixed_value_dn);
     }
 
     #[test]

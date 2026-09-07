@@ -142,7 +142,7 @@ roughly in the order you'd want to tackle them.
 
 ## Medium — identity-budget dilution
 
-- [ ] **A bind DN is used verbatim as `Identity`, with no case or
+- [x] **A bind DN is used verbatim as `Identity`, with no case or
       attribute-form normalization, letting one real principal multiply
       its own `PerIdentity` threshold budget for free.** `bind_request`
       ([src/connector/ldap.rs:316-326](src/connector/ldap.rs)) returns
@@ -179,3 +179,18 @@ roughly in the order you'd want to tackle them.
       parse-and-re-serialize to a canonical RFC 4514 form (also resolving
       an attribute type's numeric-OID form to its descriptive name or vice
       versa) so equivalent spellings always collapse to one `Identity`.
+      Fixed: `bind_request` ([src/connector/ldap.rs](src/connector/ldap.rs))
+      now runs the claimed DN through a new `normalize_bind_dn` helper
+      (lowercasing the whole string) before `cap_dn`, so `cn=`/`CN=`/`Cn=`
+      and a caseIgnoreMatch RDN value (`alice` vs `ALICE`) all collapse to
+      the same `Identity` instead of each spelling buying a fresh
+      `PerIdentity` budget. Deliberately doesn't touch `cap_dn`'s other
+      callers (`Action::target` for modify/del/add/password-modify), since
+      those strings are audit/forensic display only, and stops short of
+      full RFC 4514 canonicalization (whitespace re-serialization,
+      numeric-OID⇄name resolution) — undercollapsing there only dilutes a
+      budget across a couple of extra buckets rather than defeating it
+      outright, and OID⇄name resolution would require modeling every
+      backend's schema. See
+      `bind_request_case_folds_claimed_dn_so_spelling_variants_collapse` in
+      `src/connector/ldap.rs`.
