@@ -8,12 +8,17 @@
 # What it does, all read-only against the upstream:
 #   - checks TCP reachability on the chosen port
 #   - reads rootDSE (namingContexts, vendorName, supportedExtension, ...) to
-#     guess the backend (AD / OpenLDAP / 389 DS) and whether StartTLS /
+#     guess the backend (AD / OpenLDAP / 389 DS / lldap) and whether StartTLS /
 #     RFC 3062 Password Modify are advertised
 #   - if TLS is in play, fetches the upstream certificate to help you decide
 #     server_name/ca_file, without asking you to already know them
 # It never writes to the directory, and any bind DN/password you give it for
 # the rootDSE query is used in-memory only -- never written to config.toml.
+# lldap (the docker/lldap upstream this repo's compose.yaml brings up for
+# local testing) rejects anonymous binds outright, so against that upstream
+# this script needs a bind DN/password just to read rootDSE; if a local .env
+# (see .env.example) has LLDAP_LDAP_USER_PASS, it's offered as that
+# credential -- still used in-memory only, never written to config.toml.
 #
 # Requires: ldapsearch (OpenLDAP client tools), nc, openssl, awk.
 #
@@ -73,6 +78,19 @@ backup_if_exists() {
         cp "$f" "$bak"
         warn "existing $f backed up to $bak"
     fi
+}
+
+# dotenv_value <VAR> <file> -- print VAR's value from a .env-style file
+# without sourcing it (avoids executing arbitrary content), stripping one
+# layer of surrounding quotes. Prints nothing (exit 1) if unset.
+dotenv_value() {
+    local var="$1" file="$2" line val
+    [ -f "$file" ] || return 1
+    line="$(grep -m1 "^${var}=" "$file")" || return 1
+    val="${line#*=}"
+    val="${val%\"}"; val="${val#\"}"
+    val="${val%\'}"; val="${val#\'}"
+    printf '%s' "$val"
 }
 
 WORKDIR="$(mktemp -d)"
@@ -215,11 +233,46 @@ try_rootdse() {
         -s base -b "" -LLL "${ROOTDSE_ATTRS[@]}" 2>"$WORKDIR/rootdse.err" | unfold
 }
 
+# The local docker/lldap upstream's base DN is set by compose.yaml's
+# LLDAP_LDAP_BASE_DN, not by .env -- read it from there (falling back to an
+# .env override, then lldap's compose.yaml default) instead of hardcoding
+# dc=example,dc=com, so a customized base DN doesn't produce a silently
+# wrong admin bind DN.
+detect_lldap_base_dn() {
+    local val
+    val="$(dotenv_value LLDAP_LDAP_BASE_DN .env)"
+    if [ -z "$val" ] && [ -f compose.yaml ]; then
+        val="$(grep -m1 'LLDAP_LDAP_BASE_DN=' compose.yaml | sed -E 's/.*LLDAP_LDAP_BASE_DN=//' | tr -d "\"'" | xargs)"
+    fi
+    case "$val" in
+        dc=*) printf '%s' "$val" ;;
+        *) printf '%s' "dc=example,dc=com" ;;
+    esac
+}
+
+LLDAP_BASE_DN="$(detect_lldap_base_dn)"
+LLDAP_DEFAULT_BIND_DN="uid=admin,ou=people,${LLDAP_BASE_DN}"
+DOTENV_LLDAP_PASS="$(dotenv_value LLDAP_LDAP_USER_PASS .env)"
+
 ROOTDSE_OUT="$(try_rootdse)"
 if [ -z "$ROOTDSE_OUT" ]; then
     warn "Anonymous rootDSE query returned nothing ($(head -n1 "$WORKDIR/rootdse.err" 2>/dev/null))."
-    if confirm "Retry with a bind DN/password (common for servers that reject anonymous binds, e.g. Active Directory)?" y; then
-        ask BIND_DN "Bind DN"
+
+    if [ -n "$DOTENV_LLDAP_PASS" ] && confirm "Found LLDAP_LDAP_USER_PASS in .env -- use it to bind as ${LLDAP_DEFAULT_BIND_DN} (this repo's local lldap upstream) for this discovery query?" y; then
+        BIND_DN="$LLDAP_DEFAULT_BIND_DN"
+        BIND_PW="$DOTENV_LLDAP_PASS"
+        BIND_ARGS=(-D "$BIND_DN" -w "$BIND_PW")
+        USED_CREDS=1
+        ROOTDSE_OUT="$(try_rootdse)"
+        if [ -z "$ROOTDSE_OUT" ]; then
+            warn "Bind with the .env password as ${LLDAP_DEFAULT_BIND_DN} didn't work ($(head -n1 "$WORKDIR/rootdse.err" 2>/dev/null)); falling back to manual entry."
+            BIND_ARGS=()
+            USED_CREDS=0
+        fi
+    fi
+
+    if [ -z "$ROOTDSE_OUT" ] && confirm "Retry with a bind DN/password (common for servers that reject anonymous binds, e.g. Active Directory, lldap)?" y; then
+        ask BIND_DN "Bind DN" "$LLDAP_DEFAULT_BIND_DN"
         ask_secret BIND_PW "Bind password"
         BIND_ARGS=(-D "$BIND_DN" -w "$BIND_PW")
         USED_CREDS=1
@@ -258,6 +311,8 @@ else
 
     if echo "$SUPPORTED_CAPS" | grep -q '1\.2\.840\.113556\.1\.4\.800' || echo "$VENDOR_NAME" | grep -qi "microsoft"; then
         VENDOR_GUESS="Active Directory"
+    elif echo "$VENDOR_NAME" | grep -qi "lldap"; then
+        VENDOR_GUESS="lldap"
     elif echo "$VENDOR_NAME" | grep -qiE "389|red hat|fedora"; then
         VENDOR_GUESS="389 Directory Server"
     elif echo "$VENDOR_NAME" | grep -qi "openldap"; then
