@@ -21,14 +21,34 @@ use crate::core::tls::UpstreamTls;
 /// connector was configured.
 pub type UpstreamStream = MaybeTlsStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-/// Attribute names (lowercased) whose modification we treat as an account
-/// lock/unlock across common directory schemas (AD, OpenLDAP, 389 DS).
-const LOCK_ATTRIBUTES: &[&str] = &[
-    "pwdaccountlockedtime",
-    "useraccountcontrol",
-    "nsaccountlock",
-    "shadowexpire",
+/// Attribute names (lowercased), paired with that attribute's well-known
+/// numeric OID, whose modification we treat as an account lock/unlock across
+/// common directory schemas (AD, OpenLDAP, 389 DS). RFC 4512 lets an
+/// `AttributeDescription` on the wire name an attribute by either form — a
+/// directory resolves both identically — so a numeric-OID spelling must
+/// match here too, or it silently bypasses detection (see TODO.md).
+const LOCK_ATTRIBUTES: &[(&str, &str)] = &[
+    ("pwdaccountlockedtime", "1.3.6.1.4.1.42.2.27.8.1.17"),
+    ("useraccountcontrol", "1.2.840.113556.1.4.8"),
+    ("nsaccountlock", "2.16.840.1.113730.3.1.220"),
+    ("shadowexpire", "1.3.6.1.1.1.1.10"),
 ];
+
+/// Whether an `AttributeDescription` (RFC 4512: a descriptive name or a
+/// numeric OID, optionally followed by one or more `;`-delimited attribute
+/// options) names one of `LOCK_ATTRIBUTES`. Strips any option suffix and
+/// compares case-insensitively against either the descriptive name or the
+/// OID, since a directory resolves both forms to the same attribute.
+fn is_lock_attribute(attr_type: &str) -> bool {
+    let base = attr_type
+        .split(';')
+        .next()
+        .unwrap_or(attr_type)
+        .to_lowercase();
+    LOCK_ATTRIBUTES
+        .iter()
+        .any(|(name, oid)| base == *name || base == *oid)
+}
 
 /// Hard cap on a single LDAP message's BER content length. Applied before
 /// `read_frame` allocates a buffer for that content, so a client claiming an
@@ -222,8 +242,7 @@ impl LdapConnector {
                 let touches_lock_attribute = |ops: &[ChangeOperation]| {
                     modify.changes.iter().any(|change| {
                         ops.contains(&change.operation)
-                            && LOCK_ATTRIBUTES
-                                .contains(&change.modification.r#type.0.to_lowercase().as_str())
+                            && is_lock_attribute(&change.modification.r#type.0)
                     })
                 };
 
@@ -721,6 +740,41 @@ mod tests {
         assert_eq!(action.operation, OperationKind::AccountUnlock);
         assert_eq!(action.target, "cn=alice,dc=example,dc=com");
         assert_eq!(action.blast_radius, 1);
+    }
+
+    #[test]
+    fn decodes_lock_attribute_oid_form_as_account_lock_action() {
+        for (name, oid) in LOCK_ATTRIBUTES {
+            let frame = modify_request_frame(1, "cn=alice,dc=example,dc=com", oid, b"514");
+
+            let action = connector()
+                .decode(&frame)
+                .unwrap()
+                .unwrap_or_else(|| panic!("expected an action for OID form of {name}"));
+
+            assert_eq!(
+                action.operation,
+                OperationKind::AccountLock,
+                "OID form of {name} ({oid}) did not match LOCK_ATTRIBUTES"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_lock_attribute_with_attribute_option_suffix_as_account_lock_action() {
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl;x-foo",
+            b"514",
+        );
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.operation, OperationKind::AccountLock);
     }
 
     #[test]
