@@ -87,7 +87,11 @@ protocol is this" from "should this be allowed."
   decoding (`rasn`/`rasn-ldap`), recognizing which attributes represent an
   account-lock across different directory schemas (`LOCK_ATTRIBUTES` covers
   AD's `userAccountControl`, OpenLDAP's `pwdAccountLockedTime`, 389 DS's
-  `nsAccountLock`, and `shadowExpire`), recognizing every `DelRequest`/
+  `nsAccountLock`, and `shadowExpire`) and distinguishing setting one
+  (`AccountLock`, `ChangeOperation::Add`/`Replace`) from clearing one back
+  to its schema default (`AccountUnlock`, `ChangeOperation::Delete` —
+  mass-reactivating locked accounts is policed as its own action rather
+  than passing through unexamined), recognizing every `DelRequest`/
   `AddRequest`/`ModifyDnRequest` unconditionally (removing, creating, or
   renaming/moving an entry outright is already high-blast-radius, and —
   unlike `Modify` — there's no cheap attribute-level filter to narrow any
@@ -109,8 +113,8 @@ protocol is this" from "should this be allowed."
   code is written once regardless of which connector or transport is
   underneath.
 - **Action** is the seam. It says *what* is being attempted
-  (`OperationKind`: `AccountLock`, `Delete`, `Create`, `Rename`, or
-  `PasswordReset`), *what* it targets (`target`), and *how big* it is
+  (`OperationKind`: `AccountLock`, `AccountUnlock`, `Delete`, `Create`,
+  `Rename`, or `PasswordReset`), *what* it targets (`target`), and *how big* it is
   (`blast_radius`) — nothing about how it was expressed on the wire.
   Today `blast_radius` is always `1` (one object per
   modify/delete/add/rename/password-reset), but the field exists so a

@@ -93,8 +93,8 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   (rather than silently discarding) any error `rustls-native-certs` hits
   loading the OS trust store.
 - [src/core/action.rs](src/core/action.rs) — defines `Action` /
-  `OperationKind` (`AccountLock`, `Delete`, `Create`, `Rename`,
-  `PasswordReset`), the
+  `OperationKind` (`AccountLock`, `AccountUnlock`, `Delete`, `Create`,
+  `Rename`, `PasswordReset`), the
   normalized representation a connector produces so the policy engine
   never has to understand a wire protocol.
 - [src/core/connector.rs](src/core/connector.rs) — the `Connector` trait
@@ -111,7 +111,9 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   Reads BER-framed LDAP messages off the wire (`read_frame`), decodes
   `ModifyRequest`s via `rasn`/`rasn-ldap` and flags ones touching a known
   account-lock attribute (`LOCK_ATTRIBUTES`, covering AD/OpenLDAP/389 DS
-  schemas) as an `Action`, flags every `DelRequest`/`AddRequest`/
+  schemas) as an `Action` — `AccountLock` if it's set (`Add`/`Replace`),
+  `AccountUnlock` if it's cleared back to the schema default (`Delete`) —
+  flags every `DelRequest`/`AddRequest`/
   `ModifyDnRequest` unconditionally (removing, creating, or renaming/moving
   an entry outright is already high-blast-radius, and unlike `Modify`
   there's no cheap attribute-level filter to narrow any of them further

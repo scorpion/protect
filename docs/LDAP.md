@@ -8,18 +8,19 @@ in the first place, see [INSTALLATION.md](INSTALLATION.md).
 ## The short version
 
 `ai-protect` decodes just enough of each request to tell whether it's one
-of five kinds of account-affecting change. If it isn't, the request is
+of six kinds of account-affecting change. If it isn't, the request is
 forwarded untouched — `ai-protect` doesn't parse it at all, so there's no
 speed or compatibility cost for the searches, binds, compares, and
 ordinary attribute edits that make up the bulk of directory traffic. If
-it is one of the five, it's checked against your configured policy before
+it is one of the six, it's checked against your configured policy before
 being allowed through.
 
 ## Requests that are inspected
 
 | Request | Treated as actionable when... |
 |---|---|
-| **Modify** | it adds or replaces one of a fixed set of account-lock attributes (see [Account-lock attributes](#account-lock-attributes-recognized) below) |
+| **Modify (lock)** | it adds or replaces one of a fixed set of account-lock attributes (see [Account-lock attributes](#account-lock-attributes-recognized) below) |
+| **Modify (unlock)** | it deletes one of that same set of attributes |
 | **Delete** | always — removing an entry outright |
 | **Add** | always — creating an entry outright |
 | **Modify DN** (rename/move, RFC 4511 §4.9) | always — renaming or moving an entry outright |
@@ -34,9 +35,9 @@ traffic.
 
 ### Account-lock attributes recognized
 
-A Modify is only actionable if it **adds or replaces** (not deletes) one
-of these attribute names, matched case-insensitively, covering the three
-directory families `ai-protect` targets:
+A Modify is only actionable if it touches one of these attribute names,
+matched case-insensitively, covering the three directory families
+`ai-protect` targets:
 
 | Attribute | Directory |
 |---|---|
@@ -45,12 +46,16 @@ directory families `ai-protect` targets:
 | `nsAccountLock` | 389 Directory Server |
 | `shadowExpire` | RFC 2307 `shadowAccount` (some OpenLDAP setups) |
 
-Deleting one of these attributes (clearing it back to the schema default,
-typically *unlocking* the account) is not treated as a lock action — it
-isn't the high-blast-radius direction. A Modify touching any other
-attribute — job title, group membership, phone number, anything not in
-this list — passes through untouched regardless of how many attributes
-or values it changes.
+**Adding or replacing** one of these attributes is reported as
+`AccountLock`; **deleting** one (clearing it back to the schema default,
+typically *unlocking* the account) is reported separately as
+`AccountUnlock` — the mirror image, since mass-reactivating
+previously-locked accounts (e.g. to keep a credential-stuffing run alive)
+is arguably just as security-relevant as mass-locking them, and "N
+unlocks" may warrant a different limit than "N locks" in policy. A Modify
+touching any other attribute — job title, group membership, phone number,
+anything not in this list — passes through untouched regardless of how
+many attributes or values it changes.
 
 ### Why Delete, Add, and Modify DN are always actionable
 
@@ -185,17 +190,17 @@ Each event carries:
 - **identity** — the source IP or bound DN responsible (see
   [Identity](#identity-how-who-is-doing-this-is-determined) above)
 - **backend** — always `ldap` today
-- **operation** — one of `AccountLock`, `Delete`, `Create`, `Rename`,
-  `PasswordReset`
+- **operation** — one of `AccountLock`, `AccountUnlock`, `Delete`,
+  `Create`, `Rename`, `PasswordReset`
 - **target** — the DN the request names
 - **blast_radius** — always `1` for LDAP today
 - **reason** — present on a block, absent on an allow; the same text sent
   to the client (see [What a blocked client sees](#what-a-blocked-client-sees))
 
 Because every decision is logged regardless of outcome, this is the
-complete forensic trail of every account-lock, delete, create, and
-password-reset request `ai-protect` has ever seen — there's no separate
-audit store to reconcile against.
+complete forensic trail of every account-lock, account-unlock, delete,
+create, and password-reset request `ai-protect` has ever seen — there's
+no separate audit store to reconcile against.
 
 ## Known limitations
 

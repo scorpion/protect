@@ -108,8 +108,8 @@ Connector.read_frame → Connector.decode → Action → Policy.evaluate_all →
 - **`src/core/action.rs`** — `Action`/`OperationKind`, the backend-agnostic
   seam: what's attempted, what it targets, and its `blast_radius` (always
   `1` today; exists so a future bulk-op connector can report >1 without any
-  downstream change). `OperationKind` covers `AccountLock`, `Delete`,
-  `Create`, `Rename`, and `PasswordReset`.
+  downstream change). `OperationKind` covers `AccountLock`, `AccountUnlock`,
+  `Delete`, `Create`, `Rename`, and `PasswordReset`.
 - **`src/core/policy.rs`** + **`src/core/policy/threshold.rs`** — the
   `Policy` trait (`evaluate(&Action, &PolicyContext) -> Decision`) and
   `evaluate_all` (stops at first `Block`, so ordering matters for

@@ -57,6 +57,7 @@ impl Drop for ConnectionGuard {
 fn operation_label(operation: &OperationKind) -> &'static str {
     match operation {
         OperationKind::AccountLock => "account_lock",
+        OperationKind::AccountUnlock => "account_unlock",
         OperationKind::Delete => "delete",
         OperationKind::Create => "create",
         OperationKind::PasswordReset => "password_reset",

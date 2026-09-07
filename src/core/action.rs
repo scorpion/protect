@@ -1,6 +1,16 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationKind {
     AccountLock,
+    /// A lock attribute being cleared back to its schema default (LDAP
+    /// `ModifyRequest` with `ChangeOperation::Delete` against a
+    /// `LOCK_ATTRIBUTES` entry) — the mirror image of `AccountLock`: mass
+    /// *reactivating* previously-locked/disabled accounts is arguably just
+    /// as security-relevant as mass-locking them (e.g. stripping lockout
+    /// state to keep a credential-stuffing run alive), so it gets its own
+    /// `OperationKind` rather than being silently ignored or folded into
+    /// `AccountLock`, since "N unlocks" and "N locks" may warrant different
+    /// limits (see `LdapConnector::decode`).
+    AccountUnlock,
     /// A directory entry being removed entirely (LDAP `DelRequest`) —
     /// at least as high-blast-radius as locking one, and not distinguished
     /// by target object type (see `LdapConnector::decode`).

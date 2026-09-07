@@ -214,24 +214,31 @@ impl LdapConnector {
 
         match &message.protocol_op {
             ProtocolOp::ModifyRequest(modify) => {
-                // Add/Replace can set a lock value; Delete of these attributes
-                // just clears them back to the schema default, which isn't a
-                // lock action.
-                let touches_lock_attribute = modify.changes.iter().any(|change| {
-                    matches!(
-                        change.operation,
-                        ChangeOperation::Add | ChangeOperation::Replace
-                    ) && LOCK_ATTRIBUTES
-                        .contains(&change.modification.r#type.0.to_lowercase().as_str())
-                });
+                // Add/Replace can set a lock value (AccountLock); Delete of
+                // these attributes clears them back to the schema default,
+                // i.e. unlocks the account (AccountUnlock) — the mirror image,
+                // policed separately since "N unlocks" and "N locks" may
+                // warrant different limits.
+                let touches_lock_attribute = |ops: &[ChangeOperation]| {
+                    modify.changes.iter().any(|change| {
+                        ops.contains(&change.operation)
+                            && LOCK_ATTRIBUTES
+                                .contains(&change.modification.r#type.0.to_lowercase().as_str())
+                    })
+                };
 
-                if !touches_lock_attribute {
-                    return Ok(None);
-                }
+                let operation =
+                    if touches_lock_attribute(&[ChangeOperation::Add, ChangeOperation::Replace]) {
+                        OperationKind::AccountLock
+                    } else if touches_lock_attribute(&[ChangeOperation::Delete]) {
+                        OperationKind::AccountUnlock
+                    } else {
+                        return Ok(None);
+                    };
 
                 Ok(Some(Action {
                     backend: "ldap",
-                    operation: OperationKind::AccountLock,
+                    operation,
                     target: cap_dn(modify.object.0.clone()),
                     blast_radius: 1,
                 }))
@@ -512,8 +519,24 @@ pub(crate) mod test_support {
         attribute: &str,
         value: &[u8],
     ) -> Vec<u8> {
+        modify_request_frame_with_operation(
+            message_id,
+            dn,
+            ChangeOperation::Replace,
+            attribute,
+            value,
+        )
+    }
+
+    pub fn modify_request_frame_with_operation(
+        message_id: u32,
+        dn: &str,
+        operation: ChangeOperation,
+        attribute: &str,
+        value: &[u8],
+    ) -> Vec<u8> {
         let change = ModifyRequestChanges {
-            operation: ChangeOperation::Replace,
+            operation,
             modification: PartialAttribute::new(
                 attribute.into(),
                 SetOf::from_vec(vec![OctetString::from(value.to_vec())]),
@@ -613,7 +636,8 @@ mod tests {
     use super::test_support::{
         add_request_frame, bind_request_frame, decode_message, del_request_frame,
         extended_request_frame, mod_dn_request_frame, modify_request_frame,
-        password_modify_request_frame, sasl_bind_request_frame,
+        modify_request_frame_with_operation, password_modify_request_frame,
+        sasl_bind_request_frame,
     };
     use super::*;
 
@@ -674,6 +698,27 @@ mod tests {
 
         assert_eq!(action.backend, "ldap");
         assert_eq!(action.operation, OperationKind::AccountLock);
+        assert_eq!(action.target, "cn=alice,dc=example,dc=com");
+        assert_eq!(action.blast_radius, 1);
+    }
+
+    #[test]
+    fn decodes_lock_attribute_delete_as_account_unlock_action() {
+        let frame = modify_request_frame_with_operation(
+            1,
+            "cn=alice,dc=example,dc=com",
+            ChangeOperation::Delete,
+            "userAccountControl",
+            b"514",
+        );
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.backend, "ldap");
+        assert_eq!(action.operation, OperationKind::AccountUnlock);
         assert_eq!(action.target, "cn=alice,dc=example,dc=com");
         assert_eq!(action.blast_radius, 1);
     }

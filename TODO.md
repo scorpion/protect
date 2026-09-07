@@ -98,7 +98,7 @@ roughly in the order you'd want to tackle them.
 
 ## Medium
 
-- [ ] **Bulk *unlocking* via a `Delete`-type change to a lock attribute is
+- [x] **Bulk *unlocking* via a `Delete`-type change to a lock attribute is
       not policed.** The `touches_lock_attribute` closure in
       `LdapConnector::decode`
       ([src/connector/ldap.rs:217-223](src/connector/ldap.rs)) only
@@ -119,6 +119,24 @@ roughly in the order you'd want to tackle them.
       `Action` (perhaps a distinct `OperationKind::AccountUnlock`, since
       "4 unlocks" and "4 locks" may warrant different limits) rather than
       leaving it as an unexamined side effect of the current filter.
+      Fixed: `LdapConnector::decode` ([src/connector/ldap.rs](src/connector/ldap.rs))
+      now checks a `ModifyRequest`'s changes against `LOCK_ATTRIBUTES` for
+      `Add`/`Replace` (producing `OperationKind::AccountLock`, unchanged)
+      and separately for `Delete` (producing a new
+      `OperationKind::AccountUnlock`, [src/core/action.rs](src/core/action.rs)),
+      so mass-clearing a lock attribute back to its schema default is now
+      decoded, policed, and audited exactly like setting one — a `Delete`
+      is never silently treated as a no-op the way it was before. Since
+      `ThresholdPolicy` polices by `Action` generically rather than by
+      operation kind, both are already covered by volume under the
+      existing per-identity/global threshold with no policy-engine change
+      needed; a deployment wanting a distinct limit for unlocks vs. locks
+      would still need `PolicyContext`/config to gain matching on
+      `OperationKind`, which remains future work. `AccountUnlock` is wired
+      into `metrics::operation_label`, and `docs/LDAP.md`/`ARCHITECTURE.md`/
+      `AGENTS.md`/`CLAUDE.md` no longer describe a lock-attribute delete as
+      unexamined. See `decodes_lock_attribute_delete_as_account_unlock_action`
+      in `src/connector/ldap.rs`.
 - [ ] **SASL-bound connections never get identity upgraded from source
       IP, likely covering most real traffic on this project's flagship
       target directory.** `LdapConnector::bind_request`
