@@ -691,6 +691,19 @@ separate step from `serve` specifically so a bad `[health].listen_addr` —
 already in use, unparseable — surfaces as an immediate startup error rather
 than only once the first probe hits a dead port.)
 
+Because nothing authenticates a request here (see
+[Configuration](#configuration) below), `serve` applies the same two
+categories of defense-in-depth the main proxy path gets from
+`proxy::ConnectionLimits`, scaled down for a probe endpoint that only ever
+expects a handful of concurrent orchestrator probes rather than real
+traffic: a fixed 64-connection cap (a `Semaphore`, `try_acquire_owned`,
+mirroring `proxy::serve`) closes anything over the limit immediately
+instead of piling up unsupervised `tokio::spawn` tasks, and a fixed 5s
+deadline on the single read in `handle_connection` stops a connection that
+never sends a byte from pinning its task forever — a probe is always a
+short-lived local caller, so unlike `io_timeout` this isn't exposed as
+config.
+
 ## Configuration
 
 Two kinds of TOML file, deliberately kept separate, plus one optional

@@ -211,7 +211,12 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   silently; `serve` never stops accepting on its own — `/healthz` must stay
   reachable through the whole `shutdown_timeout` drain window, or a
   liveness probe going quiet mid-drain would get the process killed
-  outright, defeating the point of draining. `run_with_config` spawns it
+  outright, defeating the point of draining. Since nothing authenticates a
+  request here, `serve` caps concurrent connections at a fixed 64 (a
+  `Semaphore`, mirroring `proxy::ConnectionLimits` at probe-endpoint scale)
+  and races each connection's single read against a fixed 5s deadline, so
+  a connection that never sends a byte can't accumulate unbounded
+  unsupervised tasks the way it could before. `run_with_config` spawns it
   when the config's top-level `[health]` table is present and lets process
   exit take it down, same as the installed Prometheus exporter above.
 

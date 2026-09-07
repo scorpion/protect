@@ -187,7 +187,7 @@ roughly in the order you'd want to tackle them.
       the pre-bind-correlation, no-`Global`-backstop behavior) up to date
       with the mechanics `ARCHITECTURE.md#identity` already documented
       accurately, resolving the doc-staleness item below as a side effect.
-- [ ] **The hand-rolled `/healthz`/`/readyz` listener has none of the
+- [x] **The hand-rolled `/healthz`/`/readyz` listener has none of the
       per-connection hardening the main proxy path relies on.**
       `core::health::serve`/`handle_connection`
       ([src/core/health.rs:63-103](src/core/health.rs)) hands every
@@ -210,6 +210,19 @@ roughly in the order you'd want to tackle them.
       short fixed timeout (probes are always fast, local callers) and
       consider a small connection cap, mirroring `ConnectionLimits` at a
       scale appropriate for a probe endpoint.
+      Fixed: `core::health::serve` ([src/core/health.rs](src/core/health.rs))
+      now guards accepted connections with a `Semaphore`-backed
+      `MAX_CONNECTIONS` (64, `try_acquire_owned`, mirroring
+      `proxy::serve`'s `ConnectionLimits` pattern at a scale appropriate for
+      a probe endpoint) — a connection over the cap is closed immediately
+      instead of handed to an unsupervised `tokio::spawn`. `handle_connection`
+      now races its single read against a fixed `READ_TIMEOUT` (5s, not
+      exposed as config since a probe is always a short-lived local caller
+      unlike the main proxy path's tunable `io_timeout`), so a connection
+      that never sends a byte no longer pins its task forever. See
+      `connections_beyond_the_cap_are_closed_immediately` and
+      `handle_connection_times_out_when_client_sends_nothing` in
+      `src/core/health.rs`.
 
 ## Low — hardening & process
 

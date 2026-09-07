@@ -19,10 +19,12 @@
 //! explicitly stopped either.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 /// Failure modes for standing up the health endpoint — just binding the
 /// listener, mirroring `proxy::ProxyError::Bind`.
@@ -35,6 +37,21 @@ pub enum HealthError {
         source: std::io::Error,
     },
 }
+
+/// Deadline for reading one probe request. Not exposed as config — unlike
+/// the main proxy path's `io_timeout`, a probe is always a short-lived local
+/// caller (kubelet, a sidecar), so a generous fixed value is enough to catch
+/// a connection that never sends a byte without adding a knob nobody needs
+/// to tune.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum probe connections handled concurrently. Orders of magnitude below
+/// `ConnectionLimits::default().max_connections` (1024) — this endpoint only
+/// ever expects a handful of orchestrator probes at once, not real traffic —
+/// so a small fixed cap stops connections that never send a byte (each
+/// otherwise parked forever in its own task, per the module doc) from
+/// accumulating without bound.
+const MAX_CONNECTIONS: usize = 64;
 
 const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 const UNAVAILABLE_RESPONSE: &[u8] =
@@ -59,15 +76,28 @@ pub async fn bind(listen_addr: SocketAddr) -> Result<TcpListener, HealthError> {
 
 /// Accepts connections from an already-bound listener and answers
 /// `/healthz`/`/readyz` off of `shutdown` forever — see the module doc for
-/// why this deliberately never stops accepting on its own.
+/// why this deliberately never stops accepting on its own. Concurrency is
+/// capped at `MAX_CONNECTIONS`, mirroring `proxy::ConnectionLimits` at a
+/// scale appropriate for a probe endpoint: a connection beyond the cap is
+/// closed immediately rather than queued.
 pub async fn serve(listener: TcpListener, shutdown: watch::Receiver<bool>) {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, peer_addr)) = listener.accept().await else {
+            continue;
+        };
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            tracing::warn!(
+                %peer_addr,
+                max_connections = MAX_CONNECTIONS,
+                "health: rejecting connection: at concurrent connection limit"
+            );
             continue;
         };
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, &shutdown).await {
+            let _permit = permit;
+            if let Err(err) = handle_connection(stream, &shutdown, READ_TIMEOUT).await {
                 tracing::debug!(%err, "health: connection error");
             }
         });
@@ -77,13 +107,25 @@ pub async fn serve(listener: TcpListener, shutdown: watch::Receiver<bool>) {
 /// Reads just enough of one HTTP/1.1 request to pull the path off its
 /// request line, answers it, and closes the connection — probes are
 /// short-lived, single-request clients, so there's no need for
-/// keep-alive/pipelining support here.
+/// keep-alive/pipelining support here. The read races `read_timeout` (always
+/// `READ_TIMEOUT` outside tests, parameterized so tests can use a short
+/// deadline instead of waiting out the real one) so a connection that never
+/// sends a byte doesn't pin its task forever.
 async fn handle_connection(
     mut stream: TcpStream,
     shutdown: &watch::Receiver<bool>,
+    read_timeout: Duration,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 512];
-    let n = stream.read(&mut buf).await?;
+    let n = match tokio::time::timeout(read_timeout, stream.read(&mut buf)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no request received within {read_timeout:?}"),
+            ));
+        }
+    };
     let request = String::from_utf8_lossy(&buf[..n]);
     let path = request
         .lines()
@@ -161,5 +203,44 @@ mod tests {
         let addr = spawn_server(rx).await;
 
         assert!(get(addr, "/other").await.starts_with("HTTP/1.1 404"));
+    }
+
+    #[tokio::test]
+    async fn handle_connection_times_out_when_client_sends_nothing() {
+        let (_tx, rx) = watch::channel(false);
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+
+        // A short deadline in place of the real `READ_TIMEOUT`, so the test
+        // doesn't wait out the real one.
+        let result = handle_connection(stream, &rx, Duration::from_millis(50)).await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn connections_beyond_the_cap_are_closed_immediately() {
+        let (_tx, rx) = watch::channel(false);
+        let addr = spawn_server(rx).await;
+
+        // Fill every permit with connections that never send a byte, so
+        // they're held open (and thus counted) for the rest of the test.
+        let mut held = Vec::with_capacity(MAX_CONNECTIONS);
+        for _ in 0..MAX_CONNECTIONS {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut rejected = TcpStream::connect(addr).await.unwrap();
+        let mut response = Vec::new();
+        rejected.read_to_end(&mut response).await.unwrap();
+        assert!(
+            response.is_empty(),
+            "expected the connection over the cap to be closed with no response"
+        );
+
+        drop(held);
     }
 }
