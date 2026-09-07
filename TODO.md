@@ -233,14 +233,18 @@ priority; within a group, roughly in the order you'd want to tackle them.
       parking_lot's guard can't be), and the test-only `SharedBuffer` mutex
       in `src/core/audit.rs`. No behavior change on the non-panic path;
       existing test suite covers it unchanged.
-- [ ] **Confirm `cargo audit` is currently clean.** Not independently
-      verified in this review (no network install attempted); CI already
-      runs it on every push/PR (`security_audit` job in
-      [`ci.yaml`](.github/workflows/ci.yaml)) — confirm the latest run is
-      green before sign-off. Dependency versions in `Cargo.lock` (rustls
-      0.23.43, rasn 0.28.14, rusqlite 0.40.2, tokio 1.53.1) are all recent
-      and no open RustSec advisory is known against them as of this
-      review, but that wasn't independently re-checked here.
+- [x] **Confirm `cargo audit` is currently clean.**
+      Verified: ran `cargo audit` locally (RustSec advisory-db, 1239
+      advisories loaded) against the current `Cargo.lock` (256 crates) — no
+      vulnerability advisories. `rustls-pemfile` (flagged unmaintained,
+      `RUSTSEC-2025-0134`) was a direct dependency in
+      [`Cargo.toml`](Cargo.toml) used only for PEM parsing in
+      [`src/core/tls.rs`](src/core/tls.rs); replaced with the `pem` support
+      that now ships in `rustls-pki-types` (already in the dependency tree
+      via `rustls` itself) — `rustls-pemfile` no longer appears anywhere in
+      `Cargo.lock`. `cargo audit` is clean with no advisories or notices,
+      `cargo test`/`fmt`/`clippy -D warnings` all pass, and recent `main`
+      CI runs (`gh run list`) are green.
 - [ ] **Encryption and persistent state are opt-in, not enforced.** TLS/mTLS
       on both hops and `state_db` persistence are fully implemented but
       off by default — [`config.example.toml`](config.example.toml) ships

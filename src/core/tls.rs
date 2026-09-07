@@ -3,9 +3,10 @@ use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
 
@@ -23,7 +24,7 @@ pub enum TlsError {
     ParseCert {
         path: PathBuf,
         #[source]
-        source: io::Error,
+        source: rustls_pki_types::pem::Error,
     },
     #[error("opening TLS key file {path}")]
     OpenKey {
@@ -35,7 +36,7 @@ pub enum TlsError {
     ParseKey {
         path: PathBuf,
         #[source]
-        source: io::Error,
+        source: rustls_pki_types::pem::Error,
     },
     #[error("no private key found in {path}")]
     NoPrivateKey { path: PathBuf },
@@ -241,7 +242,7 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         path: path.to_path_buf(),
         source,
     })?;
-    rustls_pemfile::certs(&mut BufReader::new(file))
+    CertificateDer::pem_reader_iter(BufReader::new(file))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|source| TlsError::ParseCert {
             path: path.to_path_buf(),
@@ -254,14 +255,16 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
         path: path.to_path_buf(),
         source,
     })?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))
-        .map_err(|source| TlsError::ParseKey {
+    match PrivateKeyDer::from_pem_reader(BufReader::new(file)) {
+        Ok(key) => Ok(key),
+        Err(rustls_pki_types::pem::Error::NoItemsFound) => Err(TlsError::NoPrivateKey {
+            path: path.to_path_buf(),
+        }),
+        Err(source) => Err(TlsError::ParseKey {
             path: path.to_path_buf(),
             source,
-        })?
-        .ok_or_else(|| TlsError::NoPrivateKey {
-            path: path.to_path_buf(),
-        })
+        }),
+    }
 }
 
 #[cfg(test)]
