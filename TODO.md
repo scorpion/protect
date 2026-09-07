@@ -245,7 +245,7 @@ priority; within a group, roughly in the order you'd want to tackle them.
       `Cargo.lock`. `cargo audit` is clean with no advisories or notices,
       `cargo test`/`fmt`/`clippy -D warnings` all pass, and recent `main`
       CI runs (`gh run list`) are green.
-- [ ] **Encryption and persistent state are opt-in, not enforced.** TLS/mTLS
+- [x] **Encryption and persistent state are opt-in, not enforced.** TLS/mTLS
       on both hops and `state_db` persistence are fully implemented but
       off by default — [`config.example.toml`](config.example.toml) ships
       with both commented out. Nothing in the code stops a deployment from
@@ -253,3 +253,16 @@ priority; within a group, roughly in the order you'd want to tackle them.
       replica with in-memory-only policy state that resets on every
       restart. These need to be explicit go-live checklist items for any
       real deployment, not just available features.
+      Fixed: extended the "Production deployment checklist" section in
+      [docs/INSTALLATION.md](docs/INSTALLATION.md#production-deployment-checklist)
+      (added by the previous `/metrics`/`/health` item) with two more
+      checked items: turning on `[proxy.listen_tls]`/`[proxy.upstream_tls]`
+      (with `client_ca_file` for mTLS) unless both legs are already on a
+      fully trusted network segment, and deciding `state_db` persistence
+      and its TLS (`state_db.ca_file`/`state_db.client_cert` for Valkey,
+      encryption at rest for SQLite) deliberately rather than leaving the
+      in-memory, plaintext default unexamined. No code change: like the
+      `/metrics`/`/health` item, this is a deployment decision the code
+      can't enforce — the fix direction itself asks only for explicit
+      go-live checklist items, not code that refuses to start without
+      them.

@@ -257,9 +257,10 @@ file hot-reloads.
 
 ## Production deployment checklist
 
-Neither of these is enforced by the code — they're network-topology
-decisions only you can make — so treat them as hard requirements to check
-off before going live, not optional hardening:
+None of these is enforced by the code — they're deployment decisions only
+you can make, and `ai-protect` runs perfectly well without any of them —
+so treat them as hard requirements to check off before going live, not
+optional hardening:
 
 - [ ] **`/metrics` and `/health` are unreachable from client-facing
   networks.** Neither endpoint authenticates its caller (see
@@ -272,6 +273,35 @@ off before going live, not optional hardening:
   firewall rule or network policy (e.g. a Kubernetes `NetworkPolicy`
   restricting ingress on both ports to your metrics/orchestration
   systems only) and verify it — don't rely on the config file alone.
+- [ ] **TLS is turned on for every hop that crosses a network you don't
+  fully control.** [config.example.toml](../config.example.toml) ships
+  with `[proxy.listen_tls]` and `[proxy.upstream_tls]` both commented out,
+  and nothing in the code refuses to run without them — a config with
+  neither set proxies LDAP in plaintext end-to-end, credentials and all,
+  same as the directory server itself would. Turn on
+  [`[proxy.listen_tls]`](#enabling-tls) for the client-facing hop (with
+  `client_ca_file` for mTLS if clients should be certificate-authenticated,
+  not just the directory's own bind credentials) and `[proxy.upstream_tls]`
+  for the hop to the real directory, unless both legs are already confined
+  to a network segment you treat as trusted end-to-end. If you're running
+  the optional Valkey-backed state store, the same applies to it — see the
+  next item.
+- [ ] **Policy state survives a restart, or you've deliberately accepted
+  that it won't.** By default a threshold policy's rate-limit bookkeeping
+  lives only in memory (see
+  [Sharing policy state across restarts or instances](#sharing-policy-state-across-restarts-or-instances)
+  above): a restart, crash, or rolling deploy silently zeroes every
+  identity's window, so a caller mid-way through being throttled gets a
+  fresh budget for free at exactly the moment a deployment is most likely
+  to happen. Set `state_db` (SQLite for a single instance, Valkey/Redis for
+  more than one behind a load balancer) if that reset is a real gap for
+  your threat model, and encrypt it — the SQLite file at rest, or a
+  `rediss://` URL plus `state_db.ca_file`/`state_db.client_cert` for
+  Valkey — the same rate-limit/identity bookkeeping this proxy exists to
+  protect shouldn't itself sit in plaintext on disk or on the wire. If
+  you've reviewed this and a restart-time reset is acceptable, that's a
+  valid choice too — just make it deliberately, not by leaving the default
+  unexamined.
 
 ## Stopping and restarting
 
