@@ -274,7 +274,7 @@ want to tackle them.
 
 ## Low — health-probe request line can be misread if split across reads
 
-- [ ] **`core::health::handle_connection` treats whatever bytes one
+- [x] **`core::health::handle_connection` treats whatever bytes one
       `TcpStream::read` call returns as the complete HTTP request line, so
       a probe request arriving in more than one read can be parsed as an
       empty or truncated path and answered `404` instead of the real
@@ -319,3 +319,25 @@ want to tackle them.
       `"GET /healthz HTTP/1.1\r\nhost: test\r\n\r\n"` request across two
       separate `write_all` calls with a short delay between them and
       assert the response is still `200`, not `404`.
+      Fixed: `handle_connection`
+      ([src/core/health.rs](src/core/health.rs)) now loops
+      `stream.read` calls into the same fixed 512-byte buffer, appending
+      each chunk, until either the accumulated bytes contain `\r\n` (the
+      request line is complete), the peer closes the connection (`read`
+      returns `0`), or the buffer fills — rather than treating whatever one
+      `read()` call happened to return as the whole request. The loop, not
+      each individual `read`, is what races `read_timeout`
+      (`tokio::time::timeout` now wraps the whole `async` loop), so a
+      connection that sends a partial line and then stalls still times out
+      on the original deadline instead of hanging past it, and a
+      connection that completes its line after a delay is no longer
+      mis-parsed as pathless. Verified with
+      `healthz_is_ok_even_when_the_request_line_arrives_split_across_reads`
+      (the suggested test, using the worst-case split point — `"GET "` in
+      one `write_all`, the rest after a delay in a second — chosen because
+      splitting there leaves no second whitespace-separated token for the
+      old code to find, guaranteeing the old single-read parse would
+      return `""` and thus `404`; confirmed by temporarily reverting the
+      implementation and observing this exact test fail before re-applying
+      the fix). `handle_connection_times_out_when_client_sends_nothing`
+      (a client that never sends a byte) continues to pass unchanged.

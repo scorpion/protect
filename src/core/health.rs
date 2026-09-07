@@ -107,17 +107,40 @@ pub async fn serve(listener: TcpListener, shutdown: watch::Receiver<bool>) {
 /// Reads just enough of one HTTP/1.1 request to pull the path off its
 /// request line, answers it, and closes the connection — probes are
 /// short-lived, single-request clients, so there's no need for
-/// keep-alive/pipelining support here. The read races `read_timeout` (always
-/// `READ_TIMEOUT` outside tests, parameterized so tests can use a short
-/// deadline instead of waiting out the real one) so a connection that never
-/// sends a byte doesn't pin its task forever.
+/// keep-alive/pipelining support here. The whole read loop (not each
+/// individual `read` call) races `read_timeout` (always `READ_TIMEOUT`
+/// outside tests, parameterized so tests can use a short deadline instead of
+/// waiting out the real one) so a connection that never sends a byte, or
+/// never finishes its request line, doesn't pin its task forever.
 async fn handle_connection(
     mut stream: TcpStream,
     shutdown: &watch::Receiver<bool>,
     read_timeout: Duration,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 512];
-    let n = match tokio::time::timeout(read_timeout, stream.read(&mut buf)).await {
+    let mut len = 0;
+
+    // A bare `GET /healthz HTTP/1.1\r\n...` from a typical probe client
+    // arrives in one TCP segment, but that's not guaranteed — some minimal
+    // HTTP client implementations write the request line and headers as
+    // separate `write()` calls. Looping until the request line's `\r\n`
+    // shows up (or the connection closes, or `buf` fills) avoids treating
+    // whatever one `read()` happened to return as the complete line, which
+    // would otherwise mis-parse a request split mid-line as pathless and
+    // answer a spurious 404 instead of the real liveness/readiness status.
+    let read_result: Result<std::io::Result<()>, _> = tokio::time::timeout(read_timeout, async {
+        loop {
+            if len == buf.len() || buf[..len].windows(2).any(|w| w == b"\r\n") {
+                return Ok(());
+            }
+            match stream.read(&mut buf[len..]).await? {
+                0 => return Ok(()), // peer closed before finishing the line
+                n => len += n,
+            }
+        }
+    })
+    .await;
+    match read_result {
         Ok(result) => result?,
         Err(_) => {
             return Err(std::io::Error::new(
@@ -125,8 +148,8 @@ async fn handle_connection(
                 format!("no request received within {read_timeout:?}"),
             ));
         }
-    };
-    let request = String::from_utf8_lossy(&buf[..n]);
+    }
+    let request = String::from_utf8_lossy(&buf[..len]);
     let path = request
         .lines()
         .next()
@@ -203,6 +226,34 @@ mod tests {
         let addr = spawn_server(rx).await;
 
         assert!(get(addr, "/other").await.starts_with("HTTP/1.1 404"));
+    }
+
+    #[tokio::test]
+    async fn healthz_is_ok_even_when_the_request_line_arrives_split_across_reads() {
+        let (_tx, rx) = watch::channel(false);
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let server = tokio::spawn(async move {
+            handle_connection(stream, &rx, READ_TIMEOUT).await.unwrap();
+        });
+
+        // Split mid-request-line: after this first write, a single `read()`
+        // sees only "GET " — no second whitespace-separated token yet, so
+        // parsing this alone would find no path.
+        client.write_all(b"GET ").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client
+            .write_all(b"/healthz HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await
+            .unwrap();
+
+        server.await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
     }
 
     #[tokio::test]
