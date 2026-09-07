@@ -159,6 +159,7 @@ impl HistoryStore for ValkeyStore {
         &self,
         new_events: &[(String, i64)],
         cutoff_epoch_millis: i64,
+        max_identities: usize,
     ) -> anyhow::Result<HashMap<String, Vec<i64>>> {
         let mut conn = self.connection().await?;
 
@@ -198,7 +199,7 @@ impl HistoryStore for ValkeyStore {
             cursor = next_cursor;
         }
 
-        let mut rows_by_identity = HashMap::with_capacity(keys.len());
+        let mut rows_by_identity: HashMap<String, Vec<i64>> = HashMap::with_capacity(keys.len());
         for key in keys {
             let (remaining, count): (Vec<(String, f64)>, usize) = redis::pipe()
                 .zrembyscore(&key, "-inf", format!("({cutoff_epoch_millis}"))
@@ -229,6 +230,40 @@ impl HistoryStore for ValkeyStore {
                     .map(|(_, score)| score as i64)
                     .collect(),
             );
+        }
+
+        // Bound the keyspace to at most `max_identities` distinct
+        // identities, deleting the sorted sets for the least-recently-
+        // active identities beyond that — the identity-count cap
+        // `max_tracked_identities` documents extending to `state_db`, not
+        // just the in-memory map. "Least recently active" ranks by each
+        // identity's own most recent (highest-scored) timestamp, matching
+        // `evict_stalest_until`'s in-memory definition — `remaining` above
+        // is ascending by score, so each identity's last element is that
+        // maximum.
+        if rows_by_identity.len() > max_identities {
+            let mut by_last_seen: Vec<(&String, i64)> = rows_by_identity
+                .iter()
+                .map(|(identity, timestamps)| {
+                    (identity, timestamps.last().copied().unwrap_or(i64::MIN))
+                })
+                .collect();
+            by_last_seen.sort_by_key(|(_, last_seen)| *last_seen);
+
+            let excess = rows_by_identity.len() - max_identities;
+            let stalest: Vec<String> = by_last_seen
+                .into_iter()
+                .take(excess)
+                .map(|(identity, _)| identity.clone())
+                .collect();
+
+            for identity in stalest {
+                let key = self.history_key(&identity);
+                if let Err(err) = conn.del::<_, usize>(&key).await {
+                    tracing::debug!(error = %err, key = %key, "failed to delete threshold history key evicted by max_tracked_identities");
+                }
+                rows_by_identity.remove(&identity);
+            }
         }
 
         Ok(rows_by_identity)
@@ -299,6 +334,7 @@ mod tests {
             .sync(
                 &[("alice".to_string(), 1_000), ("bob".to_string(), 1_500)],
                 0,
+                100,
             )
             .await
             .unwrap();
@@ -307,7 +343,7 @@ mod tests {
 
         // A cutoff past "alice"'s only row prunes it (and deletes the now-
         // empty key) but keeps "bob"'s.
-        let rows = store.sync(&[], 1_200).await.unwrap();
+        let rows = store.sync(&[], 1_200, 100).await.unwrap();
         assert!(!rows.contains_key("alice"));
         assert_eq!(rows.get("bob").unwrap(), &vec![1_500]);
     }
@@ -325,12 +361,48 @@ mod tests {
         let instance_b = ValkeyStore::open(&url, key_prefix, ValkeyTlsConfig::default()).unwrap();
 
         instance_a
-            .sync(&[("alice".to_string(), 1_000)], 0)
+            .sync(&[("alice".to_string(), 1_000)], 0, 100)
             .await
             .unwrap();
-        let rows = instance_b.sync(&[], 0).await.unwrap();
+        let rows = instance_b.sync(&[], 0, 100).await.unwrap();
 
         assert_eq!(rows.get("alice").unwrap(), &vec![1_000]);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn sync_caps_distinct_identities_by_evicting_the_stalest() {
+        let Some(url) = test_url() else {
+            eprintln!("skipping: VALKEY_TEST_URL not set");
+            return;
+        };
+        let key_prefix = format!("ai_protect_test:{}", unique_test_suffix());
+        let store = ValkeyStore::open(&url, key_prefix, ValkeyTlsConfig::default()).unwrap();
+
+        // alice is the least-recently-active of the three (her only event
+        // has the smallest timestamp), so a cap of 2 must evict only her —
+        // both from the returned snapshot and from the store itself.
+        let rows = store
+            .sync(
+                &[
+                    ("alice".to_string(), 1_000),
+                    ("bob".to_string(), 2_000),
+                    ("carol".to_string(), 3_000),
+                ],
+                0,
+                2,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.contains_key("alice"), "alice should be evicted");
+        assert_eq!(rows.get("bob").unwrap(), &vec![2_000]);
+        assert_eq!(rows.get("carol").unwrap(), &vec![3_000]);
+
+        let rows = store.sync(&[], 0, 100).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.contains_key("alice"));
     }
 
     /// Nanoseconds alone aren't a reliable uniqueness source under some

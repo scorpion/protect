@@ -47,8 +47,9 @@ impl SqliteStore {
         &self,
         new_events: &[(String, i64)],
         cutoff_epoch_millis: i64,
+        max_identities: usize,
     ) -> rusqlite::Result<HashMap<String, Vec<i64>>> {
-        blocking_sync(&self.conn, new_events, cutoff_epoch_millis)
+        blocking_sync(&self.conn, new_events, cutoff_epoch_millis, max_identities)
     }
 }
 
@@ -56,6 +57,7 @@ fn blocking_sync(
     conn: &Mutex<Connection>,
     new_events: &[(String, i64)],
     cutoff_epoch_millis: i64,
+    max_identities: usize,
 ) -> rusqlite::Result<HashMap<String, Vec<i64>>> {
     let mut conn = conn.lock();
     let tx = conn.transaction()?;
@@ -70,6 +72,27 @@ fn blocking_sync(
     tx.execute(
         "DELETE FROM threshold_history WHERE timestamp_millis < ?1",
         [cutoff_epoch_millis],
+    )?;
+    // Bound the table to at most `max_identities` distinct identities,
+    // dropping every row for the least-recently-active identities beyond
+    // that — the identity-count cap `max_tracked_identities` documents
+    // extending to `state_db`, not just the in-memory map. Ranks identities
+    // by their own most recent timestamp (`MAX(timestamp_millis)`, matching
+    // `evict_stalest_until`'s in-memory definition of "least recently
+    // active") and deletes every row belonging to an identity ranked past
+    // `max_identities`.
+    tx.execute(
+        "DELETE FROM threshold_history WHERE identity IN (
+            SELECT identity FROM (
+                SELECT identity, ROW_NUMBER() OVER (
+                    ORDER BY MAX(timestamp_millis) DESC
+                ) AS rank
+                FROM threshold_history
+                GROUP BY identity
+            )
+            WHERE rank > ?1
+        )",
+        [max_identities as i64],
     )?;
     let mut rows_by_identity: HashMap<String, Vec<i64>> = HashMap::new();
     {
@@ -96,13 +119,16 @@ impl HistoryStore for SqliteStore {
         &self,
         new_events: &[(String, i64)],
         cutoff_epoch_millis: i64,
+        max_identities: usize,
     ) -> anyhow::Result<HashMap<String, Vec<i64>>> {
         let conn = self.conn.clone();
         let new_events = new_events.to_vec();
-        tokio::task::spawn_blocking(move || blocking_sync(&conn, &new_events, cutoff_epoch_millis))
-            .await
-            .map_err(anyhow::Error::from)?
-            .map_err(anyhow::Error::from)
+        tokio::task::spawn_blocking(move || {
+            blocking_sync(&conn, &new_events, cutoff_epoch_millis, max_identities)
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(anyhow::Error::from)
     }
 }
 
@@ -119,13 +145,14 @@ mod tests {
             .sync_now(
                 &[("alice".to_string(), 1_000), ("bob".to_string(), 1_500)],
                 0,
+                100,
             )
             .unwrap();
         assert_eq!(rows.get("alice").unwrap(), &vec![1_000]);
         assert_eq!(rows.get("bob").unwrap(), &vec![1_500]);
 
         // A cutoff past "alice"'s only row prunes it but keeps "bob"'s.
-        let rows = store.sync_now(&[], 1_200).unwrap();
+        let rows = store.sync_now(&[], 1_200, 100).unwrap();
         assert!(!rows.contains_key("alice"));
         assert_eq!(rows.get("bob").unwrap(), &vec![1_500]);
     }
@@ -135,8 +162,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(&dir.path().join("history.sqlite3")).unwrap();
 
-        store.sync_now(&[("alice".to_string(), 1_000)], 0).unwrap();
-        let rows = store.sync_now(&[("alice".to_string(), 2_000)], 0).unwrap();
+        store
+            .sync_now(&[("alice".to_string(), 1_000)], 0, 100)
+            .unwrap();
+        let rows = store
+            .sync_now(&[("alice".to_string(), 2_000)], 0, 100)
+            .unwrap();
 
         assert_eq!(rows.get("alice").unwrap(), &vec![1_000, 2_000]);
     }
@@ -148,13 +179,47 @@ mod tests {
 
         {
             let store = SqliteStore::open(&path).unwrap();
-            store.sync_now(&[("alice".to_string(), 1_000)], 0).unwrap();
+            store
+                .sync_now(&[("alice".to_string(), 1_000)], 0, 100)
+                .unwrap();
         }
 
         let store = SqliteStore::open(&path).unwrap();
-        let rows = store.sync_now(&[], 0).unwrap();
+        let rows = store.sync_now(&[], 0, 100).unwrap();
 
         assert_eq!(rows.get("alice").unwrap(), &vec![1_000]);
+    }
+
+    #[test]
+    fn sync_now_caps_distinct_identities_by_evicting_the_stalest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&dir.path().join("history.sqlite3")).unwrap();
+
+        // alice is the least-recently-active of the three (her only row has
+        // the smallest timestamp), so a cap of 2 must drop only her.
+        let rows = store
+            .sync_now(
+                &[
+                    ("alice".to_string(), 1_000),
+                    ("bob".to_string(), 2_000),
+                    ("carol".to_string(), 3_000),
+                ],
+                0,
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.contains_key("alice"), "alice should be evicted");
+        assert_eq!(rows.get("bob").unwrap(), &vec![2_000]);
+        assert_eq!(rows.get("carol").unwrap(), &vec![3_000]);
+
+        // The eviction is persisted, not just filtered from this call's
+        // return value — a later sync with no new events still only sees
+        // the two survivors.
+        let rows = store.sync_now(&[], 0, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.contains_key("alice"));
     }
 
     #[tokio::test]
@@ -162,7 +227,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(&dir.path().join("history.sqlite3")).unwrap();
 
-        let rows = HistoryStore::sync(&store, &[("alice".to_string(), 1_000)], 0)
+        let rows = HistoryStore::sync(&store, &[("alice".to_string(), 1_000)], 0, 100)
             .await
             .unwrap();
 

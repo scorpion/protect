@@ -7,190 +7,277 @@ previous rounds of hardening are still in place and working as documented
 (both hops, with no buffered-plaintext bleed-through across the upgrade),
 `MAX_PENDING_BINDS` eviction, bind-response correlation for `Identity`
 (never promoted on an unverified claim), the `Global` threshold-scope
-backstop, `max_tracked_identities` eviction, graceful shutdown, hot-reload,
-metrics, health checks, structured JSON audit logging (properly escaped,
-not forgeable via embedded control characters), fail-closed error handling
-throughout `decode`/`evaluate_all`/`build_rejection` (no fail-open path
-forwards a frame after an internal error), and a clean `cargo audit` —
+backstop, the numeric-OID/attribute-option-aware `LOCK_ATTRIBUTES` match,
+bind-DN case-folding, the `sync_once` merge that no longer erases
+in-flight admissions during a `state_db` round trip, graceful shutdown,
+hot-reload, metrics, health checks, structured JSON audit logging
+(properly escaped, not forgeable via embedded control characters),
+fail-closed error handling throughout `decode`/`evaluate_all`/
+`build_rejection` (no fail-open path forwards a frame after an internal
+error), and a clean `cargo audit` (255 dependencies, zero advisories) —
 none of that is re-litigated below. This pass instead went looking for
-what those fixes might have missed. Grouped by severity; within a group,
-roughly in the order you'd want to tackle them.
+what those fixes might have missed, with particular attention to the
+`state_db`/`max_tracked_identities` machinery those earlier fixes touched
+and to the account-lock detection logic's actual semantics. Grouped by
+severity; within a group, roughly in the order you'd want to tackle them.
 
-## Critical — policy bypass
+## High — `max_tracked_identities` doesn't bound `state_db` storage
 
-- [x] **A lock/unlock attribute named by its numeric OID (or with an
-      attribute-option suffix) instead of its descriptive name completely
-      bypasses `AccountLock`/`AccountUnlock` detection.** `LOCK_ATTRIBUTES`
-      ([src/connector/ldap.rs:26-31](src/connector/ldap.rs)) lists four
-      lowercase descriptive names
-      (`pwdaccountlockedtime`/`useraccountcontrol`/`nsaccountlock`/
-      `shadowexpire`), and `touches_lock_attribute`
-      ([src/connector/ldap.rs:222-228](src/connector/ldap.rs)) matches a
-      `ModifyRequest` `Change`'s attribute against that list via exact
-      string comparison after lowercasing:
-      `LOCK_ATTRIBUTES.contains(&change.modification.r#type.0.to_lowercase().as_str())`.
-      Per RFC 4512, an `AttributeDescription` on the wire may legally be
-      given as either its descriptive name *or* its numeric OID — a
-      directory resolves both identically to the same attribute. Every
-      attribute in `LOCK_ATTRIBUTES` has a well-known OID (e.g.
-      `userAccountControl` → `1.2.840.113556.1.4.8` in Active Directory,
-      this project's flagship target). A `ModifyRequest` whose
-      `Change.modification.type` is sent as `"1.2.840.113556.1.4.8"`
-      instead of `"userAccountControl"` flips `ACCOUNTDISABLE` on the real
-      directory exactly as effectively as the descriptive-name form, but
-      never matches `LOCK_ATTRIBUTES`, so `decode` returns `Ok(None)` and
-      the request is forwarded byte-for-byte — unthrottled by
-      `ThresholdPolicy` and completely absent from `audit::log_decision`
-      and the Prometheus counters. The same exact-match gap also lets an
-      attribute-option suffix (`userAccountControl;x-foo`, tolerated by
-      some server implementations for an otherwise-unrecognized option)
-      slip through. This is a complete, silent, zero-trace bypass of the
-      proxy's central detection mechanism for bulk account lock/unlock —
-      the exact "4 is fine, 4,000 is not" scenario this project exists to
-      catch — reachable by any client that can issue a `Modify`, with no
-      elevated privilege required beyond whatever the directory itself
-      demands for the underlying attribute write.
-      Fix direction: resolve both forms to a canonical identifier before
-      the `LOCK_ATTRIBUTES` comparison — either maintain each attribute's
-      known numeric OID alongside its name in the table and match either,
-      or strip a leading `;`-delimited attribute-option suffix and treat a
-      numeric-OID-shaped type string as an alias lookup. Consider a test
-      fixture that sends the OID form of each `LOCK_ATTRIBUTES` entry and
-      asserts `decode` still produces the matching `Action`.
-      Fixed: `LOCK_ATTRIBUTES` ([src/connector/ldap.rs](src/connector/ldap.rs))
-      is now a table of `(descriptive name, numeric OID)` pairs — each
-      schema's well-known OID (e.g. `userAccountControl` →
-      `1.2.840.113556.1.4.8`) alongside its name — and a new
-      `is_lock_attribute` helper strips any leading `;`-delimited
-      attribute-option suffix, lowercases, and matches against either form
-      before `touches_lock_attribute` consults it, so an OID-spelled or
-      option-suffixed `Change.modification.type` no longer bypasses
-      detection. See `decodes_lock_attribute_oid_form_as_account_lock_action`
-      and
-      `decodes_lock_attribute_with_attribute_option_suffix_as_account_lock_action`
-      in `src/connector/ldap.rs`.
+- [x] **`max_tracked_identities` caps the in-memory identity history map
+      but never touches `state_db`, so a `state_db`-backed deployment's
+      SQLite table or Valkey key count — and the per-cycle cost of
+      scanning them — grows without the bound the code's own
+      documentation promises.** `evict_stalest_until`
+      ([src/core/policy/threshold.rs:406-422](src/core/policy/threshold.rs)),
+      called from `evaluate`
+      ([src/core/policy/threshold.rs:472-483](src/core/policy/threshold.rs))
+      whenever a never-before-seen identity is admitted and the map is at
+      capacity, and again from `sync_once`
+      ([src/core/policy/threshold.rs:328-330](src/core/policy/threshold.rs))
+      after folding in a `state_db` snapshot, only ever removes entries
+      from the in-memory `history: Mutex<HashMap<Identity,
+      VecDeque<Instant>>>`. It never calls into `state.store` (the
+      `Arc<dyn HistoryStore>`) to delete the evicted identity's persisted
+      rows — there is no such method to call. `HistoryStore`'s only
+      mutating operation, `sync`
+      ([src/core/policy/store/mod.rs:85-98](src/core/policy/store/mod.rs)),
+      prunes strictly "anything at or older than `cutoff_epoch_millis`" —
+      age-based only, with no concept of an identity-count cap. Both
+      backends confirm this: `SqliteStore::blocking_sync`'s only `DELETE`
+      is `WHERE timestamp_millis < ?1`
+      ([src/core/policy/store/sqlite.rs:70-73](src/core/policy/store/sqlite.rs))
+      against one global table with no per-identity row cap, and the
+      `SELECT` that rebuilds `rows_by_identity` has no `LIMIT` and groups
+      every surviving row regardless of how many distinct identities that
+      is
+      ([src/core/policy/store/sqlite.rs:76-77](src/core/policy/store/sqlite.rs));
+      `ValkeyStore::sync` discovers every key with `SCAN
+      {key_prefix}:history:*`
+      ([src/core/policy/store/valkey.rs:181-199](src/core/policy/store/valkey.rs))
+      and does a `ZREMRANGEBYSCORE`/`ZRANGE`/`ZCARD` round trip per key
+      found
+      ([src/core/policy/store/valkey.rs:201-232](src/core/policy/store/valkey.rs))
+      — again with no cap on how many distinct keys that loop iterates.
 
-## High — window-limit bypass under `state_db`
+      This directly contradicts an explicit, repeated promise in the
+      codebase's own documentation. `ThresholdConfig::max_tracked_identities`'s
+      doc comment states the default "bound[s] worst-case memory (and, if
+      `state_db` is set, storage) to a fixed amount regardless of how many
+      distinct identities an attacker churns through"
+      ([src/core/policy/threshold.rs:140-144](src/core/policy/threshold.rs));
+      [ARCHITECTURE.md](ARCHITECTURE.md#policy-blast-radius-thresholding)
+      (lines 381-383) repeats it near-verbatim — "bounding memory (and
+      `state_db` storage, if configured) to a fixed size"; and the
+      template every deployer copies,
+      [policies/ldap.example.toml:21-27](policies/ldap.example.toml),
+      tells the operator setting this value that it's "bounding
+      memory/state_db growth." None of that holds. Verified directly: with
+      `max_tracked_identities = 2` and a SQLite `state_db`, admitting 10
+      distinct identities (one action each, well under `max_per_window`)
+      leaves the in-memory map correctly capped at 2 entries, but after
+      one `sync_once` the SQLite file holds all 10 identities' rows — the
+      in-memory cap has no effect on the store at all.
 
-- [x] **A `state_db`-backed `ThresholdPolicy`'s background sync can
-      silently erase in-flight admissions from local history, letting
-      sustained traffic exceed `max_per_window`.** `evaluate`
-      ([src/core/policy/threshold.rs:457-467](src/core/policy/threshold.rs))
-      admits a request by pushing timestamps into both `history` (the live
-      in-memory sliding window) and `state.pending` (queued for the next
-      background flush) under two separate, sequential lock sections.
-      `sync_once` ([src/core/policy/threshold.rs:303-335](src/core/policy/threshold.rs)),
-      which runs on every `flush_interval` tick (default 2s) whenever
-      `state_db` is configured — durability alone, no multi-instance HA
-      deployment required — does, in order: (1) drain `state.pending` into
-      `new_events` and release the lock; (2) `.await` `state.store.sync(...)`,
-      a real, unbounded-in-practice blocking SQLite call or Valkey network
-      round trip performed with **no lock held**; (3) re-lock `history` and
-      unconditionally *replace* (not merge) each identity's entry with
-      whatever `HistoryStore::sync` returns — documented at
-      [src/core/policy/store/mod.rs:85-98](src/core/policy/store/mod.rs)
-      as "the authoritative, whole-store snapshot," by design so an
-      instance's own events aren't double-counted against fresh copies of
-      themselves arriving from the round trip. Any `evaluate` call that
-      lands between step 1 and step 3 pushes into `history` (correctly
-      counted for its own request) and queues into `pending` for the *next*
-      cycle — but that timestamp isn't part of the snapshot fetched in
-      step 2, since the snapshot only reflects events already drained at
-      step 1. When step 3's replace lands, it overwrites that identity's
-      whole history with the stale, smaller snapshot, discarding every
-      timestamp added during the round trip. The discarded timestamps
-      aren't lost forever (they're still in `pending` and get written on
-      the *next* cycle), but from the moment of each merge until that next
-      cycle, `history` locally undercounts the identity's true recent
-      volume — and `evaluate`'s admission check reads only `history`, so
-      requests landing in that undercounted window are admitted even
-      though the true recent count would have blocked them. This recurs
-      every `flush_interval`, for as long as the attacker keeps flooding:
-      each cycle's round-trip duration is a fresh window in which some
-      admitted volume gets erased and the freed-up "room" gets re-spent,
-      systematically leaking throughput above `max_per_window` in direct
-      proportion to (request rate) × (store round-trip latency) per cycle
-      — worse for `ValkeyStore` (network RTT) than `SqliteStore` (local
-      disk via `spawn_blocking`), and worse the longer the attack is
-      sustained, since every cycle reopens the same window. This applies
-      to both `PerIdentity` and `Global` scope alike, since `history_key`
-      just selects which bucket gets replaced.
-      Fix direction: don't wholesale-replace an identity's local entry
-      from the fetched snapshot — union/merge the returned timestamps with
-      whatever's already in `history` (dedup on exact value, since a
-      timestamp round-tripped through the store is byte-identical to the
-      one already in memory), so a concurrent admission between drain and
-      merge is never lost; or drain `pending` *after* the store round trip
-      completes rather than before, so nothing admitted during the round
-      trip is missing from the next drain. Add a test that calls
-      `evaluate` (pushing to `pending`) concurrently with a slow/delayed
-      fake `HistoryStore::sync` and asserts the concurrently-admitted
-      timestamp survives the subsequent merge.
-      Fixed: `sync_once` ([src/core/policy/threshold.rs](src/core/policy/threshold.rs))
-      no longer wholesale-replaces an identity's `history` entry with the
-      fetched snapshot. A new `merge_history_from_rows` helper unions the
-      snapshot's timestamps with whatever's already in `history`, deduping
-      on exact epoch-millis value (an event this instance already flushed
-      round-trips back byte-identical, so a plain union without dedup would
-      double-count it every cycle), so a concurrent `evaluate` admission
-      landing between the drain and the merge is preserved instead of
-      silently erased. See
-      `sync_once_merges_admission_that_lands_during_the_round_trip`
-      (reproduces the race end to end against a real `SqliteStore`) and
-      `merge_history_from_rows_dedups_a_timestamp_already_in_local_history`
-      in `src/core/policy/threshold.rs`.
+      Any deployment that enables `state_db` for durability or HA —
+      arguably the higher-stakes production deployments, since that's an
+      opt-in hardening step per
+      [ARCHITECTURE.md](ARCHITECTURE.md#known-gaps-by-design-at-this-stage)
+      — gets none of `max_tracked_identities`'s advertised protection
+      against identity-churn resource exhaustion on the persisted side. An
+      attacker able to present many distinct identities within one
+      `window` (an owned IPv6 prefix trivially yields far more distinct
+      unauthenticated `ip:`-scoped identities than the default cap; a
+      multi-credential compromise yields as many `dn:`-scoped ones as DNs
+      it can successfully bind as) can grow the SQLite file or the Valkey
+      keyspace by one row/key per distinct identity indefinitely — bounded
+      only by the `window` duration, not by any operator-configured cap —
+      filling disk (SQLite) or Valkey memory, and, since every `sync_once`
+      cycle (`flush_interval`, default 2s) re-fetches and re-groups every
+      surviving row/key regardless of count, making each cycle
+      progressively slower as the unbounded set grows, which risks the
+      background sync (one round trip per key for `ValkeyStore`) falling
+      permanently behind under sustained churn. An evicted identity can
+      also resurrect itself: `sync_once` merges whatever the snapshot
+      returns into `history` *before* re-applying `evict_stalest_until`,
+      so an identity evicted from memory moments earlier is pulled
+      straight back in on the very next cycle for as long as its rows are
+      still sitting in the (uncapped) store.
+      Fix direction: give `HistoryStore` a way to bound its own identity
+      cardinality — either an explicit `delete(identity)`/`evict`
+      operation `evict_stalest_until` calls for the specific identity it
+      removes (threading the store handle through, which `evaluate`
+      doesn't have today — only `sync_once` does), or have `sync` itself
+      enforce a maximum row/key count by least-recent-activity (e.g. a
+      window-function-based `DELETE` in SQL, or a maintained "last active"
+      sorted set in Valkey pruned by rank rather than only by score) so it
+      never returns more identities than the caller's cap regardless of
+      which instance wrote them. Update the doc comment and the example
+      policy file only once the guarantee actually holds, and add a test
+      that churns more identities than `max_tracked_identities` through a
+      `state_db`-backed policy and asserts the store's own identity count
+      stays at or under the cap after a sync.
+      Fixed: `HistoryStore::sync` (and `SqliteStore::sync_now`) now take a
+      `max_identities` parameter, and `ThresholdPolicy` passes
+      `config.max_tracked_identities` through on every call (`new`'s
+      startup load and `sync_once`'s periodic flush alike). Each backend
+      enforces the cap itself, ranking "least recently active" the same
+      way `evict_stalest_until` already does in memory — the smallest
+      per-identity *maximum* timestamp, not insertion order — so both
+      agree on which identity goes first: `SqliteStore` deletes every row
+      for identities ranked past the cap in one window-function `DELETE`
+      (`ROW_NUMBER() OVER (ORDER BY MAX(timestamp_millis) DESC)`) inside
+      the same transaction as the existing age-based prune;
+      `ValkeyStore::sync` ranks the per-identity sorted sets it already
+      fetched by their highest score and `DEL`s the stalest ones' keys
+      past the cap. Verified directly: `state_db_caps_tracked_identity_count_after_sync`
+      (`src/core/policy/threshold.rs`) churns 10 identities through a
+      `max_tracked_identities = 3` SQLite-backed policy and asserts the
+      file itself never holds more than 3; `sync_now_caps_distinct_identities_by_evicting_the_stalest`
+      (`src/core/policy/store/sqlite.rs`) and
+      `sync_caps_distinct_identities_by_evicting_the_stalest`
+      (`src/core/policy/store/valkey.rs`, requires a real server, run with
+      `--ignored`) cover each backend directly.
 
-## Medium — identity-budget dilution
+## High — eviction-scan denial of service
 
-- [x] **A bind DN is used verbatim as `Identity`, with no case or
-      attribute-form normalization, letting one real principal multiply
-      its own `PerIdentity` threshold budget for free.** `bind_request`
-      ([src/connector/ldap.rs:316-326](src/connector/ldap.rs)) returns
-      `cap_dn(bind.name.0.clone())` — `cap_dn`
-      ([src/connector/ldap.rs:63-75](src/connector/ldap.rs)) only bounds
-      length/hashes oversized DNs, performing no case-folding or
-      canonicalization — and `Identity::from_bind_dn`
-      ([src/core/identity.rs:26-28](src/core/identity.rs)) wraps it as
-      `format!("dn:{dn}")` verbatim. LDAP attribute type names are
-      case-insensitive and may also be given by numeric OID (e.g. `cn=` vs
-      `CN=` vs `2.5.4.3=`), and RDN values typically use `caseIgnoreMatch`
-      — so `"cn=alice,dc=example,dc=com"`, `"CN=alice,DC=example,DC=com"`,
-      and `"cn=ALICE,dc=EXAMPLE,dc=COM"` all authenticate as the exact same
-      directory entry, each producing a genuine, correlated
-      `BindResponse::Success` (not the already-fixed unverified-claim
-      bypass — every one of these is a real, verified bind). Because the
-      DN string is used verbatim, each spelling variant promotes to a
-      *distinct* `Identity` and gets its own fresh, empty `ThresholdPolicy`
-      `PerIdentity` history bucket. One attacker with one valid credential
-      can multiply their own effective per-identity rate limit by
-      reconnecting and re-binding with a different DN spelling each time —
-      no privilege escalation needed, just case or attribute-form
-      variance on a DN they're already entitled to use. A `scope =
-      "global"` backstop entry (see `docs/INSTALLATION.md`'s deployment
-      checklist) still catches the aggregate volume regardless of which
-      spelling each request is attributed to, so this doesn't defeat
-      policy entirely where that's enabled — but the per-identity control
-      itself, and the audit trail's ability to attribute a burst to one
-      consistently-named principal, are both undermined for any deployment
-      relying on `PerIdentity` scope alone.
-      Fix direction: normalize the DN in `bind_request` before returning
-      it — at minimum, lowercase attribute type names (the part before
-      each unescaped `=`) so `cn=`/`CN=`/`Cn=` collapse together; ideally
-      parse-and-re-serialize to a canonical RFC 4514 form (also resolving
-      an attribute type's numeric-OID form to its descriptive name or vice
-      versa) so equivalent spellings always collapse to one `Identity`.
-      Fixed: `bind_request` ([src/connector/ldap.rs](src/connector/ldap.rs))
-      now runs the claimed DN through a new `normalize_bind_dn` helper
-      (lowercasing the whole string) before `cap_dn`, so `cn=`/`CN=`/`Cn=`
-      and a caseIgnoreMatch RDN value (`alice` vs `ALICE`) all collapse to
-      the same `Identity` instead of each spelling buying a fresh
-      `PerIdentity` budget. Deliberately doesn't touch `cap_dn`'s other
-      callers (`Action::target` for modify/del/add/password-modify), since
-      those strings are audit/forensic display only, and stops short of
-      full RFC 4514 canonicalization (whitespace re-serialization,
-      numeric-OID⇄name resolution) — undercollapsing there only dilutes a
-      budget across a couple of extra buckets rather than defeating it
-      outright, and OID⇄name resolution would require modeling every
-      backend's schema. See
-      `bind_request_case_folds_claimed_dn_so_spelling_variants_collapse` in
-      `src/connector/ldap.rs`.
+- [ ] **Once the tracked-identity map is at capacity, every single new
+      identity `evaluate()` admits or blocks pays for a full linear scan
+      of the entire map while holding the one lock every connection's
+      policy decisions share — an attacker who reaches that capacity can
+      turn ordinary traffic into a process-wide throughput bottleneck.**
+      `evict_stalest_until`
+      ([src/core/policy/threshold.rs:406-422](src/core/policy/threshold.rs))
+      finds the identity to remove via `history.iter().min_by_key(|(_,
+      timestamps)| timestamps.back().copied())` — an O(n) walk of the
+      whole `HashMap` for n = current tracked-identity count (up to
+      `max_tracked_identities`, defaulting to 100,000). `evaluate`
+      ([src/core/policy/threshold.rs:461-523](src/core/policy/threshold.rs))
+      calls it, with `target_len = max_tracked_identities.saturating_sub(1)`,
+      every time it sees a key not already in `history`
+      ([src/core/policy/threshold.rs:472-483](src/core/policy/threshold.rs))
+      — while holding `self.history.lock()`, the single `parking_lot::Mutex`
+      shared by every `evaluate()` call this `ThresholdPolicy` instance
+      ever makes, across every connection the proxy is handling (policies
+      are `Arc<dyn Policy>`, shared process-wide). Once the map is at
+      steady-state capacity, this isn't an occasional cost: *every*
+      subsequent never-before-seen identity — including one that's about
+      to be blocked, since even a blocked action creates a history entry
+      per the function's own comment at line 476 — triggers exactly one
+      such scan.
+
+      Measured directly on the release profile this project ships
+      (`lto=true`, `codegen-units=1`): with the map pre-filled to the
+      default cap of 100,000 identities, each additional new-identity
+      `evaluate()` call took ~233µs, a ceiling of ~4,300 such
+      admissions/sec for the whole policy instance regardless of available
+      CPU, because the work is serialized behind one lock rather than
+      parallelized across cores. Reaching capacity in the first place
+      needs only ordinary sequential connections, not concurrency: each
+      can complete (bind or send one actionable request, get a response,
+      disconnect) well inside the default 60s `io_timeout`, so 100,000
+      *sequential* identities is a matter of minutes at a modest
+      connection rate, not 100,000 simultaneous ones (`max_connections`
+      defaults to only 1024). Reaching it does require genuine identity
+      diversity, not just connection volume: an `ip:`-scoped identity
+      needs a distinct source address per identity (trivial to obtain in
+      volume from an owned IPv6 allocation — a single /64 or /48, routine
+      from most cloud/VPS providers, yields vastly more addresses than the
+      default cap — or from a botnet; one fixed source address only ever
+      occupies one `ip:`-scoped identity), while a `dn:`-scoped identity
+      needs a distinct, successfully-verified bind per identity. Once at
+      capacity, an attacker sustaining new distinct identities keeps the
+      shared lock busy with O(n) work on their behalf, adding latency
+      (and, past the ~4,300/sec ceiling, an outright queue) to *every*
+      connection's policy evaluation on the same instance — including
+      legitimate traffic that never touches a new identity itself, since
+      it still has to wait for the same mutex. This is a resource-
+      exhaustion vector against the proxy's own availability — notable
+      since blast-radius policing exists to protect the *directory's*
+      availability — reachable by a caller with no valid credential at
+      all, present whether or not `state_db` is configured.
+      Fix direction: replace the O(n) "find the least-recently-active
+      identity" scan with a structure that supports it in better than
+      linear time — e.g. a secondary ordered index (a `BTreeMap<Instant,
+      Identity>` keyed by last-activity, updated alongside `history`,
+      giving O(log n) eviction) or an intrusive LRU (`linked-hash-map`-
+      style) ordering. Alternatively, reconsider whether eviction needs
+      the *exact* least-recently-active identity at all — an approximated
+      victim (sampling a handful of random entries and evicting the
+      stalest of those, the approach Redis's own `maxmemory` eviction
+      uses) would bound the cost per admission to a small constant
+      regardless of `max_tracked_identities`, at the cost of not always
+      evicting the true global minimum. Add a benchmark or test asserting
+      eviction cost doesn't scale with `max_tracked_identities` before
+      considering this closed.
+
+## Medium — `AccountLock`/`AccountUnlock` misclassification for Active Directory
+
+- [ ] **`decode()` classifies a lock-attribute `Modify` as `AccountLock`
+      or `AccountUnlock` purely from its `ChangeOperation` (`Add`/
+      `Replace` vs. `Delete`), never from the value actually being
+      written — for Active Directory, this project's flagship target, a
+      real-world account re-enable is a `Replace` (`userAccountControl`
+      is mandatory and can't be `Delete`d), so `AccountUnlock` is
+      effectively unreachable in practice and every AD lock *and* unlock
+      alike is logged, metriced, and (should a deployment ever split
+      their limits) policed as `AccountLock`.** `decode`'s
+      `ModifyRequest` arm
+      ([src/connector/ldap.rs:264-292](src/connector/ldap.rs)) computes
+      `operation` from the `touches_lock_attribute` closure, which checks
+      only whether `change.operation` is `Add`/`Replace` (→
+      `AccountLock`) or `Delete` (→ `AccountUnlock`) and whether the
+      attribute name matches `LOCK_ATTRIBUTES` — `change.modification`'s
+      actual value (the `SetOf<OctetString>` being written) is never
+      read. For Active Directory's `userAccountControl` — a mandatory,
+      single-valued bitmask attribute — both locking (setting the
+      `ACCOUNTDISABLE` bit, `0x2`) *and* unlocking (clearing it) an
+      account are done identically on the wire: a `Replace` with a new
+      integer value. A directory won't accept a `Delete` of a mandatory
+      attribute, so real AD tooling never unlocks that way. Verified
+      directly: a `Replace` of `userAccountControl` to `512`
+      (`NORMAL_ACCOUNT`, i.e. enabled, no disable bit set — exactly what a
+      real AD re-enable sends) still decodes to `OperationKind::AccountLock`,
+      identically to a `Replace` to a value with the bit set. The
+      `Delete` branch that would classify it as `AccountUnlock` is, for
+      AD, effectively dead code — it only fires for a directory family
+      that supports removing the attribute outright to unlock (OpenLDAP's
+      `pwdAccountLockedTime`, 389 DS's `nsAccountLock`), and even for
+      389 DS, replacing `nsAccountLock` with `false` — a common
+      alternative to deleting it — hits the same misclassification.
+
+      `ThresholdPolicy` doesn't currently split its budget by
+      `OperationKind` (every actionable `Action` counts against the same
+      per-identity/global counter regardless of kind), so this doesn't
+      bypass enforcement today — a mass unlock is still counted and still
+      blockable. The impact is on the audit trail and the extension point
+      the codebase's own documentation treats as important:
+      `OperationKind::AccountUnlock`'s doc comment
+      ([src/core/action.rs:4-13](src/core/action.rs)) argues mass account
+      reactivation "is arguably just as security-relevant" as mass
+      locking specifically *because* it "gets its own `OperationKind`
+      rather than being silently ignored or folded into `AccountLock`,
+      since 'N unlocks' and 'N locks' may warrant different limits" — and
+      [docs/LDAP.md](docs/LDAP.md#account-lock-attributes-recognized)
+      tells operators the same thing. For the primary target directory,
+      that distinction silently never materializes: every AD unlock is
+      indistinguishable from a lock in `audit::log_decision`'s output, in
+      the `ai_protect_policy_decisions_total{operation="..."}` metric, and
+      to any future policy that tries to give unlocks a different (e.g.
+      stricter) limit than locks — exactly the scenario the
+      `OperationKind` split was introduced for. An incident responder
+      reviewing logs after a burst of account re-enables (e.g. an
+      attacker restoring accounts a prior incident-response action
+      disabled, to keep credential-stuffing accounts usable) would see it
+      reported as a lock spree, not an unlock spree.
+      Fix direction: for a `Replace`, compare the change against the
+      attribute's known "locked" representation where that's cheap and
+      schema-defined — e.g. for `userAccountControl`, parse the integer
+      and check the `ACCOUNTDISABLE` bit rather than assuming every
+      `Replace` locks; for boolean-like attributes (`nsAccountLock`),
+      compare the value against `"true"`/`"false"` case-insensitively.
+      Where a schema's lock representation isn't a simple bit/boolean (or
+      parsing fails), fall back to the current Add/Replace-is-a-lock
+      assumption rather than guessing. Add test coverage sending a
+      `Replace` that clears the disable bit for each schema in
+      `LOCK_ATTRIBUTES` and asserting `AccountUnlock`, alongside the
+      existing OID/option-suffix coverage.

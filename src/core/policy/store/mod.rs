@@ -86,14 +86,23 @@ pub trait HistoryStore: Send + Sync {
     /// Inserts `new_events` (this instance's newly-admitted actions since
     /// the last sync), prunes anything at or older than
     /// `cutoff_epoch_millis` (any instance's rows — pruning by age alone is
-    /// always safe), then returns every remaining row grouped by identity:
-    /// the authoritative, whole-store snapshot the caller folds into its
+    /// always safe), then, if more than `max_identities` distinct
+    /// identities remain, deletes every row for the least-recently-active
+    /// identities beyond that cap (ties with `evict_stalest_until`'s
+    /// definition: "least recently active" means the smallest per-identity
+    /// *maximum* timestamp, not insertion order) — this is what keeps the
+    /// store itself, not just the in-memory map a caller folds it into,
+    /// bounded to `max_identities` regardless of how many distinct
+    /// identities write through this or any other instance sharing the
+    /// backend. Returns every surviving row grouped by identity: the
+    /// authoritative, whole-store snapshot the caller folds into its
     /// in-memory history, which is how this instance picks up rows written
     /// by any other instance pointed at the same backend.
     async fn sync(
         &self,
         new_events: &[(String, i64)],
         cutoff_epoch_millis: i64,
+        max_identities: usize,
     ) -> anyhow::Result<HashMap<String, Vec<i64>>>;
 }
 

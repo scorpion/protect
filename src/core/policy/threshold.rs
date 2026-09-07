@@ -204,7 +204,7 @@ impl ThresholdPolicy {
                 Ok(store) => {
                     let anchor = Anchor::now();
                     let cutoff = anchor.epoch_millis_before(config.window);
-                    match store.sync_now(&[], cutoff) {
+                    match store.sync_now(&[], cutoff, config.max_tracked_identities) {
                         Ok(rows) => {
                             history = rows_into_history(&anchor, rows, config.window);
                             evict_stalest_until(&mut history, config.max_tracked_identities);
@@ -313,7 +313,11 @@ impl ThresholdPolicy {
         };
         let cutoff = anchor.epoch_millis_before(self.config.window);
 
-        let rows = match state.store.sync(&new_events, cutoff).await {
+        let rows = match state
+            .store
+            .sync(&new_events, cutoff, self.config.max_tracked_identities)
+            .await
+        {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(error = %err, "threshold policy state db sync failed");
@@ -1029,6 +1033,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_db_caps_tracked_identity_count_after_sync() {
+        // Reproduces the gap from TODO.md: `max_tracked_identities` must
+        // bound `state_db` storage itself, not just the in-memory map.
+        // Churn well past the cap and assert the SQLite file — not just
+        // this instance's `history` — never holds more distinct identities
+        // than the cap allows.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.sqlite3");
+        let max_tracked_identities = 3;
+        let config = ThresholdConfig {
+            max_per_request: 10,
+            max_per_window: 10,
+            window: Duration::from_secs(60),
+            state_db: Some(StateDbConfig::Sqlite(db_path.clone())),
+            flush_interval: Duration::from_secs(2),
+            max_tracked_identities,
+            scope: ThresholdScope::PerIdentity,
+        };
+        let policy = ThresholdPolicy::new(config);
+
+        for n in 0..10 {
+            let identity = Identity(format!("agent-{n}"));
+            assert!(matches!(
+                policy.evaluate(&action(1), &ctx_for(&identity)),
+                Decision::Allow
+            ));
+            policy.sync_once().await;
+        }
+
+        let store = SqliteStore::open(&db_path).unwrap();
+        let rows = store.sync_now(&[], 0, usize::MAX).unwrap();
+        assert!(
+            rows.len() <= max_tracked_identities,
+            "state_db holds {} distinct identities, more than max_tracked_identities ({})",
+            rows.len(),
+            max_tracked_identities
+        );
+    }
+
+    #[tokio::test]
     async fn sync_once_merges_admission_that_lands_during_the_round_trip() {
         // Reproduces the race from TODO.md end to end against a real
         // `SqliteStore`: an `evaluate` call landing between `sync_once`
@@ -1068,7 +1112,11 @@ mod tests {
                 .collect()
         };
         let cutoff = anchor.epoch_millis_before(Duration::from_secs(60));
-        let rows = state.store.sync(&new_events, cutoff).await.unwrap();
+        let rows = state
+            .store
+            .sync(&new_events, cutoff, 100_000)
+            .await
+            .unwrap();
 
         // The concurrent admission: already in `history`, only queued in
         // `pending` for the *next* cycle, and entirely absent from `rows`.
