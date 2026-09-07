@@ -73,6 +73,11 @@ cp config.example.toml config.toml
 cp policies/ldap.example.toml policies/ldap.toml
 ```
 
+Or run [`./setup.sh`](setup.sh) instead: it interrogates the real upstream
+directory server (rootDSE, TLS certificate — read-only, nothing is
+modified) and interactively writes both files tailored to what it finds,
+rather than starting from placeholder values.
+
 - `config.toml` (schema in [config.example.toml](config.example.toml)) —
   one or more `[[proxy]]` entries, each with its own listen address and one
   or more upstream addresses (load-balanced across them if more than one —
