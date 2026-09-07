@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -172,12 +172,137 @@ struct PersistentState {
     pending: Mutex<Vec<(Identity, Instant)>>,
 }
 
+/// The sliding-window history map plus a secondary index over the same
+/// data, kept in sync on every mutation so `evict_stalest_until` never has
+/// to scan `by_identity` itself to find an eviction victim.
+///
+/// `by_activity` orders identities by `(last_activity, identity)`, where
+/// `last_activity` is the same value `evict_stalest_until` always ranked
+/// by — the most recent (i.e. `back()`) timestamp in that identity's
+/// window, or `None` for an identity with no timestamps left (which must
+/// sort first, exactly as an empty `VecDeque`'s `back() == None` did
+/// before). `Identity` only breaks a tie between two entries with the same
+/// `last_activity` (in practice, two brand-new entries both still `None`);
+/// it doesn't otherwise affect eviction order.
+#[derive(Default)]
+struct History {
+    by_identity: HashMap<Identity, VecDeque<Instant>>,
+    by_activity: BTreeSet<(Option<Instant>, Identity)>,
+}
+
+impl History {
+    fn activity_key(timestamps: &VecDeque<Instant>) -> Option<Instant> {
+        timestamps.back().copied()
+    }
+
+    fn len(&self) -> usize {
+        self.by_identity.len()
+    }
+
+    fn contains_key(&self, id: &Identity) -> bool {
+        self.by_identity.contains_key(id)
+    }
+
+    #[cfg(test)]
+    fn get(&self, id: &Identity) -> Option<&VecDeque<Instant>> {
+        self.by_identity.get(id)
+    }
+
+    fn window_len(&self, id: &Identity) -> usize {
+        self.by_identity.get(id).map_or(0, VecDeque::len)
+    }
+
+    /// Guarantees `id` has an entry, inserting an empty one — indexed as
+    /// currently least-active (`None`) — if it didn't already have one.
+    /// Mirrors `HashMap::entry(..).or_default()`'s effect on `by_identity`,
+    /// but also keeps `by_activity` in sync for the newly-created case.
+    fn ensure(&mut self, id: &Identity) {
+        self.by_identity.entry(id.clone()).or_insert_with(|| {
+            self.by_activity.insert((None, id.clone()));
+            VecDeque::new()
+        });
+    }
+
+    /// Drops timestamps that have aged out of `window` off the front of
+    /// `id`'s history. Never changes `id`'s `back()`, so `by_activity`
+    /// doesn't need updating here.
+    fn prune_stale(&mut self, id: &Identity, now: Instant, window: Duration) {
+        if let Some(entry) = self.by_identity.get_mut(id) {
+            while let Some(&oldest) = entry.front() {
+                if now.duration_since(oldest) > window {
+                    entry.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Records an admitted action: pushes `count` copies of `now` onto
+    /// `id`'s window (one per unit of blast radius) and re-indexes `id`'s
+    /// activity key, which this always advances to `now` since pushes are
+    /// monotonically non-decreasing.
+    fn record_admitted(&mut self, id: &Identity, now: Instant, count: usize) {
+        let Some(entry) = self.by_identity.get_mut(id) else {
+            return;
+        };
+        let old_key = Self::activity_key(entry);
+        for _ in 0..count {
+            entry.push_back(now);
+        }
+        if old_key != Some(now) {
+            self.by_activity.remove(&(old_key, id.clone()));
+            self.by_activity.insert((Some(now), id.clone()));
+        }
+    }
+
+    /// Replaces `id`'s whole window in one go — used when folding a
+    /// `state_db` snapshot back into local history, where the merged result
+    /// is computed independently of whatever's currently stored. An empty
+    /// `timestamps` removes the entry outright rather than leaving a
+    /// zero-length one behind, matching the invariant the rest of this type
+    /// relies on (an identity present in `by_identity` is also present in
+    /// `by_activity`, and vice versa).
+    fn set(&mut self, id: Identity, timestamps: VecDeque<Instant>) {
+        if let Some(old) = self.by_identity.get(&id) {
+            self.by_activity
+                .remove(&(Self::activity_key(old), id.clone()));
+        }
+        if timestamps.is_empty() {
+            self.by_identity.remove(&id);
+        } else {
+            self.by_activity
+                .insert((Self::activity_key(&timestamps), id.clone()));
+            self.by_identity.insert(id, timestamps);
+        }
+    }
+
+    /// Evicts the identity with the least recently recorded activity — via
+    /// `by_activity`'s ordering, O(log n) per eviction rather than an O(n)
+    /// scan of `by_identity` — until at most `target_len` entries remain.
+    fn evict_stalest_until(&mut self, target_len: usize) {
+        while self.len() > target_len {
+            let Some(stalest) = self.by_activity.iter().next().cloned() else {
+                break;
+            };
+            let (_, identity) = &stalest;
+            self.by_identity.remove(identity);
+            tracing::warn!(
+                identity = %identity.0,
+                target_len,
+                "threshold policy history at max_tracked_identities capacity; evicted least-recently-active identity to make room"
+            );
+            self.by_activity.remove(&stalest);
+        }
+    }
+}
+
 /// Blocks an action outright once it (or the identity's recent history)
 /// exceeds a configured blast-radius threshold. This is the "4 accounts is
 /// fine, 4,000 is not" rule.
 pub struct ThresholdPolicy {
     config: ThresholdConfig,
-    history: Mutex<HashMap<Identity, VecDeque<Instant>>>,
+    history: Mutex<History>,
     state: Option<PersistentState>,
 }
 
@@ -197,7 +322,7 @@ impl ThresholdPolicy {
     /// that later performs cross-instance sync (see
     /// `ValkeyStore::open`).
     pub fn new(config: ThresholdConfig) -> Self {
-        let mut history = HashMap::new();
+        let mut history = History::default();
 
         let state = match &config.state_db {
             Some(StateDbConfig::Sqlite(path)) => match SqliteStore::open(path) {
@@ -207,7 +332,7 @@ impl ThresholdPolicy {
                     match store.sync_now(&[], cutoff, config.max_tracked_identities) {
                         Ok(rows) => {
                             history = rows_into_history(&anchor, rows, config.window);
-                            evict_stalest_until(&mut history, config.max_tracked_identities);
+                            history.evict_stalest_until(config.max_tracked_identities);
                         }
                         Err(err) => tracing::warn!(
                             error = %err,
@@ -331,7 +456,7 @@ impl ThresholdPolicy {
         // already-admitted state a wholesale replace would silently erase.
         let mut history = self.history.lock();
         merge_history_from_rows(&mut history, &anchor, rows, self.config.window);
-        evict_stalest_until(&mut history, self.config.max_tracked_identities);
+        history.evict_stalest_until(self.config.max_tracked_identities);
     }
 }
 
@@ -351,7 +476,7 @@ impl ThresholdPolicy {
 /// byte-identical to what's already sitting in `history`, so a plain union
 /// without dedup would double-count it every cycle it keeps arriving.
 fn merge_history_from_rows(
-    history: &mut HashMap<Identity, VecDeque<Instant>>,
+    history: &mut History,
     anchor: &Anchor,
     rows: HashMap<String, Vec<i64>>,
     window: Duration,
@@ -362,7 +487,7 @@ fn merge_history_from_rows(
         let mut seen_millis = HashSet::with_capacity(timestamps.len());
         let mut merged = Vec::with_capacity(timestamps.len());
 
-        if let Some(existing) = history.get(&identity) {
+        if let Some(existing) = history.by_identity.get(&identity) {
             for &instant in existing {
                 if now.duration_since(instant) <= window {
                     seen_millis.insert(anchor.to_epoch_millis(instant));
@@ -384,44 +509,7 @@ fn merge_history_from_rows(
         }
 
         merged.sort();
-        if merged.is_empty() {
-            history.remove(&identity);
-        } else {
-            history.insert(identity, merged.into());
-        }
-    }
-}
-
-/// Evicts the identity with the least recently recorded activity — the
-/// smallest last-seen timestamp across its own history, not insertion order
-/// — until `history` has at most `target_len` entries, logging each
-/// eviction at `warn`. An identity with no timestamps left (already aged
-/// out by its own per-request pruning in `evaluate`, but not yet removed
-/// from the map) sorts before every identity with at least one, since
-/// `back()` on an empty `VecDeque` is `None` and `None < Some(_)` — exactly
-/// the identity that should go first.
-///
-/// Called two ways: `evaluate` passes `cap - 1` *before* inserting a
-/// brand-new identity, so the map never exceeds `cap` even momentarily;
-/// `ThresholdPolicy::new`/`sync_once` pass `cap` *after* folding in a whole
-/// `state_db` snapshot, since those insert in bulk and only need the map
-/// back at or under the cap afterward. See
-/// `ThresholdConfig::max_tracked_identities`.
-fn evict_stalest_until(history: &mut HashMap<Identity, VecDeque<Instant>>, target_len: usize) {
-    while history.len() > target_len {
-        let Some(stalest) = history
-            .iter()
-            .min_by_key(|(_, timestamps)| timestamps.back().copied())
-            .map(|(identity, _)| identity.clone())
-        else {
-            break;
-        };
-        history.remove(&stalest);
-        tracing::warn!(
-            identity = %stalest.0,
-            target_len,
-            "threshold policy history at max_tracked_identities capacity; evicted least-recently-active identity to make room"
-        );
+        history.set(identity, merged.into());
     }
 }
 
@@ -429,23 +517,21 @@ fn rows_into_history(
     anchor: &Anchor,
     rows: HashMap<String, Vec<i64>>,
     window: Duration,
-) -> HashMap<Identity, VecDeque<Instant>> {
+) -> History {
     let now = Instant::now();
-    rows.into_iter()
-        .filter_map(|(identity, timestamps)| {
-            let mut instants: Vec<Instant> = timestamps
-                .into_iter()
-                .filter_map(|epoch_millis| anchor.to_instant(epoch_millis))
-                .filter(|&instant| now.duration_since(instant) <= window)
-                .collect();
-            instants.sort();
-            if instants.is_empty() {
-                None
-            } else {
-                Some((Identity(identity), instants.into()))
-            }
-        })
-        .collect()
+    let mut history = History::default();
+    for (identity, timestamps) in rows {
+        let mut instants: Vec<Instant> = timestamps
+            .into_iter()
+            .filter_map(|epoch_millis| anchor.to_instant(epoch_millis))
+            .filter(|&instant| now.duration_since(instant) <= window)
+            .collect();
+        instants.sort();
+        if !instants.is_empty() {
+            history.set(Identity(identity), instants.into());
+        }
+    }
+    history
 }
 
 impl ThresholdPolicy {
@@ -480,40 +566,28 @@ impl Policy for ThresholdPolicy {
             // blocked action still creates an (empty) history entry and an
             // attacker gets no cheaper a way to grow the map by staying
             // under max_per_request/max_per_window than by exceeding it.
-            evict_stalest_until(
-                &mut history,
-                self.config.max_tracked_identities.saturating_sub(1),
-            );
+            history.evict_stalest_until(self.config.max_tracked_identities.saturating_sub(1));
         }
-        let entry = history.entry(key.clone()).or_default();
+        history.ensure(&key);
 
         let now = Instant::now();
-        while let Some(&oldest) = entry.front() {
-            if now.duration_since(oldest) > self.config.window {
-                entry.pop_front();
-            } else {
-                break;
-            }
-        }
+        history.prune_stale(&key, now, self.config.window);
 
-        if entry.len() + action.blast_radius > self.config.max_per_window {
+        let window_len = history.window_len(&key);
+        if window_len + action.blast_radius > self.config.max_per_window {
             let scope_label = match self.config.scope {
                 ThresholdScope::PerIdentity => "matching actions",
                 ThresholdScope::Global => "matching actions across all identities",
             };
             return Decision::Block {
                 reason: format!(
-                    "{} {scope_label} in the last {:?} would exceed window limit {}",
-                    entry.len(),
-                    self.config.window,
-                    self.config.max_per_window
+                    "{window_len} {scope_label} in the last {:?} would exceed window limit {}",
+                    self.config.window, self.config.max_per_window
                 ),
             };
         }
 
-        for _ in 0..action.blast_radius {
-            entry.push_back(now);
-        }
+        history.record_admitted(&key, now, action.blast_radius);
         drop(history);
 
         if let Some(state) = &self.state {
@@ -788,6 +862,59 @@ mod tests {
         assert!(!history.contains_key(&alice), "alice should be evicted");
         assert!(history.contains_key(&bob));
         assert!(history.contains_key(&carol));
+    }
+
+    #[test]
+    fn eviction_cost_does_not_scale_with_map_size() {
+        // Regression coverage for the O(n) linear-scan eviction from
+        // TODO.md: `evict_stalest_until` must find the least-recently-active
+        // identity via the `by_activity` secondary index (O(log n)) instead
+        // of scanning every tracked identity, or a churning caller who
+        // fills the map to `max_tracked_identities` turns every further
+        // admission — on the one lock every connection's evaluations share
+        // — into work that grows with the cap. Fills a policy to capacity,
+        // then times admissions that each force exactly one eviction while
+        // the map stays pinned at that capacity.
+        fn median_eviction_nanos(cap: usize, samples: usize) -> u128 {
+            let policy = ThresholdPolicy::new(ThresholdConfig {
+                max_per_request: 10,
+                max_per_window: 10,
+                window: Duration::from_secs(300),
+                state_db: None,
+                flush_interval: Duration::from_secs(2),
+                max_tracked_identities: cap,
+                scope: ThresholdScope::PerIdentity,
+            });
+            for n in 0..cap {
+                let identity = Identity(format!("fill-{n}"));
+                policy.evaluate(&action(1), &ctx_for(&identity));
+            }
+
+            let mut samples: Vec<u128> = (0..samples)
+                .map(|n| {
+                    let identity = Identity(format!("churn-{n}"));
+                    let start = Instant::now();
+                    policy.evaluate(&action(1), &ctx_for(&identity));
+                    start.elapsed().as_nanos()
+                })
+                .collect();
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        let small = median_eviction_nanos(1_000, 300);
+        let large = median_eviction_nanos(20_000, 300);
+
+        // A 20x larger map over a linear scan would cost roughly 20x more
+        // per eviction; an O(log n) index barely moves. Generous margin
+        // (5x for a 20x size increase) to absorb machine/CI noise around
+        // sub-microsecond timings while still catching a real regression
+        // back to the O(n) scan.
+        assert!(
+            large < small.saturating_mul(5).max(1_000),
+            "eviction cost scaled with map size: {small}ns median at cap 1,000 vs \
+             {large}ns median at cap 20,000 — looks like an O(n) scan again"
+        );
     }
 
     #[test]
@@ -1148,8 +1275,8 @@ mod tests {
         let window = Duration::from_secs(60);
         let now = Instant::now();
 
-        let mut history = HashMap::new();
-        history.insert(identity.clone(), VecDeque::from(vec![now]));
+        let mut history = History::default();
+        history.set(identity.clone(), VecDeque::from(vec![now]));
 
         let mut rows = HashMap::new();
         rows.insert(identity.0.clone(), vec![anchor.to_epoch_millis(now)]);

@@ -140,7 +140,7 @@ severity; within a group, roughly in the order you'd want to tackle them.
 
 ## High — eviction-scan denial of service
 
-- [ ] **Once the tracked-identity map is at capacity, every single new
+- [x] **Once the tracked-identity map is at capacity, every single new
       identity `evaluate()` admits or blocks pays for a full linear scan
       of the entire map while holding the one lock every connection's
       policy decisions share — an attacker who reaches that capacity can
@@ -209,6 +209,32 @@ severity; within a group, roughly in the order you'd want to tackle them.
       evicting the true global minimum. Add a benchmark or test asserting
       eviction cost doesn't scale with `max_tracked_identities` before
       considering this closed.
+      Fixed: `ThresholdPolicy`'s history is now a small `History` type
+      ([src/core/policy/threshold.rs](src/core/policy/threshold.rs)) that
+      pairs the existing `HashMap<Identity, VecDeque<Instant>>` with a
+      secondary `BTreeSet<(Option<Instant>, Identity)>` index
+      (`by_activity`) ordered exactly the way eviction always ranked
+      identities — an identity's most recent timestamp (`None` for one with
+      none left, sorting first, unchanged from before). Every mutation that
+      can change an identity's last-activity — admitting a request
+      (`record_admitted`), creating a brand-new entry (`ensure`), or folding
+      in a whole `state_db` snapshot (`set`, used by `rows_into_history`/
+      `merge_history_from_rows`) — keeps both structures in sync, so
+      `evict_stalest_until` now just pops `by_activity`'s first entry
+      (`BTreeSet::iter().next()`, O(log n) amortized) instead of scanning
+      every tracked identity to find the minimum. `evaluate` still holds one
+      lock for the whole read-prune-check-write sequence — this fixes the
+      cost of eviction itself, not the lock's scope — but that cost no
+      longer grows with `max_tracked_identities`, so it no longer turns
+      identity churn at the cap into a process-wide bottleneck. Verified
+      directly: `eviction_cost_does_not_scale_with_map_size`
+      (`src/core/policy/threshold.rs`) fills a policy to capacity at 1,000
+      and at 20,000 identities and times admissions that each force one
+      eviction, asserting the median cost at 20,000 stays within 5x of the
+      cost at 1,000 — a linear scan would cost roughly 20x more, an O(log n)
+      index barely moves; every existing `ThresholdPolicy`/`History` test
+      (identity-cap eviction, `state_db` sync/merge/restart, per-identity
+      and `Global` scope) still passes unchanged.
 
 ## Medium — `AccountLock`/`AccountUnlock` misclassification for Active Directory
 

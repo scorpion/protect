@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Identity(pub String);
 
 impl Identity {
