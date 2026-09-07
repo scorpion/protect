@@ -12,3 +12,4 @@ pub mod metrics;
 pub mod net;
 pub mod policy;
 pub mod tls;
+pub mod upstream_pool;

@@ -9,6 +9,10 @@ async-trait = "0.1.92"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 parking_lot = "0.12.5"
+# Already compiled transitively via metrics-exporter-prometheus ->
+# metrics-util; declared directly here so core::upstream_pool's "random"
+# load-balance strategy can call it without adding a new crate to the graph.
+rand = "0.9.5"
 rasn = "0.28.14"
 rasn-ldap = "0.28.14"
 redis = { version = "1.7.0", default-features = false, features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }

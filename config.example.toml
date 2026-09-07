@@ -11,16 +11,35 @@
 [[proxy]]
 # Address ai-protect listens on for incoming LDAP client connections.
 listen_addr = "127.0.0.1:3890"
-# Address of the real upstream LDAP directory this proxies to.
-upstream_addr = "127.0.0.1:389"
+# Address(es) of the real upstream LDAP directory this proxies to. A single
+# address is the common case, as below.
+upstream_addrs = ["127.0.0.1:389"]
 
-# Uncomment to connect to upstream_addr via LDAPS (implicit TLS, typically
+# Uncomment to load-balance across more than one address in upstream_addrs
+# above (e.g. upstream_addrs = ["10.0.0.1:389", "10.0.0.2:389"]).
+# "round_robin" (default) rotates through healthy targets in turn; "random"
+# picks one uniformly at random; "least_connections" picks the target with
+# the fewest active connections right now. If the selected target's
+# connect/TLS handshake fails, ai-protect automatically tries the remaining
+# configured targets before failing the client connection, and excludes the
+# failed one from selection for upstream_failure_cooldown_secs. Every target
+# shares the one [proxy.upstream_tls] identity below (one server_name/CA/
+# client cert) — fine for a normal replica set/VIP setup where every backend
+# answers for the same hostname, wrong if they're different hosts with
+# per-host certificates.
+# upstream_strategy = "round_robin"
+#
+# Seconds a target is excluded from selection after a failed connect/TLS
+# handshake before it's eligible to be tried again. Defaults to 30.
+# upstream_failure_cooldown_secs = 30
+
+# Uncomment to connect to the upstream via LDAPS (implicit TLS, typically
 # port 636) instead of plaintext LDAP. server_name is used for SNI and to
 # validate the upstream's certificate against its DNS name — required
-# because upstream_addr above is an IP:port and directory certificates are
-# usually issued for a hostname, not an IP. Set ca_file if that certificate
-# is signed by an internal/enterprise CA not in the OS trust store; if
-# omitted, the OS trust store is used.
+# because upstream_addrs entries above are IP:port and directory
+# certificates are usually issued for a hostname, not an IP. Set ca_file if
+# that certificate is signed by an internal/enterprise CA not in the OS
+# trust store; if omitted, the OS trust store is used.
 # [proxy.upstream_tls]
 # server_name = "dc01.corp.example.com"
 # ca_file = "certs/internal-ca.pem"
@@ -84,7 +103,7 @@ file = "policies/ldap.toml"
 # else above (TLS, connection limits) is optional per entry too.
 # [[proxy]]
 # listen_addr = "127.0.0.1:3891"
-# upstream_addr = "127.0.0.1:2389"
+# upstream_addrs = ["127.0.0.1:2389"]
 #
 # [proxy.policy]
 # file = "policies/other.toml"

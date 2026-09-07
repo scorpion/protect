@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -16,6 +17,9 @@ use crate::core::action::{Action, OperationKind};
 use crate::core::connector::{Connector, DuplexStream};
 use crate::core::net::MaybeTlsStream;
 use crate::core::tls::UpstreamTls;
+use crate::core::upstream_pool::{
+    CountedStream, DEFAULT_FAILURE_COOLDOWN_SECS, LoadBalanceStrategy, UpstreamPool,
+};
 
 /// The upstream connection, either plaintext or LDAPS depending on how the
 /// connector was configured.
@@ -222,7 +226,7 @@ struct PasswdModifyRequestValue {
 
 #[derive(Clone)]
 pub struct LdapConnector {
-    upstream_addr: SocketAddr,
+    pool: std::sync::Arc<UpstreamPool>,
     upstream_tls: Option<UpstreamTls>,
     /// When true, `connect_upstream` dials the upstream in plaintext and
     /// negotiates RFC 4511 StartTLS before handing off to the TLS handshake
@@ -232,9 +236,36 @@ pub struct LdapConnector {
 }
 
 impl LdapConnector {
+    /// A connector with a single upstream target — no load balancing or
+    /// failover between multiple addresses. Equivalent to
+    /// `with_targets(vec![upstream_addr], LoadBalanceStrategy::default(),
+    /// Duration::from_secs(DEFAULT_FAILURE_COOLDOWN_SECS), upstream_tls)`.
     pub fn new(upstream_addr: SocketAddr, upstream_tls: Option<UpstreamTls>) -> Self {
+        Self::with_targets(
+            vec![upstream_addr],
+            LoadBalanceStrategy::default(),
+            Duration::from_secs(DEFAULT_FAILURE_COOLDOWN_SECS),
+            upstream_tls,
+        )
+    }
+
+    /// A connector load-balancing across `upstream_addrs` per `strategy`,
+    /// failing over to the remaining targets if the selected one's dial/TLS
+    /// handshake fails, and excluding a target that just failed from
+    /// selection for `failure_cooldown` (see `UpstreamPool`). Panics if
+    /// `upstream_addrs` is empty.
+    pub fn with_targets(
+        upstream_addrs: Vec<SocketAddr>,
+        strategy: LoadBalanceStrategy,
+        failure_cooldown: Duration,
+        upstream_tls: Option<UpstreamTls>,
+    ) -> Self {
         Self {
-            upstream_addr,
+            pool: std::sync::Arc::new(UpstreamPool::new(
+                upstream_addrs,
+                strategy,
+                failure_cooldown,
+            )),
             upstream_tls,
             upstream_starttls: false,
         }
@@ -251,10 +282,13 @@ impl LdapConnector {
         self
     }
 
-    pub async fn connect_upstream(&self) -> Result<UpstreamStream> {
-        let mut tcp = TcpStream::connect(self.upstream_addr)
+    /// Dials one specific target, without any selection/failover logic —
+    /// the body `connect_upstream` used to run directly against
+    /// `self.upstream_addr` before targets became a list.
+    async fn dial(&self, addr: SocketAddr) -> Result<UpstreamStream> {
+        let mut tcp = TcpStream::connect(addr)
             .await
-            .with_context(|| format!("connecting to upstream LDAP at {}", self.upstream_addr))?;
+            .with_context(|| format!("connecting to upstream LDAP at {addr}"))?;
         tcp.set_nodelay(true)
             .context("setting TCP_NODELAY on upstream connection")?;
 
@@ -269,6 +303,39 @@ impl LdapConnector {
             crate::core::metrics::record_tls_handshake_failure("upstream");
         }
         Ok(MaybeTlsStream::Tls(connected?))
+    }
+
+    /// Picks a target from `self.pool` (per its configured strategy),
+    /// dials it, and on failure tries the remaining configured targets in
+    /// turn before giving up — so one unreachable replica doesn't fail a
+    /// client connection outright when others are healthy. A successful
+    /// dial clears that target's failure cooldown (if any) and bumps its
+    /// active-connection count; a failed one starts/refreshes its cooldown,
+    /// excluding it from selection until that elapses.
+    pub async fn connect_upstream(&self) -> Result<CountedStream<UpstreamStream>> {
+        let candidates = self.pool.candidates();
+        let mut last_err = None;
+        for candidate in candidates {
+            match self.dial(candidate.addr).await {
+                Ok(stream) => {
+                    let guard = self.pool.mark_connected(candidate.index);
+                    return Ok(CountedStream::new(stream, guard));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target = %candidate.addr,
+                        error = %err,
+                        "failed to connect to upstream target; trying next configured target if any remain"
+                    );
+                    self.pool.mark_failed(candidate.index);
+                    last_err = Some(err);
+                }
+            }
+        }
+        // `candidates()` is never empty (`UpstreamPool::new` rejects an
+        // empty target list), so this is always reachable on total failure
+        // and carries a real underlying cause rather than a generic message.
+        Err(last_err.expect("at least one upstream target is always configured"))
     }
 
     /// Recognizes an RFC 4511 StartTLS extended request and builds the
@@ -1463,5 +1530,88 @@ mod tests {
         let err = read_frame(&mut cursor).await.unwrap_err();
 
         assert!(err.to_string().contains("exceeds max frame size"));
+    }
+
+    /// Reserves a `127.0.0.1` port and immediately drops the listener bound
+    /// to it, so a subsequent connect attempt fails fast and deterministic
+    /// with "connection refused" instead of needing a real unreachable host.
+    async fn unreachable_addr() -> SocketAddr {
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_upstream_fails_over_to_second_target_when_first_is_unreachable() {
+        let dead_addr = unreachable_addr().await;
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            live_listener.accept().await.unwrap();
+        });
+
+        let connector = LdapConnector::with_targets(
+            vec![dead_addr, live_addr],
+            crate::core::upstream_pool::LoadBalanceStrategy::RoundRobin,
+            std::time::Duration::from_secs(30),
+            None,
+        );
+
+        connector
+            .connect_upstream()
+            .await
+            .expect("should fail over to the second, reachable target");
+    }
+
+    #[tokio::test]
+    async fn connect_upstream_returns_the_underlying_error_when_every_target_fails() {
+        let dead_addr_a = unreachable_addr().await;
+        let dead_addr_b = unreachable_addr().await;
+
+        let connector = LdapConnector::with_targets(
+            vec![dead_addr_a, dead_addr_b],
+            crate::core::upstream_pool::LoadBalanceStrategy::RoundRobin,
+            std::time::Duration::from_secs(30),
+            None,
+        );
+
+        let err = match connector.connect_upstream().await {
+            Ok(_) => panic!("expected every target to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("connecting to upstream LDAP"));
+    }
+
+    #[tokio::test]
+    async fn connect_upstream_marks_a_failed_target_down_so_it_is_deprioritized_on_the_next_call() {
+        let dead_addr = unreachable_addr().await;
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = live_listener.accept().await else {
+                    return;
+                };
+                drop(stream);
+            }
+        });
+
+        let connector = LdapConnector::with_targets(
+            vec![dead_addr, live_addr],
+            crate::core::upstream_pool::LoadBalanceStrategy::RoundRobin,
+            std::time::Duration::from_secs(30),
+            None,
+        );
+
+        connector.connect_upstream().await.unwrap();
+
+        let candidates = connector.pool.candidates();
+        assert_eq!(
+            candidates[0].addr, live_addr,
+            "the target that just failed should be deprioritized behind the healthy one"
+        );
     }
 }

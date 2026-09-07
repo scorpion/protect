@@ -60,7 +60,7 @@ accidentally run with silently-empty config.
 
 Each `[[proxy]]` table is one independent listener: where it accepts
 client connections (`listen_addr`), where it forwards to
-(`upstream_addr`), and which policy file governs it. Most deployments
+(`upstream_addrs`), and which policy file governs it. Most deployments
 need exactly one `[[proxy]]` entry; a single process can run more than
 one if you need to front multiple directories, or the same directory on
 more than one address, side by side.
@@ -68,7 +68,7 @@ more than one address, side by side.
 ```toml
 [[proxy]]
 listen_addr = "127.0.0.1:3890"
-upstream_addr = "127.0.0.1:389"
+upstream_addrs = ["127.0.0.1:389"]
 
 [proxy.policy]
 file = "policies/ldap.toml"
@@ -79,6 +79,14 @@ timeouts, shutdown grace period — is optional and documented inline in
 [config.example.toml](../config.example.toml), which is the authoritative
 schema reference. A few highlights:
 
+- **`upstream_addrs`** takes more than one address to load-balance across
+  replicas of the same directory — `upstream_strategy` picks how
+  (`round_robin`, default; `random`; or `least_connections`), and a target
+  that fails to connect is automatically retried against the next
+  configured one and excluded from selection for
+  `upstream_failure_cooldown_secs` (default 30) before being tried again.
+  See the commented block below `upstream_addrs` in
+  [config.example.toml](../config.example.toml).
 - **`max_connections`** (default 1024) caps concurrent client
   connections; anything over the cap is rejected immediately rather than
   queued, so a connection flood degrades predictably instead of piling up
@@ -251,9 +259,9 @@ restart:
 kill -HUP $(pgrep ai-protect)
 ```
 
-Network settings (`listen_addr`, `upstream_addr`, TLS, connection limits)
-are read once at startup and need a restart to change — only the policy
-file hot-reloads.
+Network settings (`listen_addr`, `upstream_addrs`, load-balancing settings,
+TLS, connection limits) are read once at startup and need a restart to
+change — only the policy file hot-reloads.
 
 ## Production deployment checklist
 

@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
+use crate::core::upstream_pool::{DEFAULT_FAILURE_COOLDOWN_SECS, LoadBalanceStrategy};
 use crate::proxy::ConnectionLimits;
 
 /// Failure modes for loading `Config` from a TOML file.
@@ -73,9 +74,29 @@ pub struct HealthConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfig {
     pub listen_addr: SocketAddr,
-    pub upstream_addr: SocketAddr,
-    /// Present to connect to `upstream_addr` via LDAPS (implicit TLS)
-    /// instead of plaintext LDAP.
+    /// Address(es) of the real upstream LDAP directory. A single address is
+    /// the common case; more than one load-balances across replicas per
+    /// `upstream_strategy`, with automatic failover to the remaining targets
+    /// and passive health tracking (see `upstream_failure_cooldown_secs`) if
+    /// connecting to the selected one fails.
+    #[serde(deserialize_with = "deserialize_non_empty_addrs")]
+    pub upstream_addrs: Vec<SocketAddr>,
+    /// How `upstream_addrs` is load-balanced across when more than one
+    /// address is configured. Ignored (there's nothing to choose between)
+    /// when only one address is set.
+    #[serde(default)]
+    pub upstream_strategy: LoadBalanceStrategy,
+    /// Seconds a target in `upstream_addrs` is excluded from selection after
+    /// a failed connect/TLS handshake, before it's eligible to be tried
+    /// again.
+    #[serde(default = "default_upstream_failure_cooldown_secs")]
+    pub upstream_failure_cooldown_secs: u64,
+    /// Present to connect to the upstream via LDAPS (implicit TLS) instead
+    /// of plaintext LDAP. Applies to every address in `upstream_addrs` — all
+    /// targets are assumed to share one TLS identity (one server_name/CA/
+    /// client cert), which holds for a normal replica set answering for the
+    /// same logical hostname but not for targets that are distinct hosts
+    /// with per-host certificates.
     #[serde(default)]
     pub upstream_tls: Option<UpstreamTlsConfig>,
     /// Present to have ai-protect itself terminate LDAPS on `listen_addr`
@@ -117,11 +138,35 @@ fn default_shutdown_timeout_secs() -> u64 {
     ConnectionLimits::default().shutdown_timeout.as_secs()
 }
 
+fn default_upstream_failure_cooldown_secs() -> u64 {
+    DEFAULT_FAILURE_COOLDOWN_SECS
+}
+
+/// Rejects an empty `upstream_addrs` list at parse time with a clear error,
+/// instead of letting it reach `UpstreamPool::new` (which panics on empty —
+/// a connector with nothing to dial isn't a state it can do anything useful
+/// with) or `LdapConnector` construction with no usable target.
+fn deserialize_non_empty_addrs<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<SocketAddr>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let addrs = Vec::<SocketAddr>::deserialize(deserializer)?;
+    if addrs.is_empty() {
+        return Err(serde::de::Error::custom(
+            "upstream_addrs must have at least one address",
+        ));
+    }
+    Ok(addrs)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpstreamTlsConfig {
     /// DNS name used for SNI and certificate validation against the
-    /// upstream. Needed because `upstream_addr` is an IP:port and directory
-    /// certificates are typically issued for a hostname, not an IP.
+    /// upstream. Needed because `upstream_addrs` entries are IP:port and
+    /// directory certificates are typically issued for a hostname, not an
+    /// IP.
     pub server_name: String,
     /// PEM-encoded CA certificate(s) to trust instead of the OS trust store.
     /// Needed when the upstream's LDAPS certificate is signed by an
@@ -208,7 +253,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:3890"
-            upstream_addr = "127.0.0.1:389"
+            upstream_addrs = ["127.0.0.1:389"]
 
             [proxy.policy]
             file = "policies/ldap.toml"
@@ -219,10 +264,15 @@ mod tests {
         assert_eq!(config.proxy.len(), 1);
         let proxy = &config.proxy[0];
         assert_eq!(proxy.listen_addr.to_string(), "127.0.0.1:3890");
-        assert_eq!(proxy.upstream_addr.port(), 389);
+        assert_eq!(proxy.upstream_addrs, vec!["127.0.0.1:389".parse().unwrap()]);
         assert_eq!(proxy.policy.file, PathBuf::from("policies/ldap.toml"));
         assert!(proxy.upstream_tls.is_none());
         assert!(proxy.listen_tls.is_none());
+        assert_eq!(proxy.upstream_strategy, LoadBalanceStrategy::RoundRobin);
+        assert_eq!(
+            proxy.upstream_failure_cooldown_secs,
+            DEFAULT_FAILURE_COOLDOWN_SECS
+        );
         assert_eq!(
             proxy.max_connections,
             ConnectionLimits::default().max_connections
@@ -238,19 +288,83 @@ mod tests {
     }
 
     #[test]
+    fn parses_multiple_upstream_addrs() {
+        let config: Config = toml::from_str(
+            r#"
+            [[proxy]]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addrs = ["127.0.0.1:389", "127.0.0.1:390", "127.0.0.1:391"]
+
+            [proxy.policy]
+            file = "policies/ldap.toml"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.proxy[0].upstream_addrs,
+            vec![
+                "127.0.0.1:389".parse().unwrap(),
+                "127.0.0.1:390".parse().unwrap(),
+                "127.0.0.1:391".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_upstream_strategy_and_cooldown_overrides() {
+        let config: Config = toml::from_str(
+            r#"
+            [[proxy]]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addrs = ["127.0.0.1:389", "127.0.0.1:390"]
+            upstream_strategy = "least_connections"
+            upstream_failure_cooldown_secs = 5
+
+            [proxy.policy]
+            file = "policies/ldap.toml"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.proxy[0].upstream_strategy,
+            LoadBalanceStrategy::LeastConnections
+        );
+        assert_eq!(config.proxy[0].upstream_failure_cooldown_secs, 5);
+    }
+
+    #[test]
+    fn rejects_empty_upstream_addrs_list() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [[proxy]]
+            listen_addr = "127.0.0.1:3890"
+            upstream_addrs = []
+
+            [proxy.policy]
+            file = "policies/ldap.toml"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("at least one address"));
+    }
+
+    #[test]
     fn parses_multiple_proxy_entries() {
         let config: Config = toml::from_str(
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:3890"
-            upstream_addr = "127.0.0.1:389"
+            upstream_addrs = ["127.0.0.1:389"]
 
             [proxy.policy]
             file = "policies/ldap.toml"
 
             [[proxy]]
             listen_addr = "127.0.0.1:3891"
-            upstream_addr = "127.0.0.1:2389"
+            upstream_addrs = ["127.0.0.1:2389"]
 
             [proxy.policy]
             file = "policies/other.toml"
@@ -277,7 +391,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:3890"
-            upstream_addr = "127.0.0.1:389"
+            upstream_addrs = ["127.0.0.1:389"]
             max_connections = 10
             io_timeout_secs = 5
             shutdown_timeout_secs = 15
@@ -299,7 +413,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:6360"
-            upstream_addr = "127.0.0.1:636"
+            upstream_addrs = ["127.0.0.1:636"]
 
             [proxy.upstream_tls]
             server_name = "dc01.corp.example.com"
@@ -337,7 +451,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:3890"
-            upstream_addr = "127.0.0.1:389"
+            upstream_addrs = ["127.0.0.1:389"]
 
             [proxy.upstream_tls]
             server_name = "dc01.corp.example.com"
@@ -366,7 +480,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:6360"
-            upstream_addr = "127.0.0.1:636"
+            upstream_addrs = ["127.0.0.1:636"]
 
             [proxy.upstream_tls]
             server_name = "dc01.corp.example.com"
@@ -412,7 +526,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:3890"
-            upstream_addr = "127.0.0.1:389"
+            upstream_addrs = ["127.0.0.1:389"]
 
             [proxy.policy]
             file = "policies/ldap.toml"
@@ -429,7 +543,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:3890"
-            upstream_addr = "127.0.0.1:389"
+            upstream_addrs = ["127.0.0.1:389"]
 
             [proxy.policy]
             file = "policies/ldap.toml"
@@ -452,7 +566,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:3890"
-            upstream_addr = "127.0.0.1:389"
+            upstream_addrs = ["127.0.0.1:389"]
 
             [proxy.policy]
             file = "policies/ldap.toml"
@@ -469,7 +583,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "127.0.0.1:3890"
-            upstream_addr = "127.0.0.1:389"
+            upstream_addrs = ["127.0.0.1:389"]
 
             [proxy.policy]
             file = "policies/ldap.toml"

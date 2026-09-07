@@ -74,10 +74,13 @@ cp policies/ldap.example.toml policies/ldap.toml
 ```
 
 - `config.toml` (schema in [config.example.toml](config.example.toml)) —
-  one or more `[[proxy]]` entries, each with its own listen/upstream
-  addresses, optional `[proxy.listen_tls]` / `[proxy.upstream_tls]` tables
-  to enable LDAPS on either hop, and its own policy file — a single process
-  can front more than one directory or listen address this way.
+  one or more `[[proxy]]` entries, each with its own listen address and one
+  or more upstream addresses (load-balanced across them if more than one —
+  round-robin, random, or least-connections, configurable, with automatic
+  failover and passive health tracking — see `config.example.toml`),
+  optional `[proxy.listen_tls]` / `[proxy.upstream_tls]` tables to enable
+  LDAPS on either hop, and its own policy file — a single process can front
+  more than one directory or listen address this way.
 - `policies/ldap.toml` (schema in
   [policies/ldap.example.toml](policies/ldap.example.toml)) — an ordered
   list of `[[policy]]` tables. The only type today is `"threshold"`

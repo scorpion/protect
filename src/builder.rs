@@ -230,6 +230,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_is_served_when_first_configured_target_is_down() {
+        // First target: bind then immediately drop, so connecting to it
+        // fails fast and deterministically with "connection refused".
+        let dead_addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live_listener.local_addr().unwrap();
+
+        let request_frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514",
+        );
+        let response_frame = encode_message(
+            1,
+            ProtocolOp::ModifyResponse(ModifyResponse(LdapResult::new(
+                ResultCode::Success,
+                "".into(),
+                "".into(),
+            ))),
+        );
+
+        let expected_request = request_frame.clone();
+        let canned_response = response_frame.clone();
+        tokio::spawn(async move {
+            let (mut upstream_stream, _) = live_listener.accept().await.unwrap();
+            let received = read_frame(&mut upstream_stream).await.unwrap().unwrap();
+            assert_eq!(received, expected_request);
+            upstream_stream.write_all(&canned_response).await.unwrap();
+        });
+
+        let proxy_addr = reserve_free_addr().await;
+        let connector: Arc<dyn Connector> = Arc::new(LdapConnector::with_targets(
+            vec![dead_addr, live_addr],
+            crate::core::upstream_pool::LoadBalanceStrategy::RoundRobin,
+            Duration::from_secs(30),
+            None,
+        ));
+        let policy = Arc::new(ThresholdPolicy::new(ThresholdConfig {
+            max_per_request: 10,
+            max_per_window: 10,
+            window: Duration::from_secs(60),
+            state_db: None,
+            flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
+            scope: ThresholdScope::PerIdentity,
+            operations: None,
+        }));
+
+        tokio::spawn(
+            ProxyBuilder::new(proxy_addr)
+                .connector(connector)
+                .policy(policy)
+                .serve(),
+        );
+
+        // Give the accept loop a moment to bind before the client connects.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client_stream = TcpStream::connect(proxy_addr).await.unwrap();
+        client_stream.write_all(&request_frame).await.unwrap();
+
+        let received_response = read_frame(&mut client_stream).await.unwrap().unwrap();
+        assert_eq!(received_response, response_frame);
+    }
+
+    #[tokio::test]
     async fn serve_without_a_connector_fails_fast() {
         let proxy_addr = reserve_free_addr().await;
 

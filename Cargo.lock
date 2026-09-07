@@ -20,6 +20,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot",
+ "rand",
  "rasn",
  "rasn-ldap",
  "rcgen",

@@ -73,8 +73,13 @@ fn build_proxy(
         .transpose()?;
     let upstream_starttls = proxy.upstream_tls.as_ref().is_some_and(|tls| tls.starttls);
     let connector: Arc<dyn core::connector::Connector> = Arc::new(
-        connector::ldap::LdapConnector::new(proxy.upstream_addr, upstream_tls)
-            .with_starttls(upstream_starttls),
+        connector::ldap::LdapConnector::with_targets(
+            proxy.upstream_addrs.clone(),
+            proxy.upstream_strategy,
+            std::time::Duration::from_secs(proxy.upstream_failure_cooldown_secs),
+            upstream_tls,
+        )
+        .with_starttls(upstream_starttls),
     );
 
     let listen_tls = proxy
@@ -339,14 +344,14 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "{proxy_a_addr}"
-            upstream_addr = "{upstream_a_addr}"
+            upstream_addrs = ["{upstream_a_addr}"]
 
             [proxy.policy]
             file = "{policy_path}"
 
             [[proxy]]
             listen_addr = "{proxy_b_addr}"
-            upstream_addr = "{upstream_b_addr}"
+            upstream_addrs = ["{upstream_b_addr}"]
 
             [proxy.policy]
             file = "{policy_path}"
@@ -427,7 +432,7 @@ mod tests {
             r#"
             [[proxy]]
             listen_addr = "{proxy_addr}"
-            upstream_addr = "{upstream_addr}"
+            upstream_addrs = ["{upstream_addr}"]
 
             [proxy.policy]
             file = "{policy_path}"

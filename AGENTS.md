@@ -142,7 +142,24 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   claim to its outcome by message ID and only key policy/audit identity off
   the DN once the bind is confirmed to have actually succeeded — never on
   the claim alone. Exposes this as both inherent methods (used directly by
-  its own tests) and an `impl Connector`.
+  its own tests) and an `impl Connector`. `connect_upstream` no longer dials
+  a single fixed address: it holds a `core::upstream_pool::UpstreamPool` and
+  load-balances/fails over across whatever targets that pool was built with
+  — see the next entry.
+- [src/core/upstream_pool.rs](src/core/upstream_pool.rs) — `UpstreamPool`
+  (the list of upstream targets one `LdapConnector` load-balances across,
+  plus per-target failure-cooldown and active-connection state) and
+  `LoadBalanceStrategy` (`RoundRobin`/`Random`/`LeastConnections`).
+  `candidates()` returns targets ordered healthy-first per strategy, with
+  currently-cooling-down ones appended last rather than dropped, so
+  `LdapConnector::connect_upstream` can fail over to the next one instead of
+  failing the whole client connection when one target's dial/TLS handshake
+  fails. `mark_failed`/`mark_connected` update a target's cooldown and
+  active-connection count; `CountedStream` (wrapping the dialed stream) and
+  `ActiveConnectionGuard` (RAII, decrementing on drop) are what let the
+  active-connection count track a connection's real lifetime with no
+  explicit "connection closed" callback on the `Connector` trait. Protocol-
+  agnostic by design, so a future non-LDAP connector could reuse it.
 - [src/core/policy.rs](src/core/policy.rs) — the `Policy` trait
   (`evaluate(&Action, &PolicyContext) -> Decision`) and `evaluate_all`, which
   runs every configured policy and stops at the first `Block`.

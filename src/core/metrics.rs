@@ -19,6 +19,8 @@ const CONNECTIONS_TOTAL: &str = "ai_protect_connections_total";
 const POLICY_DECISIONS_TOTAL: &str = "ai_protect_policy_decisions_total";
 const UPSTREAM_CONNECT_SECONDS: &str = "ai_protect_upstream_connect_duration_seconds";
 const TLS_HANDSHAKE_FAILURES_TOTAL: &str = "ai_protect_tls_handshake_failures_total";
+const UPSTREAM_TARGET_ACTIVE_CONNECTIONS: &str = "ai_protect_upstream_target_active_connections";
+const UPSTREAM_TARGET_FAILURES_TOTAL: &str = "ai_protect_upstream_target_failures_total";
 
 /// Installs the process-wide Prometheus recorder and starts serving
 /// `/metrics` on `listen_addr` in the background. Call at most once per
@@ -101,6 +103,23 @@ pub fn record_tls_handshake_failure(hop: &'static str) {
     counter!(TLS_HANDSHAKE_FAILURES_TOTAL, "hop" => hop).increment(1);
 }
 
+/// Records how many connections are currently open to one upstream load-
+/// balancing target, keyed by its address — the live counter
+/// `LoadBalanceStrategy::LeastConnections` selects on
+/// (`core::upstream_pool::UpstreamPool`), exported so it's visible from the
+/// outside too.
+pub fn set_upstream_target_active_connections(target: SocketAddr, count: usize) {
+    gauge!(UPSTREAM_TARGET_ACTIVE_CONNECTIONS, "target" => target.to_string()).set(count as f64);
+}
+
+/// Records a failed dial/TLS handshake to one upstream load-balancing
+/// target, keyed by its address — incremented each time
+/// `core::upstream_pool::UpstreamPool::mark_failed` excludes it from
+/// selection for its failure cooldown.
+pub fn record_upstream_target_failure(target: SocketAddr) {
+    counter!(UPSTREAM_TARGET_FAILURES_TOTAL, "target" => target.to_string()).increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +167,7 @@ mod tests {
         );
         record_upstream_connect(Duration::from_millis(5));
         record_tls_handshake_failure("upstream");
+        set_upstream_target_active_connections("127.0.0.1:389".parse().unwrap(), 3);
+        record_upstream_target_failure("127.0.0.1:389".parse().unwrap());
     }
 }

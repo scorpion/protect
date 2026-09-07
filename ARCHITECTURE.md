@@ -117,7 +117,9 @@ protocol is this" from "should this be allowed."
   `connect_upstream` returns a boxed `DuplexStream` (any `AsyncRead +
   AsyncWrite + Send + Unpin`) so the proxy loop's `tokio::io::split`/relay
   code is written once regardless of which connector or transport is
-  underneath.
+  underneath. `LdapConnector` load-balances across one or more configured
+  upstream targets rather than dialing a single fixed address — see
+  [Upstream load balancing](#upstream-load-balancing).
 - **Action** is the seam. It says *what* is being attempted
   (`OperationKind`: `AccountLock`, `AccountUnlock`, `Delete`, `Create`,
   `Rename`, or `PasswordReset`), *what* it targets (`target`), and *how big* it is
@@ -157,11 +159,15 @@ logic nor the proxy loop needs to branch on:
   and the two relay functions are written once against "an async
   duplex stream" and don't know or care whether TLS is underneath.
 - [`tls::UpstreamTls`](src/core/tls.rs) builds a `rustls` `ClientConfig` and
-  performs the client-side LDAPS handshake against `upstream_addr`,
-  validating the upstream's certificate against a configured `server_name`
-  (required since directory certs are issued for hostnames, not the IP in
-  `upstream_addr`) and trusting either the OS store or a configured
-  `ca_file`. When the upstream itself requires mutual TLS, an optional
+  performs the client-side LDAPS handshake against whichever
+  `upstream_addrs` target was selected, validating the upstream's
+  certificate against a configured `server_name` (required since directory
+  certs are issued for hostnames, not the IPs in `upstream_addrs`) and
+  trusting either the OS store or a configured `ca_file`. One `UpstreamTls`
+  (one `server_name`/`ca_file`/client cert) is shared across every
+  configured target — correct for a normal replica set answering for the
+  same logical hostname, wrong if targets are distinct hosts with per-host
+  certificates. When the upstream itself requires mutual TLS, an optional
   client cert/key pair (`[proxy.upstream_tls.client_cert]`) is presented
   during the handshake instead of `with_no_client_auth()`.
   [`tls::ListenTls`](src/core/tls.rs) builds a `ServerConfig` from a
@@ -324,8 +330,9 @@ connection or restarting the process:
 
 This deliberately covers only what a `[[policy]]` file describes —
 thresholds and which policies run, in what order. `listen_addr`,
-`upstream_addr`, TLS settings, and connection limits are still read once at
-process start and require a restart to change: reloading those in place
+`upstream_addrs`, load-balancing settings, TLS settings, and connection
+limits are still read once at process start and require a restart to
+change: reloading those in place
 would mean rebinding a live listener socket or migrating already-open
 connections onto new upstream/TLS settings mid-session, not just swapping
 out an in-memory value the way a policy list can be. `ProxyBuilder` exposes
@@ -770,7 +777,9 @@ top-level table:
   `Config::load` reads whichever path is given as the first CLI arg,
   defaulting to `config.toml` in the working directory, and fails fast if
   the array is empty (nothing to listen on). Each entry has its own
-  `listen_addr`/`upstream_addr`, optional `[proxy.upstream_tls]`
+  `listen_addr`/`upstream_addrs` (one or more addresses — see
+  [Upstream load balancing](#upstream-load-balancing) if more than one is
+  configured), optional `[proxy.upstream_tls]`
   (`server_name`, optional `ca_file`, optional
   `[proxy.upstream_tls.client_cert]` for mTLS to the upstream, `starttls` to
   negotiate TLS via RFC 4511 StartTLS instead of dialing implicit TLS) and
@@ -814,6 +823,44 @@ an existing type is a config-only change (another `[[policy]]` table).
 Adding another listener/upstream pair is likewise config-only — another
 `[[proxy]]` entry.
 
+### Upstream load balancing
+
+`upstream_addrs` takes one or more addresses. With more than one,
+`LdapConnector` load-balances every new client connection's dial across them
+via [`core::upstream_pool::UpstreamPool`](src/core/upstream_pool.rs):
+
+- **Selection** (`upstream_strategy`, default `"round_robin"`): `round_robin`
+  rotates through the currently-healthy targets in turn (a shared atomic
+  counter, no per-connection state); `random` picks one uniformly at random;
+  `least_connections` picks whichever healthy target currently has the
+  fewest active connections (tracked via an RAII guard —
+  `upstream_pool::ActiveConnectionGuard` — wrapped around the dialed stream,
+  decremented on drop regardless of how the connection ends).
+- **Failover**: if the selected target's dial or TLS handshake fails,
+  `connect_upstream` tries the remaining configured targets in turn before
+  failing the client connection — one unreachable replica doesn't cost a
+  client anything as long as another target is healthy. Every attempt for
+  one connection still shares `io_timeout`'s overall budget (`proxy.rs` wraps
+  the whole `connect_upstream` call, not each individual dial), so a target
+  that hangs rather than refusing/erroring quickly can consume the budget
+  before failover reaches a healthy one — refused/reset connections (the
+  common failure mode) are near-instant and don't run into this.
+- **Passive health tracking**: a target that just failed is excluded from
+  the healthy tier of selection for `upstream_failure_cooldown_secs`
+  (default 30s), then eligible again — a persistently-dead replica costs at
+  most one wasted dial per connection per cooldown window instead of one on
+  every single connection. A successful dial clears the cooldown
+  immediately (passive recovery). If every target is currently cooling
+  down, `candidates()` still returns all of them (in config order) rather
+  than failing outright, since health tracking is a heuristic hint, not a
+  hard veto — a simultaneous blip across every replica shouldn't refuse
+  every new connection.
+- **TLS identity is shared, not per-target**: `[proxy.upstream_tls]`
+  describes one `server_name`/`ca_file`/client cert, reused unchanged
+  against whichever target is dialed. Correct for a normal replica set
+  answering for one logical hostname; wrong if targets are distinct hosts
+  with per-host certificates (see [Known gaps](#known-gaps-by-design-at-this-stage)).
+
 ## Extension points
 
 - **New backend protocol** (e.g. a different directory API, or a non-LDAP
@@ -842,14 +889,18 @@ Adding another listener/upstream pair is likewise config-only — another
   see the library-usage section of [AGENTS.md](AGENTS.md#using-ai-protect-as-a-library).
   No TOML file is required; a `Connector` and `Policy` list constructed
   in-memory are enough.
-- **Multiple upstreams / multiple listeners**: `proxy::run`/`ProxyBuilder`
-  still take one `listen_addr` and one connector bound to one upstream each,
-  but `Config` is a `Vec<ProxyConfig>` (`[[proxy]]` array-of-tables) and
-  `ai_protect::run_with_config` builds one `ProxyBuilder` per entry and
-  `serve()`s them concurrently as sibling tasks in a `tokio::task::JoinSet` —
-  see [Configuration](#configuration). Embedders using `ProxyBuilder`
-  directly (skipping `Config` entirely) get the same effect by spawning
-  multiple `serve()` tasks themselves.
+- **Multiple listeners**: `proxy::run`/`ProxyBuilder` still take one
+  `listen_addr` and one connector each, but `Config` is a `Vec<ProxyConfig>`
+  (`[[proxy]]` array-of-tables) and `ai_protect::run_with_config` builds one
+  `ProxyBuilder` per entry and `serve()`s them concurrently as sibling tasks
+  in a `tokio::task::JoinSet` — see [Configuration](#configuration).
+  Embedders using `ProxyBuilder` directly (skipping `Config` entirely) get
+  the same effect by spawning multiple `serve()` tasks themselves. This is
+  distinct from a single entry's connector load-balancing across *multiple
+  upstream targets* it's bound to (see
+  [Upstream load balancing](#upstream-load-balancing)) — one `[[proxy]]`
+  entry is one listener bound to one connector, but that connector can
+  itself front more than one physical upstream.
 
 ## Known gaps (by design, at this stage)
 
@@ -867,8 +918,23 @@ Adding another listener/upstream pair is likewise config-only — another
   reached — see [Identity](#identity)).
 - Every `[[proxy]]` entry hardcodes `LdapConnector` as its connector; the
   config-driven path (as opposed to `ProxyBuilder`, used directly) can front
-  several LDAP upstreams but not a mix of protocols in one process without a
-  Rust change to select a connector type per entry.
+  a mix of LDAP upstreams within one entry (see
+  [Upstream load balancing](#upstream-load-balancing)) but not a mix of
+  protocols in one process without a Rust change to select a connector type
+  per entry.
+- Failover across multiple `upstream_addrs` targets shares one `io_timeout`
+  budget with the rest of connection setup — `proxy.rs` wraps the entire
+  `connect_upstream` call (every attempted target included) in one
+  `with_timeout`, not each dial individually. A target that hangs rather
+  than refusing/erroring quickly (e.g. a blackholed host) can consume the
+  whole budget before failover ever reaches a healthy target. Acceptable for
+  the common failure mode (refused/reset connections, which are
+  near-instant) but worth knowing before relying on failover against a
+  target that fails by hanging.
+- `[proxy.upstream_tls]`'s `server_name` (and CA/client cert) is shared
+  across every `upstream_addrs` target — correct for a replica set behind
+  one logical hostname, wrong if targets are distinct hosts with per-host
+  certificates. There's no per-target TLS config today.
 - One `[[proxy]]` entry's fatal error aborts every other entry in the same
   process (see `run_with_config`) rather than restarting just the failed
   one — there's no per-entry supervision/backoff.
