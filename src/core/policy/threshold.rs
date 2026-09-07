@@ -9,7 +9,9 @@ use serde::{Deserialize, Deserializer};
 use crate::core::action::Action;
 use crate::core::identity::Identity;
 
-use super::store::{Anchor, HistoryStore, SqliteStore, ValkeyStore, ValkeyTlsConfig};
+use super::store::{
+    Anchor, HistoryStore, SqliteStore, ValkeyAuthConfig, ValkeyStore, ValkeyTlsConfig,
+};
 use super::{Decision, Policy, PolicyContext};
 
 /// Where `ThresholdPolicy` persists/shares its sliding-window history.
@@ -49,6 +51,17 @@ pub struct ValkeyStateDbConfig {
     /// `redis://` URL.
     #[serde(default)]
     pub client_cert: Option<ValkeyClientCertConfig>,
+    /// ACL username, if the instance requires authentication (`requirepass`
+    /// or ACLs — see ARCHITECTURE.md's "Valkey-backed policy state" section).
+    /// Kept as its own field rather than requiring the standard
+    /// `redis://user:pass@host` userinfo embedding, so `url` itself never
+    /// carries a credential that a connection failure could otherwise log
+    /// verbatim — see `redact_valkey_url`.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// ACL/`requirepass` password. See `username`.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// A certificate/key pair `ValkeyStateDbConfig` presents for mutual TLS —
@@ -297,6 +310,29 @@ impl History {
     }
 }
 
+/// Strips `redis://`/`rediss://` userinfo (`user:pass@`) from a `state_db`
+/// URL before it's ever passed to `tracing`. `ValkeyStateDbConfig::username`/
+/// `password` are the documented way to authenticate, but the standard URL
+/// scheme still accepts an embedded credential in `url` itself (a
+/// `redis::Client` requirement, not this proxy's), and `ThresholdPolicy::new`
+/// logs `url` verbatim on any `ValkeyStore::open` failure — a typo, an
+/// unreachable host, a bad `ca_file` path — which fires on every process
+/// start and every `SIGHUP` reload while the misconfiguration persists. Only
+/// ever used for that log line; the unredacted `url` is still what's handed
+/// to `ValkeyStore::open`.
+fn redact_valkey_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return "<redacted: unparseable state_db url>".to_string();
+    };
+    let (scheme, rest) = url.split_at(scheme_end + "://".len());
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, remainder) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => format!("{scheme}<redacted>@{}{remainder}", &authority[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
 /// Blocks an action outright once it (or the identity's recent history)
 /// exceeds a configured blast-radius threshold. This is the "4 accounts is
 /// fine, 4,000 is not" rule.
@@ -359,7 +395,11 @@ impl ThresholdPolicy {
                     client_cert_file: valkey.client_cert.as_ref().map(|c| c.cert_file.clone()),
                     client_key_file: valkey.client_cert.as_ref().map(|c| c.key_file.clone()),
                 };
-                match ValkeyStore::open(&valkey.url, valkey.key_prefix.clone(), tls) {
+                let auth = ValkeyAuthConfig {
+                    username: valkey.username.clone(),
+                    password: valkey.password.clone(),
+                };
+                match ValkeyStore::open(&valkey.url, valkey.key_prefix.clone(), tls, auth) {
                     Ok(store) => Some(PersistentState {
                         store: Arc::new(store),
                         pending: Mutex::new(Vec::new()),
@@ -367,7 +407,7 @@ impl ThresholdPolicy {
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
-                            url = %valkey.url,
+                            url = %redact_valkey_url(&valkey.url),
                             "failed to open threshold policy state db; continuing without persistence"
                         );
                         None
@@ -700,6 +740,122 @@ mod tests {
     }
 
     #[test]
+    fn parses_state_db_valkey_auth_config() {
+        let config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            [state_db]
+            url = "rediss://valkey:6379"
+            username = "ai-protect"
+            password = "hunter2"
+            "#,
+        )
+        .unwrap();
+
+        match config.state_db {
+            Some(StateDbConfig::Valkey(valkey)) => {
+                assert_eq!(valkey.username, Some("ai-protect".to_string()));
+                assert_eq!(valkey.password, Some("hunter2".to_string()));
+            }
+            other => panic!("expected a Valkey state_db, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redact_valkey_url_strips_userinfo_but_keeps_the_rest() {
+        assert_eq!(
+            redact_valkey_url("redis://user:hunter2@valkey:6379/0"),
+            "redis://<redacted>@valkey:6379/0"
+        );
+        assert_eq!(
+            redact_valkey_url("rediss://:onlypassword@valkey:6379"),
+            "rediss://<redacted>@valkey:6379"
+        );
+        assert_eq!(
+            redact_valkey_url("redis://valkey:6379"),
+            "redis://valkey:6379"
+        );
+        assert_eq!(
+            redact_valkey_url("not-a-url"),
+            "<redacted: unparseable state_db url>"
+        );
+    }
+
+    /// Mirrors `src/core/audit.rs`'s `logs_an_oversized_identity_and_target_truncated`
+    /// pattern: capture `tracing` output through a real subscriber and assert
+    /// on the rendered text, rather than the log call site alone. Regression
+    /// test for the credential-logging gap in TODO.md — before
+    /// `redact_valkey_url`, a `ValkeyStore::open` failure logged
+    /// `valkey.url` verbatim, embedded credential included.
+    #[test]
+    fn threshold_policy_new_does_not_log_a_valkey_url_credential_on_failed_open() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+        impl SharedBuffer {
+            fn contents(&self) -> String {
+                String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+            }
+        }
+
+        impl io::Write for SharedBuffer {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for SharedBuffer {
+            type Writer = SharedBuffer;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+
+        // A syntactically valid `rediss://` URL (so the embedded credential
+        // survives URL parsing) that still fails to open, via a client-cert
+        // file that doesn't exist — independent of the credential itself.
+        let config: ThresholdConfig = toml::from_str(
+            r#"
+            max_per_request = 10
+            max_per_window = 50
+            window_secs = 60
+            [state_db]
+            url = "rediss://ai-protect:hunter2-secret@valkey.invalid:6379"
+            [state_db.client_cert]
+            cert_file = "/nonexistent/ai-protect-client.pem"
+            key_file = "/nonexistent/ai-protect-client.key"
+            "#,
+        )
+        .unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _policy = ThresholdPolicy::new(config);
+        });
+
+        let output = buffer.contents();
+        assert!(!output.contains("hunter2-secret"));
+        assert!(output.contains("<redacted>@valkey.invalid:6379"));
+    }
+
+    #[test]
     fn parses_state_db_valkey_key_prefix_override() {
         let config: ThresholdConfig = toml::from_str(
             r#"
@@ -983,6 +1139,8 @@ mod tests {
                 key_prefix: "ai_protect_test".into(),
                 ca_file: None,
                 client_cert: None,
+                username: None,
+                password: None,
             })),
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,
@@ -1113,6 +1271,8 @@ mod tests {
                 key_prefix: key_prefix.clone(),
                 ca_file: None,
                 client_cert: None,
+                username: None,
+                password: None,
             })),
             flush_interval: Duration::from_secs(2),
             max_tracked_identities: 100_000,

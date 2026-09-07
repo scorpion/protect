@@ -474,6 +474,32 @@ path to `redis::Client::build_with_tls` once either is set. Either way,
 independently of whether either LDAP hop uses TLS at all, since this may
 be the only TLS-using code path in the process.
 
+**Authentication is not optional.** Anyone who can reach this instance can
+`ZADD` fabricated, current-scored entries into another identity's history
+key (`{key_prefix}:history:{identity}`, a predictable name enumerable via
+`SCAN`) — `ThresholdPolicy::merge_history_from_rows` unconditionally unions
+whatever the store returns into every instance's live decision-making
+history, so a forged row makes an innocent principal's genuine traffic get
+blocked, and `DEL`/`ZREMRANGEBYSCORE`-ing one's own key resets that
+identity's budget on any instance that hasn't independently cached its
+recent activity. TLS on this hop protects the data in transit; it does
+nothing to stop an unauthenticated caller from talking to the instance
+directly. Run Valkey/Redis with `requirepass` (or, on Redis 6+/Valkey,
+a dedicated ACL user scoped to this key prefix) and set
+`ValkeyStateDbConfig`'s `username`/`password` fields to match — these are
+applied to the parsed connection on top of `url` (via
+`redis::RedisConnectionInfo::set_username`/`set_password`), so the
+credential never has to be embedded in `url`'s userinfo, which
+`ThresholdPolicy::new` would otherwise risk logging verbatim (see
+`redact_valkey_url` in `src/core/policy/threshold.rs`) on any connection
+failure — a typo, an unreachable host, a bad `ca_file` path — including
+every process start and `SIGHUP` reload while the misconfiguration
+persists. `compose.yaml`'s local `ha` profile `valkey` service ships with
+a `requirepass` set (see the compose file for the value) purely so its
+example isn't itself a copy-pasteable unauthenticated instance — it's a
+convenience default for local testing, not a substitute for choosing a
+real credential (and, ideally, TLS) in an actual deployment.
+
 ## Identity
 
 [`Identity`](src/core/identity.rs) is an opaque wrapper around a string

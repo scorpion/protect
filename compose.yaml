@@ -61,4 +61,11 @@ services:
       - "6379:6379"
     volumes:
       - "valkey_data:/data"
-    command: valkey-server --save 60 1 --appendonly yes
+    # `--requirepass` so this example is never an unauthenticated,
+    # network-reachable instance by default — anyone who can reach an
+    # unauthenticated Valkey/Redis `state_db` can forge or erase the
+    # rate-limit history ThresholdPolicy enforces (see ARCHITECTURE.md
+    # "Valkey-backed policy state"). Change this password for anything
+    # beyond local testing, and point policies/ldap.toml's
+    # `[policy.state_db]` username/password at it to match.
+    command: valkey-server --save 60 1 --appendonly yes --requirepass change-me-in-production

@@ -45,10 +45,21 @@ window_secs = 60
 # state lives in the Valkey instance rather than a shared file/volume. Two
 # [[policy]] entries must use distinct key_prefix values for the same
 # reason they must use distinct SQLite files.
+#
+# Run that instance with `requirepass` (or a Redis 6+/Valkey ACL user) —
+# anyone who can reach it unauthenticated can forge or erase the very
+# rate-limit history this policy exists to enforce, since a write there is
+# unconditionally merged into every instance's live decisions. Set
+# username/password here to match rather than embedding them in url's
+# userinfo: they're applied to the parsed connection separately, so a
+# connection failure (bad host, bad ca_file path, ...) never risks logging
+# an embedded credential.
 # See ARCHITECTURE.md#valkey-backed-policy-state.
 # [policy.state_db]
 # url = "redis://127.0.0.1:6379"
 # key_prefix = "ai_protect:threshold"
+# username = "ai-protect"
+# password = "change-me"
 #
 # Use a rediss:// URL instead to encrypt this hop. With no further config,
 # the server's certificate is validated against the OS trust store. For an

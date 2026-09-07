@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use redis::AsyncCommands;
+use redis::IntoConnectionInfo;
 use redis::aio::ConnectionManager;
 use tokio::sync::Mutex;
 
@@ -43,6 +44,23 @@ pub struct ValkeyTlsConfig {
 impl ValkeyTlsConfig {
     fn is_default(&self) -> bool {
         self.ca_file.is_none() && self.client_cert_file.is_none() && self.client_key_file.is_none()
+    }
+}
+
+/// Optional `requirepass`/ACL credential for a `ValkeyStateDbConfig`, kept as
+/// its own fields (rather than requiring the standard `redis://user:pass@host`
+/// userinfo embedding) so a connection failure can be logged — see
+/// `redact_valkey_url` in `super::super::threshold` — without the log line
+/// ever containing this value in the first place.
+#[derive(Clone, Default)]
+pub struct ValkeyAuthConfig {
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl ValkeyAuthConfig {
+    fn is_default(&self) -> bool {
+        self.username.is_none() && self.password.is_none()
     }
 }
 
@@ -81,11 +99,35 @@ impl ValkeyStore {
     /// `rediss://` needs (see `ensure_crypto_provider`), since this may be
     /// the only TLS-using code path in a process whose LDAP hops are both
     /// plaintext.
-    pub fn open(url: &str, key_prefix: String, tls: ValkeyTlsConfig) -> anyhow::Result<Self> {
+    ///
+    /// `auth` (see [`ValkeyAuthConfig`]) is applied on top of whatever `url`
+    /// parses to, rather than requiring the credential to be embedded in
+    /// `url`'s userinfo — the caller (`ThresholdPolicy::new`) never has a
+    /// plaintext credential in the same string it might log on failure.
+    pub fn open(
+        url: &str,
+        key_prefix: String,
+        tls: ValkeyTlsConfig,
+        auth: ValkeyAuthConfig,
+    ) -> anyhow::Result<Self> {
         ensure_crypto_provider();
 
+        let mut connection_info = url
+            .into_connection_info()
+            .context("parsing Valkey/Redis state_db URL")?;
+        if !auth.is_default() {
+            let mut redis_settings = connection_info.redis_settings().clone();
+            if let Some(username) = &auth.username {
+                redis_settings = redis_settings.set_username(username);
+            }
+            if let Some(password) = &auth.password {
+                redis_settings = redis_settings.set_password(password);
+            }
+            connection_info = connection_info.set_redis_settings(redis_settings);
+        }
+
         let client = if tls.is_default() {
-            redis::Client::open(url).context("parsing Valkey/Redis state_db URL")?
+            redis::Client::open(connection_info).context("opening Valkey/Redis state_db client")?
         } else {
             let root_cert = tls
                 .ca_file
@@ -112,7 +154,7 @@ impl ValkeyStore {
                 ),
             };
             redis::Client::build_with_tls(
-                url,
+                connection_info,
                 redis::TlsCertificates {
                     client_tls,
                     root_cert,
@@ -277,8 +319,13 @@ mod tests {
     #[test]
     fn open_rejects_an_invalid_url_without_connecting() {
         assert!(
-            ValkeyStore::open("not-a-url", "ai_protect".into(), ValkeyTlsConfig::default())
-                .is_err()
+            ValkeyStore::open(
+                "not-a-url",
+                "ai_protect".into(),
+                ValkeyTlsConfig::default(),
+                ValkeyAuthConfig::default(),
+            )
+            .is_err()
         );
     }
 
@@ -288,6 +335,7 @@ mod tests {
             "redis://127.0.0.1:6379",
             "ai_protect".into(),
             ValkeyTlsConfig::default(),
+            ValkeyAuthConfig::default(),
         )
         .unwrap();
 
@@ -302,7 +350,12 @@ mod tests {
             client_key_file: None,
         };
 
-        let result = ValkeyStore::open("rediss://127.0.0.1:6379", "ai_protect".into(), tls);
+        let result = ValkeyStore::open(
+            "rediss://127.0.0.1:6379",
+            "ai_protect".into(),
+            tls,
+            ValkeyAuthConfig::default(),
+        );
         let Err(err) = result else {
             panic!("expected an error");
         };
@@ -314,8 +367,10 @@ mod tests {
     // are skipped by default since neither CI nor a fresh checkout has one
     // running. Bring one up locally with:
     //   docker compose --profile ha up -d valkey
-    // then run:
-    //   VALKEY_TEST_URL=redis://127.0.0.1:6379 cargo test valkey_store -- --ignored
+    // then run (compose.yaml's example service sets `--requirepass`, so the
+    // credential must be embedded in the URL here — see `ValkeyAuthConfig`
+    // for how `ai-protect` itself avoids that same embedding in `state_db`):
+    //   VALKEY_TEST_URL=redis://:change-me-in-production@127.0.0.1:6379 cargo test valkey_store -- --ignored
     fn test_url() -> Option<String> {
         std::env::var("VALKEY_TEST_URL").ok()
     }
@@ -328,7 +383,13 @@ mod tests {
             return;
         };
         let key_prefix = format!("ai_protect_test:{}", unique_test_suffix());
-        let store = ValkeyStore::open(&url, key_prefix, ValkeyTlsConfig::default()).unwrap();
+        let store = ValkeyStore::open(
+            &url,
+            key_prefix,
+            ValkeyTlsConfig::default(),
+            ValkeyAuthConfig::default(),
+        )
+        .unwrap();
 
         let rows = store
             .sync(
@@ -356,9 +417,20 @@ mod tests {
             return;
         };
         let key_prefix = format!("ai_protect_test:{}", unique_test_suffix());
-        let instance_a =
-            ValkeyStore::open(&url, key_prefix.clone(), ValkeyTlsConfig::default()).unwrap();
-        let instance_b = ValkeyStore::open(&url, key_prefix, ValkeyTlsConfig::default()).unwrap();
+        let instance_a = ValkeyStore::open(
+            &url,
+            key_prefix.clone(),
+            ValkeyTlsConfig::default(),
+            ValkeyAuthConfig::default(),
+        )
+        .unwrap();
+        let instance_b = ValkeyStore::open(
+            &url,
+            key_prefix,
+            ValkeyTlsConfig::default(),
+            ValkeyAuthConfig::default(),
+        )
+        .unwrap();
 
         instance_a
             .sync(&[("alice".to_string(), 1_000)], 0, 100)
@@ -377,7 +449,13 @@ mod tests {
             return;
         };
         let key_prefix = format!("ai_protect_test:{}", unique_test_suffix());
-        let store = ValkeyStore::open(&url, key_prefix, ValkeyTlsConfig::default()).unwrap();
+        let store = ValkeyStore::open(
+            &url,
+            key_prefix,
+            ValkeyTlsConfig::default(),
+            ValkeyAuthConfig::default(),
+        )
+        .unwrap();
 
         // alice is the least-recently-active of the three (her only event
         // has the smallest timestamp), so a cap of 2 must evict only her —
