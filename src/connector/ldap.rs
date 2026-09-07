@@ -50,6 +50,52 @@ fn is_lock_attribute(attr_type: &str) -> bool {
         .any(|(name, oid)| base == *name || base == *oid)
 }
 
+/// `userAccountControl`'s `ACCOUNTDISABLE` bit (RFC-less, but documented by
+/// Microsoft as flag `0x0002`): set means the account is disabled/locked,
+/// clear means enabled.
+const UAC_ACCOUNTDISABLE: u32 = 0x0002;
+
+/// Classify an Add/Replace write to a known lock attribute as
+/// `AccountLock` or `AccountUnlock` by inspecting the value actually being
+/// written, for the schemas where that value has an unambiguous, cheaply
+/// parsed meaning — otherwise (unrecognized attribute, unparsed value,
+/// multi-valued/empty write) falls back to `None`, letting the caller treat
+/// the write as a lock the way every Add/Replace of a lock attribute always
+/// has. Active Directory's `userAccountControl` is mandatory and
+/// single-valued, so both a lock and an unlock are a `Replace` with a new
+/// bitmask — this is what makes `AccountUnlock` reachable for AD at all
+/// (see TODO.md). 389 DS's `nsAccountLock` is commonly toggled the same way
+/// (`Replace` to `"TRUE"`/`"FALSE"`) as an alternative to deleting it.
+fn classify_lock_write(
+    attr_type: &str,
+    values: &rasn::types::SetOf<OctetString>,
+) -> Option<OperationKind> {
+    let base = attr_type
+        .split(';')
+        .next()
+        .unwrap_or(attr_type)
+        .to_lowercase();
+    let value = values.to_vec().into_iter().next()?;
+    let text = std::str::from_utf8(value.as_ref()).ok()?.trim();
+
+    match base.as_str() {
+        "useraccountcontrol" | "1.2.840.113556.1.4.8" => {
+            let flags: u32 = text.parse().ok()?;
+            Some(if flags & UAC_ACCOUNTDISABLE != 0 {
+                OperationKind::AccountLock
+            } else {
+                OperationKind::AccountUnlock
+            })
+        }
+        "nsaccountlock" | "2.16.840.1.113730.3.1.220" => match text.to_lowercase().as_str() {
+            "true" => Some(OperationKind::AccountLock),
+            "false" => Some(OperationKind::AccountUnlock),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Hard cap on a single LDAP message's BER content length. Applied before
 /// `read_frame` allocates a buffer for that content, so a client claiming an
 /// oversized length (up to `u32::MAX` under the wire format) gets the
@@ -263,26 +309,32 @@ impl LdapConnector {
 
         match &message.protocol_op {
             ProtocolOp::ModifyRequest(modify) => {
-                // Add/Replace can set a lock value (AccountLock); Delete of
+                // Add/Replace can set a lock value (AccountLock) or, for a
+                // schema where lock/unlock are both a Replace with a new
+                // value (AD's mandatory userAccountControl; 389 DS's
+                // nsAccountLock toggled rather than deleted), clear one
+                // (AccountUnlock) — see `classify_lock_write`. Delete of
                 // these attributes clears them back to the schema default,
-                // i.e. unlocks the account (AccountUnlock) — the mirror image,
-                // policed separately since "N unlocks" and "N locks" may
-                // warrant different limits.
-                let touches_lock_attribute = |ops: &[ChangeOperation]| {
-                    modify.changes.iter().any(|change| {
+                // i.e. unlocks the account (AccountUnlock) — the mirror
+                // image, policed separately since "N unlocks" and "N locks"
+                // may warrant different limits.
+                let find_change = |ops: &[ChangeOperation]| {
+                    modify.changes.iter().find(|change| {
                         ops.contains(&change.operation)
                             && is_lock_attribute(&change.modification.r#type.0)
                     })
                 };
 
-                let operation =
-                    if touches_lock_attribute(&[ChangeOperation::Add, ChangeOperation::Replace]) {
-                        OperationKind::AccountLock
-                    } else if touches_lock_attribute(&[ChangeOperation::Delete]) {
-                        OperationKind::AccountUnlock
-                    } else {
-                        return Ok(None);
-                    };
+                let operation = if let Some(change) =
+                    find_change(&[ChangeOperation::Add, ChangeOperation::Replace])
+                {
+                    classify_lock_write(&change.modification.r#type.0, &change.modification.vals)
+                        .unwrap_or(OperationKind::AccountLock)
+                } else if find_change(&[ChangeOperation::Delete]).is_some() {
+                    OperationKind::AccountUnlock
+                } else {
+                    return Ok(None);
+                };
 
                 Ok(Some(Action {
                     backend: "ldap",
@@ -773,6 +825,84 @@ mod tests {
         assert_eq!(action.operation, OperationKind::AccountUnlock);
         assert_eq!(action.target, "cn=alice,dc=example,dc=com");
         assert_eq!(action.blast_radius, 1);
+    }
+
+    #[test]
+    fn decodes_useraccountcontrol_replace_clearing_disable_bit_as_account_unlock_action() {
+        // Real AD re-enable: a Replace (userAccountControl is mandatory and
+        // can't be deleted) writing a value with ACCOUNTDISABLE (0x2) clear.
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"512", // NORMAL_ACCOUNT, enabled
+        );
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.operation, OperationKind::AccountUnlock);
+    }
+
+    #[test]
+    fn decodes_useraccountcontrol_replace_setting_disable_bit_as_account_lock_action() {
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"514", // NORMAL_ACCOUNT | ACCOUNTDISABLE
+        );
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.operation, OperationKind::AccountLock);
+    }
+
+    #[test]
+    fn decodes_useraccountcontrol_replace_with_unparseable_value_falls_back_to_account_lock() {
+        let frame = modify_request_frame(
+            1,
+            "cn=alice,dc=example,dc=com",
+            "userAccountControl",
+            b"not-a-number",
+        );
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.operation, OperationKind::AccountLock);
+    }
+
+    #[test]
+    fn decodes_nsaccountlock_replace_true_as_account_lock_action() {
+        let frame = modify_request_frame(1, "cn=alice,dc=example,dc=com", "nsAccountLock", b"TRUE");
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.operation, OperationKind::AccountLock);
+    }
+
+    #[test]
+    fn decodes_nsaccountlock_replace_false_as_account_unlock_action() {
+        let frame =
+            modify_request_frame(1, "cn=alice,dc=example,dc=com", "nsAccountLock", b"false");
+
+        let action = connector()
+            .decode(&frame)
+            .unwrap()
+            .expect("expected an action");
+
+        assert_eq!(action.operation, OperationKind::AccountUnlock);
     }
 
     #[test]

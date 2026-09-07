@@ -111,9 +111,14 @@ policy engine — as opposed to `src/connector/`, which is protocol-specific
   Reads BER-framed LDAP messages off the wire (`read_frame`), decodes
   `ModifyRequest`s via `rasn`/`rasn-ldap` and flags ones touching a known
   account-lock attribute (`LOCK_ATTRIBUTES`, covering AD/OpenLDAP/389 DS
-  schemas) as an `Action` — `AccountLock` if it's set (`Add`/`Replace`),
-  `AccountUnlock` if it's cleared back to the schema default (`Delete`) —
-  flags every `DelRequest`/`AddRequest`/
+  schemas) as an `Action` — `AccountUnlock` if it's cleared back to the
+  schema default (`Delete`), `AccountLock` if it's set (`Add`/`Replace`) by
+  default, except `classify_lock_write` inspects the value itself for
+  `userAccountControl` (the `ACCOUNTDISABLE` bit) and `nsAccountLock`
+  (`"TRUE"`/`"FALSE"`) — the two schemas where a `Replace` alone can mean
+  either lock or unlock, since AD's mandatory `userAccountControl` can
+  never be `Delete`d — falling back to Add/Replace-is-a-lock when the value
+  doesn't parse — flags every `DelRequest`/`AddRequest`/
   `ModifyDnRequest` unconditionally (removing, creating, or renaming/moving
   an entry outright is already high-blast-radius, and unlike `Modify`
   there's no cheap attribute-level filter to narrow any of them further

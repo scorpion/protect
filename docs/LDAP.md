@@ -46,16 +46,27 @@ matched case-insensitively, covering the three directory families
 | `nsAccountLock` | 389 Directory Server |
 | `shadowExpire` | RFC 2307 `shadowAccount` (some OpenLDAP setups) |
 
-**Adding or replacing** one of these attributes is reported as
-`AccountLock`; **deleting** one (clearing it back to the schema default,
-typically *unlocking* the account) is reported separately as
-`AccountUnlock` — the mirror image, since mass-reactivating
-previously-locked accounts (e.g. to keep a credential-stuffing run alive)
-is arguably just as security-relevant as mass-locking them, and "N
-unlocks" may warrant a different limit than "N locks" in policy. A Modify
-touching any other attribute — job title, group membership, phone number,
-anything not in this list — passes through untouched regardless of how
-many attributes or values it changes.
+**Deleting** one of these attributes (clearing it back to the schema
+default, typically *unlocking* the account) is reported as
+`AccountUnlock`. **Adding or replacing** one is reported as `AccountLock`
+by default — except for `userAccountControl` and `nsAccountLock`, where
+lock and unlock are both a Replace with a new value (Active Directory's
+`userAccountControl` is mandatory and single-valued, so it can never be
+deleted; `nsAccountLock` is commonly toggled the same way as an
+alternative to deleting it). For those two, the value actually being
+written is inspected: a `userAccountControl` Replace is `AccountLock` if
+the new value has the `ACCOUNTDISABLE` bit (`0x2`) set and `AccountUnlock`
+if it doesn't; an `nsAccountLock` Replace is `AccountLock` for `"TRUE"`
+and `AccountUnlock` for `"FALSE"` (case-insensitive). A value that doesn't
+parse (or a Replace of `pwdAccountLockedTime`/`shadowExpire`, whose
+"locked" representation isn't a simple bit/boolean) falls back to the
+Add/Replace-is-a-lock default. This distinction exists since
+mass-reactivating previously-locked accounts (e.g. to keep a
+credential-stuffing run alive) is arguably just as security-relevant as
+mass-locking them, and "N unlocks" may warrant a different limit than "N
+locks" in policy. A Modify touching any other attribute — job title,
+group membership, phone number, anything not in this list — passes
+through untouched regardless of how many attributes or values it changes.
 
 ### Why Delete, Add, and Modify DN are always actionable
 

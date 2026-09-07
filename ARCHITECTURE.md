@@ -88,10 +88,16 @@ protocol is this" from "should this be allowed."
   account-lock across different directory schemas (`LOCK_ATTRIBUTES` covers
   AD's `userAccountControl`, OpenLDAP's `pwdAccountLockedTime`, 389 DS's
   `nsAccountLock`, and `shadowExpire`) and distinguishing setting one
-  (`AccountLock`, `ChangeOperation::Add`/`Replace`) from clearing one back
-  to its schema default (`AccountUnlock`, `ChangeOperation::Delete` —
-  mass-reactivating locked accounts is policed as its own action rather
-  than passing through unexamined), recognizing every `DelRequest`/
+  (`AccountLock`) from clearing one back to its schema default
+  (`AccountUnlock` — mass-reactivating locked accounts is policed as its
+  own action rather than passing through unexamined: a `Delete` of the
+  attribute is always `AccountUnlock`, an `Add`/`Replace` is `AccountLock`
+  by default, and `classify_lock_write` inspects the value itself for
+  `userAccountControl` (the `ACCOUNTDISABLE` bit) and `nsAccountLock`
+  (`"TRUE"`/`"FALSE"`) — the two schemas where a `Replace` alone can mean
+  either lock or unlock, since AD's `userAccountControl` is mandatory and
+  can never be `Delete`d — falling back to the Add/Replace-is-a-lock
+  default when the value doesn't parse), recognizing every `DelRequest`/
   `AddRequest`/`ModifyDnRequest` unconditionally (removing, creating, or
   renaming/moving an entry outright is already high-blast-radius, and —
   unlike `Modify` — there's no cheap attribute-level filter to narrow any
