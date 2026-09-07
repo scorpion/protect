@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -321,17 +321,70 @@ impl ThresholdPolicy {
             }
         };
 
-        // Each identity's row set from the DB is authoritative as of this
-        // sync (it already reflects the events just inserted above), so it
-        // replaces rather than merges with local history — merging would
-        // double-count this instance's own events on every cycle, since
-        // they'd never leave `history` even as fresh copies of them keep
-        // arriving from the round trip.
+        // Fold the snapshot into local history rather than replacing it
+        // outright — see `merge_history_from_rows` for why: an `evaluate`
+        // call landing between the drain above and this lock is real, local,
+        // already-admitted state a wholesale replace would silently erase.
         let mut history = self.history.lock();
-        for (identity, timestamps) in rows_into_history(&anchor, rows, self.config.window) {
-            history.insert(identity, timestamps);
-        }
+        merge_history_from_rows(&mut history, &anchor, rows, self.config.window);
         evict_stalest_until(&mut history, self.config.max_tracked_identities);
+    }
+}
+
+/// Folds a `HistoryStore::sync` snapshot into local `history` for each
+/// identity the snapshot names, by union rather than wholesale replacement.
+/// A concurrent `evaluate` call landing between `sync_once` draining
+/// `pending` and this merge running pushes straight into `history`
+/// (visible to this instance's own next decision immediately) but only
+/// queues into `pending` for the *next* flush cycle — so the snapshot just
+/// fetched cannot possibly contain it yet, since it was generated before
+/// that admission happened. Replacing the identity's entry outright would
+/// silently erase that admission from local history until the next cycle
+/// catches up, letting sustained traffic slip past `max_per_window` for as
+/// long as each round trip takes, systematically and repeatedly (see
+/// TODO.md). Dedup is by exact epoch-millis value: an event this instance
+/// already flushed comes back from the store as a value that round-trips
+/// byte-identical to what's already sitting in `history`, so a plain union
+/// without dedup would double-count it every cycle it keeps arriving.
+fn merge_history_from_rows(
+    history: &mut HashMap<Identity, VecDeque<Instant>>,
+    anchor: &Anchor,
+    rows: HashMap<String, Vec<i64>>,
+    window: Duration,
+) {
+    let now = Instant::now();
+    for (identity, timestamps) in rows {
+        let identity = Identity(identity);
+        let mut seen_millis = HashSet::with_capacity(timestamps.len());
+        let mut merged = Vec::with_capacity(timestamps.len());
+
+        if let Some(existing) = history.get(&identity) {
+            for &instant in existing {
+                if now.duration_since(instant) <= window {
+                    seen_millis.insert(anchor.to_epoch_millis(instant));
+                    merged.push(instant);
+                }
+            }
+        }
+
+        for epoch_millis in timestamps {
+            if !seen_millis.insert(epoch_millis) {
+                continue;
+            }
+            match anchor.to_instant(epoch_millis) {
+                Some(instant) if now.duration_since(instant) <= window => merged.push(instant),
+                _ => {
+                    seen_millis.remove(&epoch_millis);
+                }
+            }
+        }
+
+        merged.sort();
+        if merged.is_empty() {
+            history.remove(&identity);
+        } else {
+            history.insert(identity, merged.into());
+        }
     }
 }
 
@@ -973,5 +1026,88 @@ mod tests {
             restarted.evaluate(&action(1), &ctx_for(&identity)),
             Decision::Allow
         ));
+    }
+
+    #[tokio::test]
+    async fn sync_once_merges_admission_that_lands_during_the_round_trip() {
+        // Reproduces the race from TODO.md end to end against a real
+        // `SqliteStore`: an `evaluate` call landing between `sync_once`
+        // draining `pending` and folding the fetched snapshot back into
+        // `history` is real, already-admitted local state that the
+        // snapshot — built moments earlier — cannot possibly contain yet.
+        // A wholesale replace would silently erase it; the merge must not.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.sqlite3");
+        let identity = Identity("agent-1".into());
+        let config = ThresholdConfig {
+            max_per_request: 10,
+            max_per_window: 10,
+            window: Duration::from_secs(60),
+            state_db: Some(StateDbConfig::Sqlite(db_path)),
+            flush_interval: Duration::from_secs(2),
+            max_tracked_identities: 100_000,
+            scope: ThresholdScope::PerIdentity,
+        };
+        let policy = ThresholdPolicy::new(config);
+
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&identity)),
+            Decision::Allow
+        ));
+
+        // Manually perform `sync_once`'s drain-then-round-trip steps so a
+        // second admission can be injected in between, standing in for the
+        // unpredictable timing of a real concurrent caller.
+        let anchor = Anchor::now();
+        let state = policy.state.as_ref().unwrap();
+        let new_events: Vec<(String, i64)> = {
+            let mut pending = state.pending.lock();
+            std::mem::take(&mut *pending)
+                .into_iter()
+                .map(|(identity, instant)| (identity.0, anchor.to_epoch_millis(instant)))
+                .collect()
+        };
+        let cutoff = anchor.epoch_millis_before(Duration::from_secs(60));
+        let rows = state.store.sync(&new_events, cutoff).await.unwrap();
+
+        // The concurrent admission: already in `history`, only queued in
+        // `pending` for the *next* cycle, and entirely absent from `rows`.
+        assert!(matches!(
+            policy.evaluate(&action(1), &ctx_for(&identity)),
+            Decision::Allow
+        ));
+
+        let mut history = policy.history.lock();
+        merge_history_from_rows(&mut history, &anchor, rows, Duration::from_secs(60));
+        drop(history);
+
+        assert_eq!(
+            policy.history.lock().get(&identity).unwrap().len(),
+            2,
+            "the concurrent admission must survive the merge, not be erased by the snapshot"
+        );
+    }
+
+    #[test]
+    fn merge_history_from_rows_dedups_a_timestamp_already_in_local_history() {
+        // The common steady-state case: the store echoes back exactly the
+        // event this instance itself already flushed and holds locally. The
+        // merge must recognize it as the same event (via exact epoch-millis
+        // match) rather than double-counting it every cycle it round-trips
+        // back.
+        let anchor = Anchor::now();
+        let identity = Identity("agent-1".into());
+        let window = Duration::from_secs(60);
+        let now = Instant::now();
+
+        let mut history = HashMap::new();
+        history.insert(identity.clone(), VecDeque::from(vec![now]));
+
+        let mut rows = HashMap::new();
+        rows.insert(identity.0.clone(), vec![anchor.to_epoch_millis(now)]);
+
+        merge_history_from_rows(&mut history, &anchor, rows, window);
+
+        assert_eq!(history.get(&identity).unwrap().len(), 1);
     }
 }

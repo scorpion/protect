@@ -72,7 +72,7 @@ roughly in the order you'd want to tackle them.
 
 ## High — window-limit bypass under `state_db`
 
-- [ ] **A `state_db`-backed `ThresholdPolicy`'s background sync can
+- [x] **A `state_db`-backed `ThresholdPolicy`'s background sync can
       silently erase in-flight admissions from local history, letting
       sustained traffic exceed `max_per_window`.** `evaluate`
       ([src/core/policy/threshold.rs:457-467](src/core/policy/threshold.rs))
@@ -126,6 +126,19 @@ roughly in the order you'd want to tackle them.
       `evaluate` (pushing to `pending`) concurrently with a slow/delayed
       fake `HistoryStore::sync` and asserts the concurrently-admitted
       timestamp survives the subsequent merge.
+      Fixed: `sync_once` ([src/core/policy/threshold.rs](src/core/policy/threshold.rs))
+      no longer wholesale-replaces an identity's `history` entry with the
+      fetched snapshot. A new `merge_history_from_rows` helper unions the
+      snapshot's timestamps with whatever's already in `history`, deduping
+      on exact epoch-millis value (an event this instance already flushed
+      round-trips back byte-identical, so a plain union without dedup would
+      double-count it every cycle), so a concurrent `evaluate` admission
+      landing between the drain and the merge is preserved instead of
+      silently erased. See
+      `sync_once_merges_admission_that_lands_during_the_round_trip`
+      (reproduces the race end to end against a real `SqliteStore`) and
+      `merge_history_from_rows_dedups_a_timestamp_already_in_local_history`
+      in `src/core/policy/threshold.rs`.
 
 ## Medium — identity-budget dilution
 
