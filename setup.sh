@@ -261,7 +261,11 @@ if [ -z "$ROOTDSE_OUT" ]; then
     if [ -n "$DOTENV_LLDAP_PASS" ] && confirm "Found LLDAP_LDAP_USER_PASS in .env -- use it to bind as ${LLDAP_DEFAULT_BIND_DN} (this repo's local lldap upstream) for this discovery query?" y; then
         BIND_DN="$LLDAP_DEFAULT_BIND_DN"
         BIND_PW="$DOTENV_LLDAP_PASS"
-        BIND_ARGS=(-D "$BIND_DN" -w "$BIND_PW")
+        # -y <passwordfile> instead of -w "$BIND_PW": -w puts the password in
+        # argv, visible to any other local account via ps/proc for the life of
+        # the process. Process substitution feeds it through an fd instead --
+        # no plaintext temp file, no argv exposure.
+        BIND_ARGS=(-D "$BIND_DN" -y <(printf '%s' "$BIND_PW"))
         USED_CREDS=1
         ROOTDSE_OUT="$(try_rootdse)"
         if [ -z "$ROOTDSE_OUT" ]; then
@@ -274,7 +278,7 @@ if [ -z "$ROOTDSE_OUT" ]; then
     if [ -z "$ROOTDSE_OUT" ] && confirm "Retry with a bind DN/password (common for servers that reject anonymous binds, e.g. Active Directory, lldap)?" y; then
         ask BIND_DN "Bind DN" "$LLDAP_DEFAULT_BIND_DN"
         ask_secret BIND_PW "Bind password"
-        BIND_ARGS=(-D "$BIND_DN" -w "$BIND_PW")
+        BIND_ARGS=(-D "$BIND_DN" -y <(printf '%s' "$BIND_PW"))
         USED_CREDS=1
         ROOTDSE_OUT="$(try_rootdse)"
     fi
@@ -582,8 +586,19 @@ backup_if_exists config.toml
 backup_if_exists policies/ldap.toml
 mv "$CFG" config.toml
 mv "$POL" policies/ldap.toml
+# Both can hold a plaintext credential (a bind password if one was embedded
+# in a URL by hand, and policies/ldap.toml's state_db Valkey password) --
+# don't leave them at the umask's default (often group/world-readable).
+chmod 600 config.toml policies/ldap.toml
 ok "wrote config.toml"
 ok "wrote policies/ldap.toml"
+
+# A SQLite state_db carries no credential but does hold per-identity bind-DN
+# history; tighten it too if this run's path already exists (e.g. a rerun
+# reusing an existing db.sqlite -- setup.sh itself never creates the file).
+if [ "$STATE_DB_MODE" = "sqlite" ] && [ -f "$STATE_DB_PATH" ]; then
+    chmod 600 "$STATE_DB_PATH"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
