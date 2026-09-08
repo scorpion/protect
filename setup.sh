@@ -536,6 +536,9 @@ POL="$WORKDIR/ldap.toml"
     echo
     echo "[[policy]]"
     echo "type = \"threshold\""
+    if [ "$INCLUDE_STRICT_DCR" = 1 ]; then
+        echo "operations = [\"account_lock\", \"account_unlock\", \"password_reset\"]"
+    fi
     echo "max_per_request = ${MAX_PER_REQUEST}"
     echo "max_per_window = ${MAX_PER_WINDOW}"
     echo "window_secs = ${WINDOW_SECS}"
