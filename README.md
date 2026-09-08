@@ -7,11 +7,12 @@ directory.
 
 It sits inline between clients and the upstream directory server. Requests
 it doesn't need to act on are forwarded byte-for-byte, untouched. Requests
-that modify account-lock attributes, delete or create an entry outright, or
-reset a password via extended operation are checked against configurable
-blast-radius policies and either forwarded or rejected with a proper LDAP
-error, with every decision logged. Each hop (client-facing and upstream)
-can independently run plaintext LDAP or LDAPS.
+that modify account-lock attributes, delete, create, or rename/move an
+entry outright, or reset a password via extended operation are checked
+against configurable blast-radius policies and either forwarded or
+rejected with a proper LDAP error, with every decision logged. Each hop
+(client-facing and upstream) can independently run plaintext LDAP or
+LDAPS.
 
 > **Status:** early. TOML-based config and policy files, TLS on both hops
 > (including optional mutual TLS and RFC 4511 StartTLS), bounded concurrent
@@ -33,14 +34,30 @@ client  ---->  ai-protect  ---->  upstream LDAP directory
                          +-- over limit    -> reject, log, never reaches directory
 ```
 
+```mermaid
+flowchart LR
+    client([client]) --> proxy[ai-protect]
+    proxy --> decode[decode request]
+    decode --> actionable{actionable?}
+    actionable -->|no| forward1[forward as-is]
+    actionable -->|yes| policy[evaluate policy]
+    policy --> withinLimits{within limits?}
+    withinLimits -->|yes| forward2[forward]
+    withinLimits -->|no| reject[reject + log]
+    forward1 --> upstream[(upstream LDAP directory)]
+    forward2 --> upstream
+    reject -.never reaches.-> upstream
+```
+
 Every modify request is inspected for attributes that represent an
 account lock across common directory schemas (Active Directory,
-OpenLDAP, 389 DS); every delete or add request is treated as actionable
-unconditionally, since removing or creating an entry outright is already
-high-blast-radius; and a password-reset extended operation (RFC 3062) is
-treated the same way, since a bulk reset locks users out just as a bulk
-lock would. Matching requests are checked against the configured policy
-chain — currently a threshold policy that blocks:
+OpenLDAP, 389 DS); every delete, add, or modify-DN (rename/move) request
+is treated as actionable unconditionally, since removing, creating, or
+renaming/moving an entry outright is already high-blast-radius; and a
+password-reset extended operation (RFC 3062) is treated the same way,
+since a bulk reset locks users out just as a bulk lock would. Matching
+requests are checked against the configured policy chain — currently a
+threshold policy that blocks:
 
 - any single request whose blast radius exceeds a per-request cap, and
 - any identity whose cumulative blast radius within a sliding time window
