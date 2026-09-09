@@ -1,4 +1,4 @@
-# ai-protect
+# SCORPION protect
 
 A transparent proxy for directory services (LDAP today) that blocks
 bulk, high-blast-radius account operations — like an automated agent or
