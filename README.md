@@ -1,6 +1,6 @@
 # SCORPION protect
 
-A transparent proxy for directory services (LDAP today) that blocks
+A transparent proxy + load balancer for directory services (LDAP today) that blocks
 bulk, high-blast-radius account operations — like an automated agent or
 runaway script locking thousands of accounts — before they reach the real
 directory.
