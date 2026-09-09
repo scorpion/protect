@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ai-protect — an inline proxy that stops bulk directory damage</title>
+  <meta name="description"
+    content="ai-protect is an inline TCP proxy for LDAP that blocks bulk account lockouts, deletions, and password resets from over-eager agents and scripts before they reach your directory.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;750&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="css/site.css">
+</head>
+
+<body>
+
+  <nav class="nav">
+    <div class="wrap">
+      <a class="brand" href="#top">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 611 119" xmlns="http://www.w3.org/2000/svg" xml:space="preserve" width="100%" height="100%"
+            version="1.2" class="svg-logo" fill="#FFFFFF" opacity="0.75">
+            <path
+              d="M165.672-26.388h-5.364a.722.722 0 0 0-.72.72v12.708l-8.46-12.924c-.072-.288-.36-.504-.684-.504h-5.364a.722.722 0 0 0-.72.72V-.72c0 .396.324.72.72.72h5.364c.396 0 .72-.324.72-.72v-12.672L159.66-.396c.144.252.36.396.648.396h5.364c.396 0 .72-.324.72-.72v-24.948a.722.722 0 0 0-.72-.72Z"
+              transform="matrix(3.55668 0 0 3.55938 18.921 106.2)" />
+            <path
+              d="M141.696-18.72c-.648-1.584-1.548-2.988-2.664-4.14-1.152-1.116-2.484-2.016-4.068-2.628-1.548-.612-3.24-.9-5.04-.9-1.8 0-3.492.288-5.04.9a11.853 11.853 0 0 0-4.032 2.628c-1.116 1.152-2.016 2.556-2.664 4.14-.612 1.62-.936 3.42-.936 5.436 0 1.944.324 3.78.936 5.4.648 1.62 1.548 3.06 2.664 4.212a12.12 12.12 0 0 0 4.032 2.736 13.64 13.64 0 0 0 5.04.936c1.8 0 3.492-.324 5.076-.936 1.548-.648 2.88-1.584 4.032-2.736 1.116-1.152 2.016-2.592 2.664-4.212.612-1.62.936-3.456.936-5.4 0-1.98-.324-3.816-.936-5.436ZM132.3-6.804a5.732 5.732 0 0 1-2.376.504c-.864 0-1.656-.18-2.376-.504a5.535 5.535 0 0 1-1.836-1.44c-.54-.612-.936-1.332-1.224-2.196-.324-.864-.468-1.836-.468-2.844 0-1.008.144-1.944.432-2.772.288-.864.684-1.584 1.224-2.16.504-.612 1.152-1.08 1.872-1.44a5.732 5.732 0 0 1 2.376-.504c.864 0 1.692.18 2.412.504.72.36 1.332.828 1.836 1.404.54.612.936 1.332 1.224 2.196a8.44 8.44 0 0 1 .468 2.772c0 1.008-.18 1.98-.468 2.844a6.817 6.817 0 0 1-1.224 2.196 6.066 6.066 0 0 1-1.872 1.44Z"
+              transform="matrix(3.55668 0 0 3.55938 21.513 106.2)" />
+            <path
+              d="M115.308-27.462h-6.192a.416.416 0 0 0-.432.432V-.432c0 .252.18.432.432.432h6.192c.252 0 .432-.18.432-.432V-27.03a.416.416 0 0 0-.432-.432Z"
+              transform="matrix(3.55668 0 0 3.41214 22.81 106.2)" />
+            <path
+              d="M106.416-21.924a6.56 6.56 0 0 0-2.124-2.592c-.864-.684-1.908-1.152-3.096-1.44a15.394 15.394 0 0 0-3.708-.432H88.74c-.216 0-.396.18-.396.432v25.56A.4.4 0 0 0 88.74 0h5.976a.4.4 0 0 0 .396-.396v-9h2.232c1.26 0 2.484-.144 3.636-.432 1.188-.324 2.268-.792 3.168-1.476.936-.684 1.656-1.548 2.232-2.664.54-1.08.792-2.448.792-3.996s-.252-2.88-.756-3.96Zm-5.796 3.996c0 .504-.108.972-.288 1.296-.216.36-.468.612-.792.828-.324.216-.756.36-1.188.468-.468.072-.936.144-1.44.144h-1.8v-5.292h1.872c.504 0 .972.036 1.44.108.432.036.828.18 1.152.36.324.216.576.432.756.792.18.324.288.756.288 1.296Z"
+              transform="matrix(3.55668 0 0 3.55938 24.106 106.2)" />
+            <path
+              d="m86.58-.648-5.976-10.476c1.404-.54 2.52-1.368 3.348-2.484.936-1.26 1.404-2.808 1.404-4.644 0-1.512-.288-2.808-.828-3.852a7.225 7.225 0 0 0-2.196-2.556 9.498 9.498 0 0 0-3.096-1.332 15.9 15.9 0 0 0-3.456-.396h-9.108c-.252 0-.468.18-.468.432V-.432c0 .216.216.432.468.432h5.616a.438.438 0 0 0 .432-.432v-9.684h1.26l5.076 9.864a.443.443 0 0 0 .396.252h6.732c.18 0 .324-.108.396-.216.072-.144.072-.324 0-.432Zm-7.74-17.784c0 .576-.108 1.044-.324 1.368-.252.36-.504.612-.864.828-.36.18-.792.324-1.224.396a9.22 9.22 0 0 1-1.404.108h-2.34v-5.148h2.7c.396 0 .828.036 1.26.108.432.036.792.18 1.116.36.324.18.576.396.756.72.216.324.324.72.324 1.26Z"
+              transform="matrix(3.55337 0 0 3.55606 26.918 106.113)" />
+            <path
+              d="M15.48-14.58a10.424 10.424 0 0 0-2.556-1.44c-.864-.324-1.692-.648-2.484-.9-.54-.18-1.008-.36-1.44-.54-.396-.144-.72-.324-1.008-.468a1.912 1.912 0 0 1-.468-.468c-.108-.18-.144-.36-.144-.648 0-.324.072-.576.18-.72.144-.252.324-.396.54-.54.252-.144.504-.252.792-.288.324-.072.648-.108.972-.108.612 0 1.26.18 1.944.504a4.782 4.782 0 0 1 1.62 1.296c.108.18.324.288.54.288a.651.651 0 0 0 .612-.252l3.564-3.924a.883.883 0 0 0 .216-.576c0-.18-.108-.396-.252-.54-1.08-1.044-2.376-1.836-3.852-2.376-1.44-.54-2.88-.828-4.284-.828-1.152 0-2.304.18-3.456.468-1.152.324-2.196.792-3.132 1.476a7.659 7.659 0 0 0-2.268 2.628c-.612 1.08-.9 2.376-.9 3.852 0 1.188.18 2.232.576 3.096.396.864.9 1.62 1.512 2.232a7.897 7.897 0 0 0 2.124 1.44c.72.36 1.476.684 2.268.936.756.252 1.44.468 2.016.684.54.216 1.008.432 1.368.648.324.216.576.432.72.684.144.18.18.396.18.72 0 .324-.036.648-.18.864a1.594 1.594 0 0 1-.432.54 2.614 2.614 0 0 1-.792.324c-.324.072-.684.144-1.044.144-.792 0-1.62-.252-2.412-.684-.828-.432-1.512-.972-2.016-1.62a.752.752 0 0 0-.576-.288c-.216 0-.432.072-.576.252L-.72-4.824c-.288.324-.288.792 0 1.08C.36-2.52 1.764-1.584 3.42-.936 5.076-.324 6.768 0 8.532 0c1.188 0 2.376-.144 3.528-.504a9.97 9.97 0 0 0 3.132-1.62 7.99 7.99 0 0 0 2.196-2.772c.54-1.116.792-2.448.792-3.96 0-1.368-.252-2.52-.792-3.456a7.81 7.81 0 0 0-1.908-2.268Z"
+              transform="matrix(3.55668 0 0 3.55938 3.329 106.2)" />
+            <g>
+              <path
+                d="M88.732 76.065c3.069-1.534 7.256-1.119 10.343-.458 2.683.734 4.8 1.937 6.288 3.002 1.658 1.187 2.532 2.202 2.532 2.202 3.895-.333 6.238-1.112 7.254-1.666l.754-.328c8.277-2.767 12.914-7.257 14.44-8.044 7-4.714 13.022-7.555 17.853-9.203a88.623 88.623 0 0 1 12.95-4.403l-.016-1.191c0-10.839 3.619-20.238 10.857-28.2 4.9-5.402 10.596-9.141 17.087-11.218 1.644-2.511 5.136-4.701 12.381-4.446 23.299.818 31.633 19.933 31.633 19.933-8.375-8.426-14.539-7.975-14.539-7.975 10.396 6.332 11.406 15.058 11.406 15.058-.896-2.213-3.892-5.859-12.013-7.958-7.888-2.038-6.269 6.001-18.25 4.745-9.581-1.003-11.84-12.584-11.84-12.584s-.238-1.038-.145-2.483c-.414 1.307-.799 3.618.189 6.486l.256.598c.457 1.203 1.175 2.482 2.224 3.816-1.76.971-6.175 3.59-7.839 6.266a8.63 8.63 0 0 1-1.221 1.529c-2.52 2.258-10.029 1.622-10.791 1.496 4.345.762 5.564 4.196 5.905 6.195.359 3.555-.554 8.3-.554 8.3l.49.057c3.07.776 4.245 2.794 4.405 5.36.187.506.354 1.011.5 1.485.437.877.536 1.584.536 1.584s2.19 2.92 1.278 7.483c-.114.572-.516 1.223-1.099 1.905l.376.45c.394.461.806.911 1.237 1.351 2.622 2.675 7.196 4.689 8.834 5.927 1.083.926 2.077 1.86 2.876 2.751.77 1.556 1.198 3.469.46 5.501 0 0 1.376-3.096 3.911-5.032 1.7-.99 4.068-1.421 6.164-1.923.482-.089.958-.19 1.427-.304.922-.167 1.766-.255 2.458-.224 2.815.129 5.181-2.344 6.344-3.835 1.037 2.103 2.179 3.651 3.322 4.789 1.654 1.413 4.226 3.049 7.367 3.184-2.549-.614-4.257-2.495-4.257-2.495s-7.59-7.796-5.658-14.326c4.563-15.421 12.632-6.456 15.056-14.235 2.19-7.026-.289-13.454-1.757-15.337 0 0 7.051 5.237 7.336 17.407 0 0 3.472-5.113.364-16.579 0 0 12.386 16.775 1.446 37.362-3.035 5.71-6.301 7.839-9.138 8.33-7.418 7.159-16.747 10.738-27.988 10.738-12.062 0-21.917-4.089-29.565-12.265a47.816 47.816 0 0 1-2.675-3.114c-.591.442-1.215.896-1.871 1.359a38.798 38.798 0 0 1-.378 3.435c-.271 1.764-3.017 7.449-2.207 8.677.791 1.2 7.847.941 10.908 2.442 2.588 1.27 4.014 2.71 3.838 2.971-.175.26-2.241-.439-4.887-.896-3.152-.543-12.536 1.696-14.053-.182-1.619-2.007.459-10.555.73-12.319-1.473.868-1.223.491-2.919 1.394.547-2.945.228-5.338-.001-6.961-.076 1.56-.705 5.966-1.564 8.409-.61 1.736-4.901 7.233-3.973 9.029 1.464 2.833 10.549 7.307 10.184 7.827-.364.521-12.69-1.877-14.775-5.555-1.046-1.843.151-5.966 1.459-8.76-1.782.753-1.576.62-3.521 1.268 1.058-2.454 1.605-5.282.875-8.202-.182 1.471-.858 4.956-1.771 7.108-.647 1.525-4.845 6.124-4.032 7.565 1.451 2.571 10.508 7.249 10.131 7.788-.378.539-13.384-1.903-15.369-5.398-.706-1.242.369-4.39 1.369-6.478-7.392 1.185-13.779 1.551-22.904 1.368-12.014-.197-21.541-4.646-29.527-12.308-8.199-7.865-12.298-17.433-12.298-28.703 0-7.577 1.917-14.615 5.751-21.113 3.833-6.499 9.101-11.57 15.804-15.214a43.944 43.944 0 0 1 2.333-1.18c-.013-.628.005-1.28.057-1.961C98.633-.008 120.149.291 126.208 6.424c7.954 8.054 15.512 1.567 18.075-5.549 0 0-4.633 31.208-31.595 32.11-3.61.12-12.113-1.867-14.685-9.586.001 1.458.263 3.189 1.019 5.129.154.398.33.804.528 1.218a21.652 21.652 0 0 1-.538 1.675c-2.142 5.849-6.576 10.418-8.99 12.593l-.727.636c-2.175-4.591-4.755-5.12-4.755-5.12 2.566 2.346 3.675 6.484 4.154 9.618-.007 3.38-.488 7.696-.849 10.461l-.22 1.622c-4.081-1.926-6.232-.904-6.232-.904 3.114.297 6.156 2.459 8.388 4.503 2.346 2.862 3.891 6.026 4.735 8.046l.254.625c-4.704.477-6.038 2.564-6.038 2.564Zm13.4-63.152c.81.754 3.014.022 5.463-1.31l.926-.404c.709-.286 2.024-.863 3.65-1.219 1.515-.331 3.371-.488 5.186-.283 2.549.287 5.041 1.111 6.794 1.634 1.378.511 2.303.767 2.463.519.161-.247-.49-.997-1.653-1.98-1.58-1.17-4.13-2.669-7.021-3.484-2.11-.596-4.457-.722-6.418-.506a18.17 18.17 0 0 0-4.82 1.232l-1.109.561c-2.887 2.025-4.27 4.484-3.461 5.24Zm46.701 43.033c-1.943-1.912-2.191-3.166-.674-5.447 1.871-2.813 5.213-5.425 6.754-8.139.496-.872 1.509-3.494 2.194-4.192.718-.732 1.442-.035 1.539.753.303 2.448-.984 5.581-2.342 7.56-.741 1.081-4.237 5.279-4.424 6.229.537 1.01 5.973 3.336 7.113 3.876l-6.855 1.98c-1.152-.803-2.3-1.631-3.305-2.62Zm-11.501 1.416c-.594-4.003 5.447-14.661 7.112-14.152 1.046.319.363 1.893.15 2.516-.861 2.512-3.255 8.349-2.852 10.486.213 1.134 5.637 3.014 6.696 3.417-2.159.792-4.271 1.607-6.364 2.563-1.56-.933-4.421-2.668-4.742-4.83Zm-9.933 6.272c-.559-3.781 5.434-14.735 7.13-14.216 1.037.317.391 1.897.187 2.527-.796 2.469-3.167 8.441-2.866 10.438.624.929 4.38 1.901 5.418 2.216a193.409 193.409 0 0 0-5.499 3.172c-1.446-.768-4.08-2.173-4.37-4.137Z"
+                transform="translate(-10.573 -.967) scale(1.10535)" />
+            </g>
+          </svg>
+        </span>
+        protect
+        <span class="kind">/ ldap</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="#problem">Why</a></li>
+        <li><a href="#how-it-works">How it works</a></li>
+        <li><a href="#features">Features</a></li>
+        <li><a href="#policy">Policy</a></li>
+        <li><a href="#docs">Docs</a></li>
+      </ul>
+      <div class="nav-cta">
+        <a class="btn btn-ghost btn-sm" href="https://github.com/scorpion/protect" target="_blank" rel="noopener">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path
+              d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
+          </svg>
+          <span class="label-text">GitHub</span>
+        </a>
+        <a class="btn btn-primary btn-sm" href="#get-started">Get started</a>
+        <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"
+            stroke-linecap="round">
+            <path d="M2 4h12M2 8h12M2 12h12" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  </nav>
+
+  <main id="top">
+
+    <!-- ============ HERO ============ -->
+    <header class="hero">
+      <div class="wrap">
+        <div>
+          <span class="eyebrow">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M8 0l6 2.5v4.6C14 12 11.6 15 8 16 4.4 15 2 12 2 7.1V2.5L8 0z" />
+            </svg>
+            Inline LDAP proxy · Rust
+          </span>
+          <h1>Stop bulk lockouts <span class="hl">before</span><br>they reach your directory.</h1>
+          <p class="hero-sub">
+            ai-protect sits between your clients and your real directory server (AD, OpenLDAP,
+            389&nbsp;DS). Every ordinary request passes through byte-for-byte, untouched — but a
+            runaway script or an over-eager AI agent trying to lock, delete, or reset thousands
+            of accounts hits a configurable blast-radius policy first, and never reaches the
+            directory at all.
+          </p>
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="#get-started">Get started</a>
+            <a class="btn btn-ghost" href="https://github.com/scorpion/protect" target="_blank" rel="noopener">View
+              source →</a>
+          </div>
+          <div class="trust-row">
+            <span class="status-note">Apache-2.0 · CI on stable/beta/nightly · fuzz-tested decoder</span>
+          </div>
+        </div>
+
+        <div class="terminal">
+          <div class="terminal-bar">
+            <span class="terminal-dot"></span>
+            <span class="terminal-dot"></span>
+            <span class="terminal-dot"></span>
+            <span class="terminal-title">RUST_LOG=info cargo run</span>
+          </div>
+          <div class="terminal-body" data-term-lines>
+            <div class="term-line"><span class="term-prompt">$</span> RUST_LOG=info cargo run</div>
+            <div class="term-line"><span class="term-dim">listening on 127.0.0.1:3890 → 127.0.0.1:389</span>
+            </div>
+            <div class="term-line">&nbsp;</div>
+            <div class="term-line"><span class="term-allow">ALLOW</span> <span class="term-dim">modify</span>
+              identity=10.1.2.14 blast_radius=1</div>
+            <div class="term-line"><span class="term-allow">ALLOW</span> <span class="term-dim">modify</span>
+              identity=svc-hr-sync blast_radius=3</div>
+            <div class="term-line"><span class="term-block">BLOCK</span> <span class="term-dim">modify</span>
+              identity=svc-agent-runner blast_radius=812 <span class="term-dim">reason=max_per_request(10)</span></div>
+            <div class="term-line"><span class="term-dim"> → UnwillingToPerform sent to client, upstream
+                never contacted</span></div>
+            <div class="term-line">&nbsp;</div>
+            <div class="term-line"><span class="term-block">BLOCK</span> <span class="term-dim">del</span>
+              identity=svc-agent-runner window=41/50 in 60s <span class="term-dim">reason=max_per_window</span></div>
+            <div class="term-line"><span class="term-dim"> → audit log: logs/ldap.log (json)</span></div>
+            <div class="term-line">&nbsp;</div>
+            <div class="term-line"><span class="term-prompt">$</span> <span class="term-cursor"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- ============ PROBLEM ============ -->
+    <section id="problem">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">The problem</p>
+          <h2>Directory protocols trust the caller completely.</h2>
+          <p>
+            LDAP has no concept of "that's a lot of accounts at once." A misconfigured
+            script, a compromised credential, or an AI agent given just enough access to
+            "clean up stale accounts" can lock, delete, or reset a huge slice of your
+            directory in the time it takes a human to notice — and by the time they do,
+            it's already done.
+          </p>
+        </div>
+        <div class="stat-grid">
+          <div class="stat-card">
+            <div class="stat-num">1<span class="unit"> line of code</span></div>
+            <p>is the difference between a scoped cleanup script and one that iterates every entry in the
+              directory instead of the ten it meant to.</p>
+          </div>
+          <div class="stat-card">
+            <div class="stat-num">&lt;1<span class="unit"> minute</span></div>
+            <p>is enough for an automated caller with valid credentials to lock or delete accounts faster
+              than any human review process can react.</p>
+          </div>
+          <div class="stat-card">
+            <div class="stat-num">0<span class="unit"> code changes</span></div>
+            <p>are needed anywhere else — ai-protect drops in as a TCP hop between client and directory, no
+              directory-side config required.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ HOW IT WORKS ============ -->
+    <section id="how-it-works">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">How it works</p>
+          <h2>Decode only what matters. Forward everything else.</h2>
+          <p>
+            ai-protect parses just enough of the wire protocol to recognize account-lock
+            modifications, deletes, creates, renames/moves, and password-reset extended
+            operations. Every other request is relayed byte-for-byte — it never has to
+            understand your whole schema to protect it.
+          </p>
+        </div>
+
+        <div class="flow">
+          <div class="flow-row">
+            <div class="flow-step">
+              <div class="flow-box">Client request</div>
+              <div class="flow-label">read_frame</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-step">
+              <div class="flow-box decode">Decode</div>
+              <div class="flow-label">rasn / BER (RFC 4511)</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-step">
+              <div class="flow-box">Actionable?</div>
+              <div class="flow-label">lock · del · add · modDN · pwd reset</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-branch">
+              <div class="flow-step">
+                <div class="flow-box allow">Within policy → forward</div>
+                <div class="flow-label">relayed to upstream</div>
+              </div>
+              <div class="flow-step">
+                <div class="flow-box block">Over limit → reject</div>
+                <div class="flow-label">LDAP error, logged</div>
+              </div>
+            </div>
+          </div>
+          <div class="flow-footnote">
+            <strong>Everything not actionable</strong> — searches, binds, ordinary single-entry
+            modifies — skips policy evaluation entirely and is forwarded as opaque bytes,
+            untouched, in both directions.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ FEATURES ============ -->
+    <section id="features">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">What's built in</p>
+          <h2>Everything a proxy sitting in front of production auth needs.</h2>
+        </div>
+
+        <div class="feature-grid">
+          <div class="feature-card">
+            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                stroke-width="1.5">
+                <path d="M1 8h6M9 8h6M6 4l2 4-2 4" />
+              </svg></div>
+            <h3>Transparent by default</h3>
+            <p>Only frames the system needs to act on are parsed. Everything else forwards byte-for-byte,
+              both directions, concurrently.</p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                stroke-width="1.5">
+                <rect x="2" y="6" width="12" height="8" rx="1.5" />
+                <path d="M5 6V4a3 3 0 0 1 6 0v2" />
+              </svg></div>
+            <h3>Configurable blast-radius policy</h3>
+            <p>Block any single request over a per-request cap, plus a sliding-window cap per identity or
+              globally as a backstop.</p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                stroke-width="1.5">
+                <path d="M2 8a6 6 0 1 1 3 5.2M2 8v4M2 8h4" />
+              </svg></div>
+            <h3>Verified identity, not IP guesswork</h3>
+            <p>Keys policy off a simple bind DN only once its BindResponse confirms success — closing
+              identity-churn bypass gaps.</p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                stroke-width="1.5">
+                <rect x="3" y="2" width="10" height="12" rx="1.5" />
+                <path d="M6 6h4M6 9h4M6 12h2" />
+              </svg></div>
+            <h3>TLS on every hop, independently</h3>
+            <p>LDAPS or plaintext-then-StartTLS on client and upstream sides, each optional and each with
+              its own mutual-TLS support.</p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                stroke-width="1.5">
+                <path d="M2 13V8l4-4 3 3 5-5" />
+                <path d="M14 2h-3v3" />
+              </svg></div>
+            <h3>Load balancing &amp; failover</h3>
+            <p>Round-robin, random, or least-connections across upstream targets, with automatic failover
+              and passive health tracking.</p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                stroke-width="1.5">
+                <rect x="2" y="3" width="12" height="10" rx="1.5" />
+                <path d="M5 6h6M5 9h4" />
+              </svg></div>
+            <h3>Structured audit logging</h3>
+            <p>Every allow and block decision, stdout + newline-JSON to disk — the forensic trail, decoupled
+              from policy logic.</p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                stroke-width="1.5">
+                <circle cx="8" cy="8" r="6" />
+                <path d="M8 5v3l2 2" />
+              </svg></div>
+            <h3>Zero-downtime policy reload</h3>
+            <p>SIGHUP hot-reloads policy files; SIGTERM/SIGINT drains in-flight connections before shutdown.
+            </p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                stroke-width="1.5">
+                <path d="M2 9h3l2-5 3 10 2-5h2" />
+              </svg></div>
+            <h3>Metrics, health checks, fuzzing</h3>
+            <p>Prometheus metrics, liveness/readiness endpoints, and a cargo-fuzz harness on every byte
+              parsed off the wire.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ POLICY AS CODE ============ -->
+    <section id="policy">
+      <div class="wrap">
+        <div class="policy-grid">
+          <div class="policy-copy">
+            <p class="kicker">Policy as config</p>
+            <h2>One TOML file. No redeploy to tune.</h2>
+            <p>
+              Policy lives in its own gitignored file, separate from network config, so it can
+              change on its own cadence — and reload on SIGHUP without dropping a connection.
+            </p>
+            <ul class="policy-list">
+              <li><span class="check">✓</span> Per-request cap blocks a single oversized operation
+                outright.</li>
+              <li><span class="check">✓</span> Sliding-window cap catches an identity accumulating damage
+                over time.</li>
+              <li><span class="check">✓</span> <span class="mono">PerIdentity</span> or <span class="mono">Global</span>
+                scope — stack both as a layered backstop.</li>
+              <li><span class="check">✓</span> Optional SQLite or Redis/Valkey backing so history survives
+                a restart or spans instances.</li>
+            </ul>
+          </div>
+          <div class="code-panel">
+            <div class="terminal-bar">
+              <span class="terminal-title">policies/ldap.toml</span>
+              <button class="copy-btn" data-copy-target="policy-code">copy</button>
+            </div>
+            <pre id="policy-code"><span class="tk-sec">[[policy]]</span>
+<span class="tk-key">type</span> = <span class="tk-str">"threshold"</span>
+<span class="tk-key">scope</span> = <span class="tk-str">"per_identity"</span>
+<span class="tk-key">max_per_request</span> = <span class="tk-num">10</span>
+<span class="tk-key">max_per_window</span> = <span class="tk-num">50</span>
+<span class="tk-key">window_secs</span> = <span class="tk-num">60</span>
+
+<span class="tk-com"># shared backstop no single identity can reset</span>
+<span class="tk-sec">[[policy]]</span>
+<span class="tk-key">type</span> = <span class="tk-str">"threshold"</span>
+<span class="tk-key">scope</span> = <span class="tk-str">"global"</span>
+<span class="tk-key">max_per_request</span> = <span class="tk-num">25</span>
+<span class="tk-key">max_per_window</span> = <span class="tk-num">200</span>
+<span class="tk-key">window_secs</span> = <span class="tk-num">60</span>
+<span class="tk-key">state_db</span> = <span class="tk-str">"policy-state.sqlite"</span></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ DOCS ============ -->
+    <section id="docs">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">Read more</p>
+          <h2>Design docs, not just a README.</h2>
+        </div>
+        <div class="docs-grid">
+          <a class="doc-card" href="https://github.com/scorpion/protect/blob/main/docs/README.md" target="_blank"
+            rel="noopener">
+            <div class="doc-name">docs/README.md</div>
+            <p>End-user docs: install, configure, and how the LDAP policy behaves in practice.</p>
+          </a>
+          <a class="doc-card" href="https://github.com/scorpion/protect/blob/main/ARCHITECTURE.md" target="_blank"
+            rel="noopener">
+            <div class="doc-name">ARCHITECTURE.md</div>
+            <p>Full request lifecycle, component design, and extension points.</p>
+          </a>
+          <a class="doc-card" href="https://github.com/scorpion/protect/blob/main/AGENTS.md" target="_blank"
+            rel="noopener">
+            <div class="doc-name">AGENTS.md</div>
+            <p>Module map and conventions for anyone — human or agent — working on the code.</p>
+          </a>
+          <a class="doc-card" href="https://github.com/scorpion/protect/blob/main/TODO.md" target="_blank"
+            rel="noopener">
+            <div class="doc-name">TODO.md</div>
+            <p>The honest gap list between today and a production-ready deployment.</p>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ GET STARTED ============ -->
+    <section id="get-started" class="get-started">
+      <div class="wrap">
+        <div class="gs-panel">
+          <div class="gs-copy">
+            <p class="kicker">Get started</p>
+            <h2>Up and running in about a minute.</h2>
+            <p>
+              Point ai-protect at your real directory, copy the example config and policy
+              files, and run it. Every client just needs to talk to a new port instead.
+            </p>
+            <div class="gs-actions">
+              <a class="btn btn-primary" href="https://github.com/scorpion/protect" target="_blank" rel="noopener">View
+                on GitHub</a>
+              <a class="btn btn-ghost" href="https://github.com/scorpion/protect/blob/main/README.md" target="_blank"
+                rel="noopener">Read the README</a>
+            </div>
+          </div>
+          <ol class="steps">
+            <li><span><code>git clone</code> the repo &amp; <code>cargo build</code></span></li>
+            <li><span><code>cp config.example.toml config.toml</code></span></li>
+            <li><span><code>cp policies/ldap.example.toml policies/ldap.toml</code></span></li>
+            <li><span><code>cargo run</code> — listens on <code>127.0.0.1:3890</code></span></li>
+            <li><span>Point clients at ai-protect instead of the directory</span></li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <div class="wrap footer-row">
+      <span class="footer-fine">&copy; 2026 <a href="https://scorpion.io" target="_blank" rel="noopener">SCORPION</a>.
+        Licensed under Apache-2.0.</span>
+      <ul class="footer-links">
+        <li><a href="https://github.com/scorpion/protect" target="_blank" rel="noopener">GitHub</a></li>
+        <li><a href="https://github.com/scorpion/protect/blob/main/README.md" target="_blank" rel="noopener">README</a>
+        </li>
+        <li><a href="https://github.com/scorpion/protect/blob/main/ARCHITECTURE.md" target="_blank"
+            rel="noopener">Architecture</a></li>
+        <li><a href="https://github.com/scorpion/protect/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
+        </li>
+      </ul>
+    </div>
+  </footer>
+
+  <script src="js/site.js"></script>
+</body>
+
+</html>

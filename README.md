@@ -32,10 +32,16 @@ client  ---->  ai-protect  ---->  upstream LDAP directory
                    +-- actionable -> evaluate policy
                          +-- within limits -> forward
                          +-- over limit    -> reject, log, never reaches directory
+
+client  <----  ai-protect  <----  upstream LDAP directory
+                   |
+                   +-- allowed request's response relayed back untouched
+                   +-- blocked request never reaches upstream;
+                       ai-protect answers directly with an LDAP error
 ```
 
 ```mermaid
-flowchart LR
+flowchart TD
     client([client]) --> proxy[ai-protect]
     proxy --> decode[decode request]
     decode --> actionable{actionable?}
@@ -47,6 +53,8 @@ flowchart LR
     forward1 --> upstream[(upstream LDAP directory)]
     forward2 --> upstream
     reject -.never reaches.-> upstream
+    upstream -.response.-> client
+    reject -.LDAP error.-> client
 ```
 
 Every modify request is inspected for attributes that represent an
