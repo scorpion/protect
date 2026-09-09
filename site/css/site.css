@@ -438,10 +438,24 @@ section {
 /* ---------- flow diagram ---------- */
 
 .flow {
+  position: relative;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 14px;
   padding: 40px 32px;
+}
+
+.flow-canvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.flow-row,
+.flow-footnote {
+  position: relative;
+  z-index: 1;
 }
 
 .flow-row {
@@ -517,6 +531,40 @@ section {
 
 .flow-footnote strong {
   color: var(--text);
+}
+
+.flow-box.pulse-allow {
+  animation: flow-pulse-allow 0.5s ease-out;
+}
+
+.flow-box.pulse-block {
+  animation: flow-pulse-block 0.5s ease-out;
+}
+
+@keyframes flow-pulse-allow {
+  0% {
+    box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.5);
+  }
+
+  100% {
+    box-shadow: 0 0 0 10px rgba(74, 222, 128, 0);
+  }
+}
+
+@keyframes flow-pulse-block {
+  0% {
+    box-shadow: 0 0 0 0 rgba(251, 113, 133, 0.5);
+  }
+
+  100% {
+    box-shadow: 0 0 0 10px rgba(251, 113, 133, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flow-canvas {
+    display: none;
+  }
 }
 
 /* ---------- features ---------- */
