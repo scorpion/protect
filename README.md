@@ -53,8 +53,9 @@ flowchart TD
     forward1 --> upstream[(upstream LDAP directory)]
     forward2 --> upstream
     reject -.never reaches.-> upstream
-    upstream -.response.-> client
-    reject -.LDAP error.-> client
+    upstream -.response.-> proxy
+    reject -.LDAP error.-> proxy
+    proxy -.response.-> client
 ```
 
 Every modify request is inspected for attributes that represent an
