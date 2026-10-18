@@ -13,9 +13,9 @@ parking_lot = "0.12.5"
 # Already compiled transitively via metrics-exporter-prometheus ->
 # metrics-util; declared directly here so core::upstream_pool's "random"
 # load-balance strategy can call it without adding a new crate to the graph.
-rand = "0.9.5"
-rasn = "0.28.14"
-rasn-ldap = "0.28.14"
+rand = "0.10.3"
+rasn = "0.29.0"
+rasn-ldap = "0.29.0"
 redis = { version = "1.7.0", default-features = false, features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 # `tls12` kept deliberately: Active Directory (a target directory) only
@@ -28,7 +28,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
-toml = "0.9.9"
+toml = "1.1.8"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
